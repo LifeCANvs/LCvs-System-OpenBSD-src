@@ -1,4 +1,4 @@
-/*	$OpenBSD: x509.c,v 1.97 2024/06/08 13:32:30 tb Exp $ */
+/*	$OpenBSD: x509.c,v 1.99 2024/06/10 12:44:06 tb Exp $ */
 /*
  * Copyright (c) 2022 Theo Buehler <tb@openbsd.org>
  * Copyright (c) 2021 Claudio Jeker <claudio@openbsd.org>
@@ -267,21 +267,37 @@ x509_get_ski(X509 *x, const char *fn, char **ski)
 
 /*
  * Check the cert's purpose: the cA bit in basic constraints distinguishes
- * between TA/CA and EE/BGPsec router. TAs are self-signed, CAs not self-issued,
- * EEs have no extended key usage, BGPsec router have id-kp-bgpsec-router OID.
+ * between TA/CA and EE/BGPsec router and the key usage bits must match.
+ * TAs are self-signed, CAs not self-issued, EEs have no extended key usage,
+ * BGPsec router have id-kp-bgpsec-router OID.
  */
 enum cert_purpose
 x509_get_purpose(X509 *x, const char *fn)
 {
 	BASIC_CONSTRAINTS		*bc = NULL;
 	EXTENDED_KEY_USAGE		*eku = NULL;
-	int				 crit, ext_flags, is_ca;
+	const X509_EXTENSION		*ku;
+	int				 crit, ext_flags, i, is_ca, ku_idx;
 	enum cert_purpose		 purpose = CERT_PURPOSE_INVALID;
 
 	if (!x509_cache_extensions(x, fn))
 		goto out;
 
 	ext_flags = X509_get_extension_flags(x);
+
+	/* Key usage must be present and critical. KU bits are checked below. */
+	if ((ku_idx = X509_get_ext_by_NID(x, NID_key_usage, -1)) < 0) {
+		warnx("%s: RFC 6487, section 4.8.4: missing KeyUsage", fn);
+		goto out;
+	}
+	if ((ku = X509_get_ext(x, ku_idx)) == NULL) {
+		warnx("%s: RFC 6487, section 4.8.4: missing KeyUsage", fn);
+		goto out;
+	}
+	if (!X509_EXTENSION_get_critical(ku)) {
+		warnx("%s: RFC 6487, section 4.8.4: KeyUsage not critical", fn);
+		goto out;
+	}
 
 	/* This weird API can return 0, 1, 2, 4, 5 but can't error... */
 	if ((is_ca = X509_check_ca(x)) > 1) {
@@ -314,6 +330,19 @@ x509_get_purpose(X509 *x, const char *fn)
 			    "Constraint must be absent", fn);
 			goto out;
 		}
+
+		if (X509_get_key_usage(x) != (KU_KEY_CERT_SIGN | KU_CRL_SIGN)) {
+			warnx("%s: RFC 6487 section 4.8.4: key usage violation",
+			    fn);
+			goto out;
+		}
+
+		if (X509_get_extended_key_usage(x) != UINT32_MAX) {
+			warnx("%s: RFC 6487 section 4.8.5: EKU not allowed",
+			    fn);
+			goto out;
+		}
+
 		/*
 		 * EXFLAG_SI means that issuer and subject are identical.
 		 * EXFLAG_SS is SI plus the AKI is absent or matches the SKI.
@@ -335,6 +364,12 @@ x509_get_purpose(X509 *x, const char *fn)
 		goto out;
 	}
 
+	if (X509_get_key_usage(x) != KU_DIGITAL_SIGNATURE) {
+		warnx("%s: RFC 6487 section 4.8.4: KU must be digitalSignature",
+		    fn);
+		goto out;
+	}
+
 	/*
 	 * EKU is only defined for BGPsec Router certs and must be absent from
 	 * EE certs.
@@ -353,20 +388,15 @@ x509_get_purpose(X509 *x, const char *fn)
 	}
 
 	/*
-	 * XXX - this isn't quite correct: other EKU OIDs are allowed per
-	 * RFC 8209, section 3.1.3.2, e.g., anyEKU could potentially help
-	 * avoid tripping up validators that don't know about the BGPsec
-	 * router purpose. Drop check or downgrade from error to warning?
+	 * Per RFC 8209, section 3.1.3.2 the id-kp-bgpsec-router OID must be
+	 * present and others are allowed, which we don't need to recognize.
+	 * This matches RFC 5280, section 4.2.1.12.
 	 */
-	if (sk_ASN1_OBJECT_num(eku) != 1) {
-		warnx("%s: EKU: expected 1 purpose, have %d", fn,
-		    sk_ASN1_OBJECT_num(eku));
-		goto out;
-	}
-
-	if (OBJ_cmp(bgpsec_oid, sk_ASN1_OBJECT_value(eku, 0)) == 0) {
-		purpose = CERT_PURPOSE_BGPSEC_ROUTER;
-		goto out;
+	for (i = 0; i < sk_ASN1_OBJECT_num(eku); i++) {
+		if (OBJ_cmp(bgpsec_oid, sk_ASN1_OBJECT_value(eku, i)) == 0) {
+			purpose = CERT_PURPOSE_BGPSEC_ROUTER;
+			break;
+		}
 	}
 
  out:
