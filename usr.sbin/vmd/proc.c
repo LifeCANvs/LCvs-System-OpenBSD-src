@@ -1,4 +1,4 @@
-/*	$OpenBSD: proc.c,v 1.25 2024/04/09 15:48:01 tobhe Exp $	*/
+/*	$OpenBSD: proc.c,v 1.34 2025/05/12 17:17:42 dv Exp $	*/
 
 /*
  * Copyright (c) 2010 - 2016 Reyk Floeter <reyk@openbsd.org>
@@ -29,10 +29,10 @@
 #include <string.h>
 #include <errno.h>
 #include <signal.h>
-#include <paths.h>
 #include <pwd.h>
 #include <event.h>
 #include <imsg.h>
+#include <ctype.h>
 
 #include "proc.h"
 
@@ -155,7 +155,10 @@ proc_connect(struct privsep *ps)
 
 		for (inst = 0; inst < ps->ps_instances[dst]; inst++) {
 			iev = &ps->ps_ievs[dst][inst];
-			imsg_init(&iev->ibuf, ps->ps_pp->pp_pipes[dst][inst]);
+			if (imsgbuf_init(&iev->ibuf,
+			    ps->ps_pp->pp_pipes[dst][inst]) == -1)
+				fatal("imsgbuf_init");
+			imsgbuf_allow_fdpass(&iev->ibuf);
 			event_set(&iev->ev, iev->ibuf.fd, iev->events,
 			    iev->handler, iev->data);
 			event_add(&iev->ev, NULL);
@@ -264,7 +267,9 @@ proc_accept(struct privsep *ps, int fd, enum privsep_procid dst,
 		pp->pp_pipes[dst][n] = fd;
 
 	iev = &ps->ps_ievs[dst][n];
-	imsg_init(&iev->ibuf, fd);
+	if (imsgbuf_init(&iev->ibuf, fd) == -1)
+		fatal("imsgbuf_init");
+	imsgbuf_allow_fdpass(&iev->ibuf);
 	event_set(&iev->ev, iev->ibuf.fd, iev->events, iev->handler, iev->data);
 	event_add(&iev->ev, NULL);
 }
@@ -294,7 +299,7 @@ proc_setup(struct privsep *ps, struct privsep_proc *procs, unsigned int nproc)
 		    sizeof(struct imsgev))) == NULL)
 			fatal("%s: calloc", __func__);
 
-		/* With this set up, we are ready to call imsg_init(). */
+		/* With this set up, we are ready to call imsgbuf_init(). */
 		for (i = 0; i < ps->ps_instances[id]; i++) {
 			ps->ps_ievs[id][i].handler = proc_dispatch;
 			ps->ps_ievs[id][i].events = EV_READ;
@@ -423,7 +428,7 @@ proc_open(struct privsep *ps, int src, int dst)
 			 */
 			if (proc_flush_imsg(ps, src, i) == -1 ||
 			    proc_flush_imsg(ps, dst, j) == -1)
-				fatal("%s: imsg_flush", __func__);
+				fatal("%s: proc_flush_imsg", __func__);
 		}
 	}
 }
@@ -449,7 +454,7 @@ proc_close(struct privsep *ps)
 
 			/* Cancel the fd, close and invalidate the fd */
 			event_del(&(ps->ps_ievs[dst][n].ev));
-			imsg_clear(&(ps->ps_ievs[dst][n].ibuf));
+			imsgbuf_clear(&(ps->ps_ievs[dst][n].ibuf));
 			close(pp->pp_pipes[dst][n]);
 			pp->pp_pipes[dst][n] = -1;
 		}
@@ -588,13 +593,15 @@ proc_dispatch(int fd, short event, void *arg)
 	int			 verbose;
 	const char		*title;
 	struct privsep_fd	 pf;
+	uint32_t		 peer_id, type;
+	pid_t			 pid;
 
 	title = ps->ps_title[privsep_process];
 	ibuf = &iev->ibuf;
 
 	if (event & EV_READ) {
-		if ((n = imsg_read(ibuf)) == -1 && errno != EAGAIN)
-			fatal("%s: imsg_read", __func__);
+		if ((n = imsgbuf_read(ibuf)) == -1)
+			fatal("%s: imsgbuf_read", __func__);
 		if (n == 0) {
 			/* this pipe is dead, so remove the event handler */
 			event_del(&iev->ev);
@@ -604,13 +611,14 @@ proc_dispatch(int fd, short event, void *arg)
 	}
 
 	if (event & EV_WRITE) {
-		if ((n = msgbuf_write(&ibuf->w)) == -1 && errno != EAGAIN)
-			fatal("%s: msgbuf_write", __func__);
-		if (n == 0) {
-			/* this pipe is dead, so remove the event handler */
-			event_del(&iev->ev);
-			event_loopexit(NULL);
-			return;
+		if (imsgbuf_write(ibuf) == -1) {
+			if (errno == EPIPE) {
+				/* this pipe is dead, remove the handler */
+				event_del(&iev->ev);
+				event_loopexit(NULL);
+				return;
+			}
+			fatal("%s: imsgbuf_write", __func__);
 		}
 	}
 
@@ -619,12 +627,6 @@ proc_dispatch(int fd, short event, void *arg)
 			fatal("%s: imsg_get", __func__);
 		if (n == 0)
 			break;
-
-#if DEBUG > 1
-		log_debug("%s: %s %d got imsg %d peerid %d from %s %d",
-		    __func__, title, ps->ps_instance + 1,
-		    imsg.hdr.type, imsg.hdr.peerid, p->p_title, imsg.hdr.pid);
-#endif
 
 		/*
 		 * Check the message with the program callback
@@ -638,24 +640,24 @@ proc_dispatch(int fd, short event, void *arg)
 		/*
 		 * Generic message handling
 		 */
-		switch (imsg.hdr.type) {
+		type = imsg_get_type(&imsg);
+		peer_id = imsg_get_id(&imsg);
+		pid = imsg_get_pid(&imsg);
+
+		switch (type) {
 		case IMSG_CTL_VERBOSE:
-			IMSG_SIZE_CHECK(&imsg, &verbose);
-			memcpy(&verbose, imsg.data, sizeof(verbose));
+			verbose = imsg_int_read(&imsg);
 			log_setverbose(verbose);
 			break;
 		case IMSG_CTL_PROCFD:
-			IMSG_SIZE_CHECK(&imsg, &pf);
-			memcpy(&pf, imsg.data, sizeof(pf));
+			privsep_fd_read(&imsg, &pf);
 			proc_accept(ps, imsg_get_fd(&imsg), pf.pf_procid,
 			    pf.pf_instance);
 			break;
 		default:
 			fatalx("%s: %s %d got invalid imsg %d peerid %d "
-			    "from %s %d",
-			    __func__, title, ps->ps_instance + 1,
-			    imsg.hdr.type, imsg.hdr.peerid,
-			    p->p_title, imsg.hdr.pid);
+			    "from %s %d", __func__, title, ps->ps_instance + 1,
+			    type, peer_id, p->p_title, pid);
 		}
 		imsg_free(&imsg);
 	}
@@ -681,12 +683,12 @@ void
 imsg_event_add2(struct imsgev *iev, struct event_base *ev_base)
 {
 	if (iev->handler == NULL) {
-		imsg_flush(&iev->ibuf);
+		imsgbuf_flush(&iev->ibuf);
 		return;
 	}
 
 	iev->events = EV_READ;
-	if (iev->ibuf.w.queued)
+	if (imsgbuf_queuelen(&iev->ibuf) > 0)
 		iev->events |= EV_WRITE;
 
 	event_del(&iev->ev);
@@ -697,37 +699,45 @@ imsg_event_add2(struct imsgev *iev, struct event_base *ev_base)
 }
 
 int
-imsg_compose_event(struct imsgev *iev, uint16_t type, uint32_t peerid,
-    pid_t pid, int fd, void *data, uint16_t datalen)
+imsg_compose_event(struct imsgev *iev, uint32_t type, uint32_t peerid,
+    pid_t pid, int fd, void *data, size_t datalen)
 {
 	return imsg_compose_event2(iev, type, peerid, pid, fd, data, datalen,
 	    NULL);
 }
 
 int
-imsg_compose_event2(struct imsgev *iev, uint16_t type, uint32_t peerid,
+imsg_compose_event2(struct imsgev *iev, uint32_t type, uint32_t peerid,
     pid_t pid, int fd, void *data, uint16_t datalen, struct event_base *ev_base)
 {
 	int	ret;
 
-	if ((ret = imsg_compose(&iev->ibuf, type, peerid,
-	    pid, fd, data, datalen)) == -1)
+	ret = imsg_compose(&iev->ibuf, type, peerid, pid, fd, data, datalen);
+	if (ret == -1)
 		return (ret);
 	imsg_event_add2(iev, ev_base);
 	return (ret);
 }
 
 int
-imsg_composev_event(struct imsgev *iev, uint16_t type, uint32_t peerid,
+imsg_composev_event(struct imsgev *iev, uint32_t type, uint32_t peerid,
     pid_t pid, int fd, const struct iovec *iov, int iovcnt)
 {
 	int	ret;
 
-	if ((ret = imsg_composev(&iev->ibuf, type, peerid,
-	    pid, fd, iov, iovcnt)) == -1)
+	ret = imsg_composev(&iev->ibuf, type, peerid, pid, fd, iov, iovcnt);
+	if (ret == -1)
 		return (ret);
 	imsg_event_add(iev);
 	return (ret);
+}
+
+void
+imsg_forward_event(struct imsgev *iev, struct imsg *imsg)
+{
+	if (imsg_forward(&iev->ibuf, imsg) == -1)
+		fatalx("%s: imsg_forward", __func__);
+	imsg_event_add(iev);
 }
 
 void
@@ -745,7 +755,7 @@ proc_range(struct privsep *ps, enum privsep_procid id, int *n, int *m)
 
 int
 proc_compose_imsg(struct privsep *ps, enum privsep_procid id, int n,
-    uint16_t type, uint32_t peerid, int fd, void *data, uint16_t datalen)
+    uint32_t type, uint32_t peerid, int fd, void *data, size_t datalen)
 {
 	int	 m;
 
@@ -761,14 +771,14 @@ proc_compose_imsg(struct privsep *ps, enum privsep_procid id, int n,
 
 int
 proc_compose(struct privsep *ps, enum privsep_procid id,
-    uint16_t type, void *data, uint16_t datalen)
+    uint32_t type, void *data, size_t datalen)
 {
 	return (proc_compose_imsg(ps, id, -1, type, -1, -1, data, datalen));
 }
 
 int
 proc_composev_imsg(struct privsep *ps, enum privsep_procid id, int n,
-    uint16_t type, uint32_t peerid, int fd, const struct iovec *iov, int iovcnt)
+    uint32_t type, uint32_t peerid, int fd, const struct iovec *iov, int iovcnt)
 {
 	int	 m;
 
@@ -783,18 +793,41 @@ proc_composev_imsg(struct privsep *ps, enum privsep_procid id, int n,
 
 int
 proc_composev(struct privsep *ps, enum privsep_procid id,
-    uint16_t type, const struct iovec *iov, int iovcnt)
+    uint32_t type, const struct iovec *iov, int iovcnt)
 {
 	return (proc_composev_imsg(ps, id, -1, type, -1, -1, iov, iovcnt));
 }
 
 int
 proc_forward_imsg(struct privsep *ps, struct imsg *imsg,
-    enum privsep_procid id, int n)
+    enum privsep_procid id, uint32_t new_peerid)
 {
-	return (proc_compose_imsg(ps, id, n, imsg->hdr.type,
-	    imsg->hdr.peerid, imsg_get_fd(imsg), imsg->data,
-	    IMSG_DATA_SIZE(imsg)));
+	int		 fd, ret;
+	size_t		 sz;
+	uint32_t	 peerid, type;
+	void		*data = NULL;
+
+	fd = imsg_get_fd(imsg);
+	sz = imsg_get_len(imsg);
+	type = imsg_get_type(imsg);
+
+	if (new_peerid == (uint32_t)(-1))
+		peerid = imsg_get_id(imsg);
+	else
+		peerid = new_peerid;
+
+	if (sz > 0) {
+		data = malloc(sz);
+		if (data == NULL)
+			return (ENOMEM);
+		if (imsg_get_data(imsg, data, sz))
+			fatal("%s: imsg_get_data", __func__);
+	}
+
+	ret = proc_compose_imsg(ps, id, -1, type, peerid, fd, data, sz);
+	if (sz > 0)
+		free(data);
+	return (ret);
 }
 
 struct imsgbuf *
@@ -826,13 +859,71 @@ proc_flush_imsg(struct privsep *ps, enum privsep_procid id, int n)
 	for (; n < m; n++) {
 		if ((ibuf = proc_ibuf(ps, id, n)) == NULL)
 			return (-1);
-		do {
-			ret = imsg_flush(ibuf);
-		} while (ret == -1 && errno == EAGAIN);
-		if (ret == -1)
+		if ((ret = imsgbuf_flush(ibuf)) == -1)
 			break;
 		imsg_event_add(&ps->ps_ievs[id][n]);
 	}
 
 	return (ret);
+}
+
+void
+privsep_fd_read(struct imsg *imsg, struct privsep_fd *pf)
+{
+	if (imsg_get_data(imsg, pf, sizeof(*pf)))
+		fatal("%s", __func__);
+}
+
+unsigned int
+imsg_uint_read(struct imsg *imsg)
+{
+	unsigned int val;
+
+	if (imsg_get_data(imsg, &val, sizeof(val)))
+		fatal("%s", __func__);
+
+	return (val);
+}
+
+int
+imsg_int_read(struct imsg *imsg)
+{
+	int val;
+
+	if (imsg_get_data(imsg, &val, sizeof(val)))
+		fatal("%s", __func__);
+
+	return (val);
+}
+
+char *
+imsg_string_read(struct imsg *imsg, size_t max)
+{
+	size_t i, sz;
+	char *s = NULL;
+
+	sz = imsg_get_len(imsg);
+	if (sz > max) {
+		log_warnx("%s: string too large", __func__);
+		return (NULL);
+	}
+	s = malloc(sz);
+	if (imsg_get_data(imsg, s, sz))
+		fatal("%s: imsg_get_data", __func__);
+
+	/* Guarantee NUL-termination. */
+	s[sz - 1] = '\0';
+
+	/* Ensure all characters are printable. */
+	for (i = 0; i < sz; i++) {
+		if (s[i] == '\0')
+			break;
+		if (!isprint(s[i])) {
+			log_warnx("%s: non-printable character", __func__);
+			free(s);
+			return (NULL);
+		}
+	}
+
+	return (s);
 }

@@ -30,9 +30,9 @@
 .\" OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
 .\" SUCH DAMAGE.
 .\"
-.\"	$OpenBSD: malloc.3,v 1.141 2023/12/04 22:52:41 tb Exp $
+.\"	$OpenBSD: malloc.3,v 1.144 2025/05/24 12:47:11 schwarze Exp $
 .\"
-.Dd $Mdocdate: December 4 2023 $
+.Dd $Mdocdate: May 24 2025 $
 .Dt MALLOC 3
 .Os
 .Sh NAME
@@ -69,7 +69,8 @@
 .Fn malloc_conceal "size_t size"
 .Ft void *
 .Fn calloc_conceal "size_t nmemb" "size_t size"
-.Vt char *malloc_options ;
+.Vt const char * const
+.Va malloc_options ;
 .Sh DESCRIPTION
 The standard functions
 .Fn malloc ,
@@ -268,7 +269,15 @@ next checks the environment for a variable called
 and finally looks at the global variable
 .Va malloc_options
 in the program.
-Each is scanned for the flags documented below.
+Since
+.Fn malloc
+might already get called before the beginning of
+.Fn main ,
+either initialize
+.Va malloc_options
+to a string literal at file scope or do not declare it at all.
+.Pp
+Each of the three strings is scanned for the flags documented below.
 Unless otherwise noted uppercase means on, lowercase means off.
 During initialization, flags occurring later modify the behaviour
 that was requested by flags processed earlier.
@@ -722,6 +731,10 @@ The
 .Fn aligned_alloc
 function conforms to
 .St -isoC-2011 .
+The
+.Fn reallocarray
+function conforms to
+.St -p1003.1-2024 .
 .Pp
 If
 .Fa nmemb

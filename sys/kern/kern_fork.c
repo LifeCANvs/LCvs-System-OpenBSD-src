@@ -1,4 +1,4 @@
-/*	$OpenBSD: kern_fork.c,v 1.260 2024/06/03 12:48:25 claudio Exp $	*/
+/*	$OpenBSD: kern_fork.c,v 1.272 2025/05/24 06:49:16 deraadt Exp $	*/
 /*	$NetBSD: kern_fork.c,v 1.29 1996/02/09 18:59:34 christos Exp $	*/
 
 /*
@@ -58,14 +58,15 @@
 #include <sys/atomic.h>
 #include <sys/unistd.h>
 #include <sys/tracepoint.h>
+#include <sys/witness.h>
 
 #include <sys/syscallargs.h>
 
-#include <uvm/uvm.h>
+#include <uvm/uvm_extern.h>
 #include <machine/tcb.h>
 
 int	nprocesses = 1;		/* process 0 */
-int	nthreads = 1;		/* proc 0 */
+int	nthreads = 1;		/* [a] proc 0 */
 struct	forkstat forkstat;
 
 void fork_return(void *);
@@ -178,6 +179,8 @@ thread_new(struct proc *parent, vaddr_t uaddr)
 void
 process_initialize(struct process *pr, struct proc *p)
 {
+	refcnt_init(&pr->ps_refcnt);
+
 	/* initialize the thread links */
 	pr->ps_mainproc = p;
 	TAILQ_INIT(&pr->ps_threads);
@@ -191,14 +194,16 @@ process_initialize(struct process *pr, struct proc *p)
 	/* new thread and new process */
 	KASSERT(p->p_ucred->cr_refcnt.r_refs >= 2);
 
+	prof_fork(pr);
+
 	LIST_INIT(&pr->ps_children);
 	LIST_INIT(&pr->ps_orphans);
-	LIST_INIT(&pr->ps_ftlist);
 	LIST_INIT(&pr->ps_sigiolst);
 	TAILQ_INIT(&pr->ps_tslpqueue);
 
 	rw_init(&pr->ps_lock, "pslock");
 	mtx_init(&pr->ps_mtx, IPL_HIGH);
+	klist_init_mutex(&pr->ps_klist, &pr->ps_mtx);
 
 	timeout_set_flags(&pr->ps_realit_to, realitexpire, pr,
 	    KCLOCK_UPTIME, 0);
@@ -234,6 +239,9 @@ process_new(struct proc *p, struct process *parent, int flags)
 	pr->ps_pptr = parent;
 	pr->ps_ppid = parent->ps_pid;
 
+	WITNESS_SETCHILD(&pr->ps_mtx.mtx_lock_obj,
+	    &parent->ps_mtx.mtx_lock_obj);
+
 	/* bump references to the text vnode (for sysctl) */
 	pr->ps_textvp = parent->ps_textvp;
 	if (pr->ps_textvp)
@@ -253,14 +261,12 @@ process_new(struct proc *p, struct process *parent, int flags)
 		    sizeof(u_int), M_PINSYSCALL, M_WAITOK);
 		memcpy(pr->ps_pin.pn_pins, parent->ps_pin.pn_pins,
 		    parent->ps_pin.pn_npins * sizeof(u_int));
-		pr->ps_flags |= PS_PIN;
 	}
 	if (parent->ps_libcpin.pn_pins) {
 		pr->ps_libcpin.pn_pins = mallocarray(parent->ps_libcpin.pn_npins,
 		    sizeof(u_int), M_PINSYSCALL, M_WAITOK);
 		memcpy(pr->ps_libcpin.pn_pins, parent->ps_libcpin.pn_pins,
 		    parent->ps_libcpin.pn_npins * sizeof(u_int));
-		pr->ps_flags |= PS_LIBCPIN;
 	}
 
 	/*
@@ -304,6 +310,8 @@ struct timeval fork_tfmrate = { 10, 0 };
 int
 fork_check_maxthread(uid_t uid)
 {
+	int maxthread_local, val;
+
 	/*
 	 * Although process entries are dynamically created, we still keep
 	 * a global limit on the maximum number we will create. We reserve
@@ -313,14 +321,17 @@ fork_check_maxthread(uid_t uid)
 	 * the variable nthreads is the current number of procs, maxthread is
 	 * the limit.
 	 */
-	if ((nthreads >= maxthread - 5 && uid != 0) || nthreads >= maxthread) {
+	maxthread_local = atomic_load_int(&maxthread);
+	val = atomic_inc_int_nv(&nthreads);
+	if ((val > maxthread_local - 5 && uid != 0) ||
+	    val > maxthread_local) {
 		static struct timeval lasttfm;
 
 		if (ratecheck(&lasttfm, &fork_tfmrate))
 			tablefull("thread");
+		atomic_dec_int(&nthreads);
 		return EAGAIN;
 	}
-	nthreads++;
 
 	return 0;
 }
@@ -347,7 +358,7 @@ fork1(struct proc *curp, int flags, void (*func)(void *), void *arg,
 	struct proc *p;
 	uid_t uid = curp->p_ucred->cr_ruid;
 	struct vmspace *vm;
-	int count;
+	int count, maxprocess_local;
 	vaddr_t uaddr;
 	int error;
 	struct  ptrace_state *newptstat = NULL;
@@ -360,13 +371,14 @@ fork1(struct proc *curp, int flags, void (*func)(void *), void *arg,
 	if ((error = fork_check_maxthread(uid)))
 		return error;
 
-	if ((nprocesses >= maxprocess - 5 && uid != 0) ||
-	    nprocesses >= maxprocess) {
+	maxprocess_local = atomic_load_int(&maxprocess);
+	if ((nprocesses >= maxprocess_local - 5 && uid != 0) ||
+	    nprocesses >= maxprocess_local) {
 		static struct timeval lasttfm;
 
 		if (ratecheck(&lasttfm, &fork_tfmrate))
 			tablefull("process");
-		nthreads--;
+		atomic_dec_int(&nthreads);
 		return EAGAIN;
 	}
 	nprocesses++;
@@ -379,7 +391,7 @@ fork1(struct proc *curp, int flags, void (*func)(void *), void *arg,
 	if (uid != 0 && count > lim_cur(RLIMIT_NPROC)) {
 		(void)chgproccnt(uid, -1);
 		nprocesses--;
-		nthreads--;
+		atomic_dec_int(&nthreads);
 		return EAGAIN;
 	}
 
@@ -387,7 +399,7 @@ fork1(struct proc *curp, int flags, void (*func)(void *), void *arg,
 	if (uaddr == 0) {
 		(void)chgproccnt(uid, -1);
 		nprocesses--;
-		nthreads--;
+		atomic_dec_int(&nthreads);
 		return (ENOMEM);
 	}
 
@@ -450,8 +462,9 @@ fork1(struct proc *curp, int flags, void (*func)(void *), void *arg,
 	LIST_INSERT_AFTER(curpr, pr, ps_pglist);
 	LIST_INSERT_HEAD(&curpr->ps_children, pr, ps_sibling);
 
+	mtx_enter(&pr->ps_mtx);
 	if (pr->ps_flags & PS_TRACED) {
-		pr->ps_oppid = curpr->ps_pid;
+		pr->ps_opptr = curpr;
 		process_reparent(pr, curpr->ps_pptr);
 
 		/*
@@ -466,6 +479,7 @@ fork1(struct proc *curp, int flags, void (*func)(void *), void *arg,
 			pr->ps_ptstat->pe_other_pid = curpr->ps_pid;
 		}
 	}
+	mtx_leave(&pr->ps_mtx);
 
 	/*
 	 * For new processes, set accounting bits and mark as complete.
@@ -484,7 +498,7 @@ fork1(struct proc *curp, int flags, void (*func)(void *), void *arg,
 	/*
 	 * Notify any interested parties about the new process.
 	 */
-	knote_locked(&curpr->ps_klist, NOTE_FORK | pr->ps_pid);
+	knote_processfork(curpr, pr->ps_pid);
 
 	/*
 	 * Update stats now that we know the fork was successful.
@@ -544,7 +558,7 @@ thread_fork(struct proc *curp, void *stack, void *tcb, pid_t *tidptr,
 
 	uaddr = uvm_uarea_alloc();
 	if (uaddr == 0) {
-		nthreads--;
+		atomic_dec_int(&nthreads);
 		return ENOMEM;
 	}
 
@@ -581,12 +595,13 @@ thread_fork(struct proc *curp, void *stack, void *tcb, pid_t *tidptr,
 	pr->ps_threadcnt++;
 
 	/*
-	 * if somebody else wants to take us to single threaded mode,
-	 * count ourselves in.
+	 * if somebody else wants to take us to single threaded mode
+	 * or suspend the process, count ourselves in.
 	 */
-	if (pr->ps_single) {
-		pr->ps_singlecnt++;
-		atomic_setbits_int(&p->p_flag, P_SUSPSINGLE);
+	if (pr->ps_single != NULL || ISSET(pr->ps_flags, PS_STOPPING)) {
+		pr->ps_suspendcnt++;
+		atomic_setbits_int(&p->p_flag,
+		    curp->p_flag & (P_SUSPSINGLE | P_SUSPSIG));
 	}
 	mtx_leave(&pr->ps_mtx);
 

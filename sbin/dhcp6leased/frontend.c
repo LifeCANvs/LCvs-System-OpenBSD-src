@@ -1,4 +1,4 @@
-/*	$OpenBSD: frontend.c,v 1.11 2024/06/05 16:14:12 florian Exp $	*/
+/*	$OpenBSD: frontend.c,v 1.21 2025/04/27 16:22:33 florian Exp $	*/
 
 /*
  * Copyright (c) 2017, 2021, 2024 Florian Obser <florian@openbsd.org>
@@ -69,7 +69,6 @@ struct iface {
 
 __dead void	 frontend_shutdown(void);
 void		 frontend_sig_handler(int, short, void *);
-void		 rtsock_update_iface(struct if_msghdr *, struct sockaddr_dl *);
 void		 frontend_startup(void);
 void		 update_iface(uint32_t);
 void		 route_receive(int, short, void *);
@@ -181,7 +180,9 @@ frontend(int debug, int verbose)
 	/* Setup pipe and event handler to the parent process. */
 	if ((iev_main = malloc(sizeof(struct imsgev))) == NULL)
 		fatal(NULL);
-	imsg_init(&iev_main->ibuf, 3);
+	if (imsgbuf_init(&iev_main->ibuf, 3) == -1)
+		fatal(NULL);
+	imsgbuf_allow_fdpass(&iev_main->ibuf);
 	iev_main->handler = frontend_dispatch_main;
 	iev_main->events = EV_READ;
 	event_set(&iev_main->ev, iev_main->ibuf.fd, iev_main->events,
@@ -198,11 +199,11 @@ __dead void
 frontend_shutdown(void)
 {
 	/* Close pipes. */
-	msgbuf_write(&iev_engine->ibuf.w);
-	msgbuf_clear(&iev_engine->ibuf.w);
+	imsgbuf_write(&iev_engine->ibuf);
+	imsgbuf_clear(&iev_engine->ibuf);
 	close(iev_engine->ibuf.fd);
-	msgbuf_write(&iev_main->ibuf.w);
-	msgbuf_clear(&iev_main->ibuf.w);
+	imsgbuf_write(&iev_main->ibuf);
+	imsgbuf_clear(&iev_main->ibuf);
 	close(iev_main->ibuf.fd);
 
 	config_clear(frontend_conf);
@@ -244,16 +245,18 @@ frontend_dispatch_main(int fd, short event, void *bula)
 	int				 shut = 0, udpsock, if_index;
 
 	if (event & EV_READ) {
-		if ((n = imsg_read(ibuf)) == -1 && errno != EAGAIN)
-			fatal("imsg_read error");
+		if ((n = imsgbuf_read(ibuf)) == -1)
+			fatal("imsgbuf_read error");
 		if (n == 0)	/* Connection closed. */
 			shut = 1;
 	}
 	if (event & EV_WRITE) {
-		if ((n = msgbuf_write(&ibuf->w)) == -1 && errno != EAGAIN)
-			fatal("msgbuf_write");
-		if (n == 0)	/* Connection closed. */
-			shut = 1;
+		if (imsgbuf_write(ibuf) == -1) {
+			if (errno == EPIPE)	/* Connection closed. */
+				shut = 1;
+			else
+				fatal("imsgbuf_write");
+		}
 	}
 
 	for (;;) {
@@ -281,7 +284,8 @@ frontend_dispatch_main(int fd, short event, void *bula)
 			if (iev_engine == NULL)
 				fatal(NULL);
 
-			imsg_init(&iev_engine->ibuf, fd);
+			if (imsgbuf_init(&iev_engine->ibuf, fd) == -1)
+				fatal(NULL);
 			iev_engine->handler = frontend_dispatch_engine;
 			iev_engine->events = EV_READ;
 
@@ -343,6 +347,11 @@ frontend_dispatch_main(int fd, short event, void *bula)
 				fatal(NULL);
 			memcpy(iface_conf, imsg.data, sizeof(struct
 			    iface_conf));
+			if (iface_conf->name[sizeof(iface_conf->name) - 1]
+			    != '\0')
+				fatalx("%s: IMSG_RECONF_IFACE invalid name",
+				    __func__);
+
 			SIMPLEQ_INIT(&iface_conf->iface_ia_list);
 			SIMPLEQ_INSERT_TAIL(&nconf->iface_list,
 			    iface_conf, entry);
@@ -376,6 +385,11 @@ frontend_dispatch_main(int fd, short event, void *bula)
 				fatal(NULL);
 			memcpy(iface_pd_conf, imsg.data, sizeof(struct
 			    iface_pd_conf));
+			if (iface_pd_conf->name[sizeof(iface_pd_conf->name) - 1]
+			    != '\0')
+				fatalx("%s: IMSG_RECONF_IFACE_PD invalid name",
+				    __func__);
+
 			SIMPLEQ_INSERT_TAIL(&iface_ia_conf->iface_pd_list,
 			    iface_pd_conf, entry);
 			break;
@@ -448,16 +462,18 @@ frontend_dispatch_engine(int fd, short event, void *bula)
 	int			 shut = 0;
 
 	if (event & EV_READ) {
-		if ((n = imsg_read(ibuf)) == -1 && errno != EAGAIN)
-			fatal("imsg_read error");
+		if ((n = imsgbuf_read(ibuf)) == -1)
+			fatal("imsgbuf_read error");
 		if (n == 0)	/* Connection closed. */
 			shut = 1;
 	}
 	if (event & EV_WRITE) {
-		if ((n = msgbuf_write(&ibuf->w)) == -1 && errno != EAGAIN)
-			fatal("msgbuf_write");
-		if (n == 0)	/* Connection closed. */
-			shut = 1;
+		if (imsgbuf_write(ibuf) == -1) {
+			if (errno == EPIPE)	/* Connection closed. */
+				shut = 1;
+			else
+				fatal("imsgbuf_write");
+		}
 	}
 
 	for (;;) {
@@ -552,6 +568,9 @@ update_iface(uint32_t if_index)
 	if ((flags = get_flags(if_name)) == -1)
 		return;
 
+	if (find_iface_conf(&frontend_conf->iface_list, if_name) == NULL)
+		return;
+
 	memset(&ifinfo, 0, sizeof(ifinfo));
 	ifinfo.if_index = if_index;
 	ifinfo.link_state = -1;
@@ -596,72 +615,12 @@ update_iface(uint32_t if_index)
 }
 
 void
-rtsock_update_iface(struct if_msghdr *ifm, struct sockaddr_dl *sdl)
-{
-#if 0
-XXX
-	struct iface		*iface;
-	struct imsg_ifinfo	 ifinfo;
-	uint32_t		 if_index;
-	int			 flags;
-	char			 ifnamebuf[IF_NAMESIZE], *if_name;
-
-	if_index = ifm->ifm_index;
-
-	flags = ifm->ifm_flags;
-
-	iface = get_iface_by_id(if_index);
-	if_name = if_indextoname(if_index, ifnamebuf);
-
-	if (if_name == NULL) {
-		if (iface != NULL) {
-			log_debug("interface with idx %d removed", if_index);
-			frontend_imsg_compose_engine(IMSG_REMOVE_IF, 0, 0,
-			    &if_index, sizeof(if_index));
-			remove_iface(if_index);
-		}
-		return;
-	}
-
-	memset(&ifinfo, 0, sizeof(ifinfo));
-	ifinfo.if_index = if_index;
-	ifinfo.link_state = ifm->ifm_data.ifi_link_state;
-	ifinfo.rdomain = ifm->ifm_tableid;
-	ifinfo.running = (flags & (IFF_UP | IFF_RUNNING)) ==
-	    (IFF_UP | IFF_RUNNING);
-
-	if (iface == NULL) {
-		if ((iface = calloc(1, sizeof(*iface))) == NULL)
-			fatal("calloc");
-		iface->udpsock = -1;
-		LIST_INSERT_HEAD(&interfaces, iface, entries);
-		frontend_imsg_compose_main(IMSG_OPEN_UDPSOCK, 0,
-		    &if_index, sizeof(if_index));
-	} else {
-		if (iface->ifinfo.rdomain != ifinfo.rdomain &&
-		    iface->udpsock != -1) {
-			close(iface->udpsock);
-			iface->udpsock = -1;
-		}
-	}
-
-	if (memcmp(&iface->ifinfo, &ifinfo, sizeof(iface->ifinfo)) != 0) {
-		memcpy(&iface->ifinfo, &ifinfo, sizeof(iface->ifinfo));
-		frontend_imsg_compose_main(IMSG_UPDATE_IF, 0, &iface->ifinfo,
-		    sizeof(iface->ifinfo));
-	}
-#endif
-}
-
-void
 frontend_startup(void)
 {
 	if (!event_initialized(&ev_route))
 		fatalx("%s: did not receive a route socket from the main "
 		    "process", __func__);
 
-	if (pledge("stdio unix recvfd", NULL) == -1)
-		fatal("pledge");
 	event_add(&ev_route, NULL);
 }
 
@@ -707,16 +666,13 @@ route_receive(int fd, short events, void *arg)
 void
 handle_route_message(struct rt_msghdr *rtm, struct sockaddr **rti_info)
 {
-	struct sockaddr_dl		*sdl = NULL;
 	struct if_announcemsghdr	*ifan;
 	uint32_t			 if_index;
 
 	switch (rtm->rtm_type) {
 	case RTM_IFINFO:
-		if (rtm->rtm_addrs & RTA_IFP && rti_info[RTAX_IFP]->sa_family
-		    == AF_LINK)
-			sdl = (struct sockaddr_dl *)rti_info[RTAX_IFP];
-		rtsock_update_iface((struct if_msghdr *)rtm, sdl);
+		if_index = ((struct if_msghdr *)rtm)->ifm_index;
+		update_iface(if_index);
 		break;
 	case RTM_IFANNOUNCE:
 		ifan = (struct if_announcemsghdr *)rtm;
@@ -937,8 +893,8 @@ build_packet(uint8_t message_type, struct iface *iface, char *if_name)
 void
 send_packet(uint8_t message_type, struct iface *iface)
 {
-	ssize_t			 pkt_len;
-	char			 ifnamebuf[IF_NAMESIZE], *if_name;
+	ssize_t	 pkt_len;
+	char	 ifnamebuf[IF_NAMESIZE], *if_name, *message_name;
 
 	if (!event_initialized(&iface->udpev)) {
 		iface->send_solicit = 1;
@@ -951,7 +907,26 @@ send_packet(uint8_t message_type, struct iface *iface)
 	    == NULL)
 		return; /* iface went away, nothing to do */
 
-	log_debug("%s on %s", dhcp_message_type2str(message_type), if_name);
+	switch (message_type) {
+	case DHCPSOLICIT:
+		message_name = "Soliciting";
+		break;
+	case DHCPREQUEST:
+		message_name = "Requesting";
+		break;
+	case DHCPRENEW:
+		message_name = "Renewing";
+		break;
+	case DHCPREBIND:
+		message_name = "Rebinding";
+		break;
+	default:
+		message_name = NULL;
+		break;
+	}
+
+	if (message_name)
+		log_info("%s lease on %s", message_name, if_name);
 
 	pkt_len = build_packet(message_type, iface, if_name);
 

@@ -1,4 +1,4 @@
-/*	$OpenBSD: kdump.c,v 1.163 2024/05/18 05:20:22 guenther Exp $	*/
+/*	$OpenBSD: kdump.c,v 1.165 2025/04/29 08:16:56 tb Exp $	*/
 
 /*-
  * Copyright (c) 1988, 1993
@@ -1019,7 +1019,6 @@ skip:
 static struct ctlname topname[] = CTL_NAMES;
 static struct ctlname kernname[] = CTL_KERN_NAMES;
 static struct ctlname vmname[] = CTL_VM_NAMES;
-static struct ctlname fsname[] = CTL_FS_NAMES;
 static struct ctlname netname[] = CTL_NET_NAMES;
 static struct ctlname hwname[] = CTL_HW_NAMES;
 static struct ctlname debugname[CTL_DEBUG_MAXID];
@@ -1073,9 +1072,6 @@ kresolvsysctl(int depth, const int *top)
 			break;
 		case CTL_VM:
 			SETNAME(vmname);
-			break;
-		case CTL_FS:
-			SETNAME(fsname);
 			break;
 		case CTL_NET:
 			SETNAME(netname);
@@ -1499,9 +1495,6 @@ ktrpledge(struct ktr_pledge *pledge, size_t len)
 static void
 ktrpinsyscall(struct ktr_pinsyscall *pinsyscall, size_t len)
 {
-	const char *name = "";
-	int i;
-
 	if (len < sizeof(struct ktr_pinsyscall))
 		errx(1, "invalid ktr pinsyscall length %zu", len);
 

@@ -1,4 +1,4 @@
-/*	$OpenBSD: disklabel.h,v 1.86 2022/11/07 10:33:22 krw Exp $	*/
+/*	$OpenBSD: disklabel.h,v 1.88 2025/05/02 10:14:46 jsg Exp $	*/
 /*	$NetBSD: disklabel.h,v 1.41 1996/05/10 23:07:37 mark Exp $	*/
 
 /*
@@ -72,7 +72,7 @@
 #define	DISKLABELDEV(dev) \
     (MAKEDISKDEV(major(dev), DISKUNIT(dev), RAW_PART))
 
-#define DISKMAGIC	((u_int32_t)0x82564557)	/* The disk magic number */
+#define DISKMAGIC	0x82564557U	/* The disk magic number */
 
 #define MAXDISKSIZE	0x7fffffffffffLL	/* 47 bits of reach */
 
@@ -457,10 +457,6 @@ struct dos_partition {
 	u_int32_t	dp_start;	/* absolute starting sector number */
 	u_int32_t	dp_size;	/* partition size in sectors */
 };
-
-/* Isolate the relevant bits to get sector and cylinder. */
-#define	DPSECT(s)	((s) & 0x3f)
-#define	DPCYL(c, s)	((c) + (((s) & 0xc0) << 2))
 
 /* Known DOS partition types. */
 #define	DOSPTYP_UNUSED	0x00		/* Unused partition */

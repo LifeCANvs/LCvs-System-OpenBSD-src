@@ -1,4 +1,4 @@
-/*	$OpenBSD: rtsock.c,v 1.373 2023/12/03 10:51:17 mvs Exp $	*/
+/*	$OpenBSD: rtsock.c,v 1.383 2025/03/29 06:33:28 claudio Exp $	*/
 /*	$NetBSD: rtsock.c,v 1.18 1996/03/29 00:32:10 cgd Exp $	*/
 
 /*
@@ -313,10 +313,12 @@ route_rcvd(struct socket *so)
 	 * If we are in a FLUSH state, check if the buffer is
 	 * empty so that we can clear the flag.
 	 */
+
+	mtx_enter(&so->so_rcv.sb_mtx);
 	if (((rop->rop_flags & ROUTECB_FLAG_FLUSH) != 0) &&
-	    ((sbspace(rop->rop_socket, &rop->rop_socket->so_rcv) ==
-	    rop->rop_socket->so_rcv.sb_hiwat)))
+	    ((sbspace_locked(&so->so_rcv) == so->so_rcv.sb_hiwat)))
 		rop->rop_flags &= ~ROUTECB_FLAG_FLUSH;
+	mtx_leave(&so->so_rcv.sb_mtx);
 }
 
 int
@@ -357,7 +359,7 @@ int
 route_peeraddr(struct socket *so, struct mbuf *nam)
 {
 	/* minimal support, just implement a fake peer address */
-	bcopy(&route_src, mtod(nam, caddr_t), route_src.sa_len);
+	memcpy(mtod(nam, caddr_t), &route_src, route_src.sa_len);
 	nam->m_len = route_src.sa_len;
 	return (0);
 }
@@ -478,8 +480,13 @@ rtm_senddesync(struct socket *so)
 	 */
 	desync_mbuf = rtm_msg1(RTM_DESYNC, NULL);
 	if (desync_mbuf != NULL) {
-		if (sbappendaddr(so, &so->so_rcv, &route_src,
-		    desync_mbuf, NULL) != 0) {
+		int ret;
+
+		mtx_enter(&so->so_rcv.sb_mtx);
+		ret = sbappendaddr(&so->so_rcv, &route_src, desync_mbuf, NULL);
+		mtx_leave(&so->so_rcv.sb_mtx);
+
+		if (ret != 0) {
 			rop->rop_flags &= ~ROUTECB_FLAG_DESYNC;
 			sorwakeup(rop->rop_socket);
 			return;
@@ -586,6 +593,7 @@ rtm_sendup(struct socket *so, struct mbuf *m0)
 {
 	struct rtpcb *rop = sotortpcb(so);
 	struct mbuf *m;
+	int send_desync = 0;
 
 	soassertlocked(so);
 
@@ -593,8 +601,13 @@ rtm_sendup(struct socket *so, struct mbuf *m0)
 	if (m == NULL)
 		return (ENOMEM);
 
-	if (sbspace(so, &so->so_rcv) < (2 * MSIZE) ||
-	    sbappendaddr(so, &so->so_rcv, &route_src, m, NULL) == 0) {
+	mtx_enter(&so->so_rcv.sb_mtx);
+	if (sbspace_locked(&so->so_rcv) < (2 * MSIZE) ||
+	    sbappendaddr(&so->so_rcv, &route_src, m, NULL) == 0)
+		send_desync = 1;
+	mtx_leave(&so->so_rcv.sb_mtx);
+
+	if (send_desync) {
 		/* Flag socket as desync'ed and flush required */
 		rop->rop_flags |= ROUTECB_FLAG_DESYNC | ROUTECB_FLAG_FLUSH;
 		rtm_senddesync(so);
@@ -616,6 +629,9 @@ rtm_report(struct rtentry *rt, u_char type, int seq, int tableid)
 #ifdef BFD
 	struct sockaddr_bfd	 sa_bfd;
 #endif
+#ifdef MPLS
+	struct sockaddr_mpls	 sa_mpls;
+#endif
 	struct ifnet		*ifp = NULL;
 	int			 len;
 
@@ -633,8 +649,6 @@ rtm_report(struct rtentry *rt, u_char type, int seq, int tableid)
 #endif
 #ifdef MPLS
 	if (rt->rt_flags & RTF_MPLS) {
-		struct sockaddr_mpls	 sa_mpls;
-
 		bzero(&sa_mpls, sizeof(sa_mpls));
 		sa_mpls.smpls_family = AF_MPLS;
 		sa_mpls.smpls_len = sizeof(sa_mpls);
@@ -1331,7 +1345,7 @@ route_cleargateway(struct rtentry *rt, void *arg, unsigned int rtableid)
 
 	if (ISSET(rt->rt_flags, RTF_GATEWAY) && rt->rt_gwroute == nhrt &&
 	    !ISSET(rt->rt_locks, RTV_MTU))
-		rt->rt_mtu = 0;
+		atomic_store_int(&rt->rt_mtu, 0);
 
 	return (0);
 }
@@ -1379,7 +1393,7 @@ rtm_setmetrics(u_long which, const struct rt_metrics *in,
 	int64_t expire;
 
 	if (which & RTV_MTU)
-		out->rmx_mtu = in->rmx_mtu;
+		atomic_store_int(&out->rmx_mtu, in->rmx_mtu);
 	if (which & RTV_EXPIRE) {
 		expire = in->rmx_expire;
 		if (expire != 0) {
@@ -1407,7 +1421,7 @@ rtm_getmetrics(const struct rtentry *rt, struct rt_metrics *out)
 
 	bzero(out, sizeof(*out));
 	out->rmx_locks = in->rmx_locks;
-	out->rmx_mtu = in->rmx_mtu;
+	out->rmx_mtu = atomic_load_int(&in->rmx_mtu);
 	out->rmx_expire = expire;
 	out->rmx_pksent = in->rmx_pksent;
 }
@@ -1953,6 +1967,9 @@ sysctl_dumpentry(struct rtentry *rt, void *v, unsigned int id)
 #ifdef BFD
 	struct sockaddr_bfd	 sa_bfd;
 #endif
+#ifdef MPLS
+	struct sockaddr_mpls	 sa_mpls;
+#endif
 	struct sockaddr_rtlabel	 sa_rl;
 	struct sockaddr_in6	 sa_mask;
 
@@ -1995,8 +2012,6 @@ sysctl_dumpentry(struct rtentry *rt, void *v, unsigned int id)
 #endif
 #ifdef MPLS
 	if (rt->rt_flags & RTF_MPLS) {
-		struct sockaddr_mpls	 sa_mpls;
-
 		bzero(&sa_mpls, sizeof(sa_mpls));
 		sa_mpls.smpls_family = AF_MPLS;
 		sa_mpls.smpls_len = sizeof(sa_mpls);
@@ -2122,11 +2137,17 @@ sysctl_ifnames(struct walkarg *w)
 int
 sysctl_source(int af, u_int tableid, struct walkarg *w)
 {
+	union {
+		struct sockaddr_in in;
+#ifdef INET6
+		struct sockaddr_in6 in6;
+#endif
+	}		 buf;
 	struct sockaddr	*sa;
 	int		 size, error = 0;
 
-	sa = rtable_getsource(tableid, af);
-	if (sa) {
+	NET_LOCK_SHARED();
+	if ((sa = rtable_getsource(tableid, af)) != NULL) {
 		switch (sa->sa_family) {
 		case AF_INET:
 			size = sizeof(struct sockaddr_in);
@@ -2137,11 +2158,19 @@ sysctl_source(int af, u_int tableid, struct walkarg *w)
 			break;
 #endif
 		default:
-			return (0);
+			sa = NULL;
+			break;
 		}
+
+	}
+	if (sa != NULL)
+		memcpy(&buf, sa, size);
+	NET_UNLOCK_SHARED();
+
+	if (sa != NULL) {
 		w->w_needed += size;
 		if (w->w_where && w->w_needed <= w->w_given) {
-			if ((error = copyout(sa, w->w_where, size)))
+			if ((error = copyout(&buf, w->w_where, size)))
 				return (error);
 			w->w_where += size;
 		}
@@ -2222,7 +2251,6 @@ sysctl_rtable(int *name, u_int namelen, void *where, size_t *given, void *new,
 		tableid = w.w_arg;
 		if (!rtable_exists(tableid))
 			return (ENOENT);
-		NET_LOCK_SHARED();
 		for (i = 1; i <= AF_MAX; i++) {
 			if (af != 0 && af != i)
 				continue;
@@ -2233,7 +2261,6 @@ sysctl_rtable(int *name, u_int namelen, void *where, size_t *given, void *new,
 			if (error)
 				break;
 		}
-		NET_UNLOCK_SHARED();
 		break;
 	}
 	free(w.w_tmem, M_RTABLE, w.w_tmemsize);

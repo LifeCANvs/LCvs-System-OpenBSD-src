@@ -1,4 +1,4 @@
-#	$OpenBSD: Makefile.arm64,v 1.47 2023/09/06 01:47:36 jsg Exp $
+#	$OpenBSD: Makefile.arm64,v 1.54 2025/05/05 20:43:32 tedu Exp $
 
 # For instructions on building kernels consult the config(8) and options(4)
 # manual pages.
@@ -38,6 +38,7 @@ INCLUDES=	-nostdinc -I$S -I${.OBJDIR} -I$S/arch \
 		-I$S/dev/pci/drm/amd/pm/swsmu/smu11 \
 		-I$S/dev/pci/drm/amd/pm/swsmu/smu12 \
 		-I$S/dev/pci/drm/amd/pm/swsmu/smu13 \
+		-I$S/dev/pci/drm/amd/pm/swsmu/smu14 \
 		-I$S/dev/pci/drm/amd/pm/powerplay/inc \
 		-I$S/dev/pci/drm/amd/pm/powerplay/hwmgr \
 		-I$S/dev/pci/drm/amd/pm/powerplay/smumgr \
@@ -46,6 +47,30 @@ INCLUDES=	-nostdinc -I$S -I${.OBJDIR} -I$S/arch \
 		-I$S/dev/pci/drm/amd/display/dc/inc \
 		-I$S/dev/pci/drm/amd/display/dc/inc/hw \
 		-I$S/dev/pci/drm/amd/display/dc/clk_mgr \
+		-I$S/dev/pci/drm/amd/display/dc/dccg \
+		-I$S/dev/pci/drm/amd/display/dc/dio \
+		-I$S/dev/pci/drm/amd/display/dc/dpp \
+		-I$S/dev/pci/drm/amd/display/dc/dsc \
+		-I$S/dev/pci/drm/amd/display/dc/dwb \
+		-I$S/dev/pci/drm/amd/display/dc/hubbub \
+		-I$S/dev/pci/drm/amd/display/dc/hpo \
+		-I$S/dev/pci/drm/amd/display/dc/hwss \
+		-I$S/dev/pci/drm/amd/display/dc/hubp \
+		-I$S/dev/pci/drm/amd/display/dc/dml2 \
+		-I$S/dev/pci/drm/amd/display/dc/dml2/dml21 \
+		-I$S/dev/pci/drm/amd/display/dc/dml2/dml21/inc \
+		-I$S/dev/pci/drm/amd/display/dc/dml2/dml21/src/dml2_core \
+		-I$S/dev/pci/drm/amd/display/dc/dml2/dml21/src/dml2_dpmm \
+		-I$S/dev/pci/drm/amd/display/dc/dml2/dml21/src/dml2_mcg \
+		-I$S/dev/pci/drm/amd/display/dc/dml2/dml21/src/dml2_pmo \
+		-I$S/dev/pci/drm/amd/display/dc/dml2/dml21/src/dml2_standalone_libraries \
+		-I$S/dev/pci/drm/amd/display/dc/dml2/dml21/src/inc \
+		-I$S/dev/pci/drm/amd/display/dc/mmhubbub \
+		-I$S/dev/pci/drm/amd/display/dc/mpc \
+		-I$S/dev/pci/drm/amd/display/dc/opp \
+		-I$S/dev/pci/drm/amd/display/dc/optc \
+		-I$S/dev/pci/drm/amd/display/dc/pg \
+		-I$S/dev/pci/drm/amd/display/dc/resource \
 		-I$S/dev/pci/drm/amd/display/modules/inc \
 		-I$S/dev/pci/drm/amd/display/modules/hdcp \
 		-I$S/dev/pci/drm/amd/display/dmub/inc
@@ -56,10 +81,11 @@ CWARNFLAGS=	-Werror -Wall -Wimplicit-function-declaration \
 		-Wno-unused-but-set-variable -Wno-gnu-folding-constant \
 		-Wframe-larger-than=2047
 
-CMACHFLAGS=	-march=armv8-a+nofp+nosimd \
+CMACHFLAGS=	-march=armv8-a+nofp+nosimd+rng \
 		-fno-omit-frame-pointer -mno-omit-leaf-frame-pointer \
 		-ffixed-x18
 CMACHFLAGS+=	-ffreestanding ${NOPIE_FLAGS}
+CMACHFLAGS+=	-moutline-atomics
 SORTR=		sort -R
 .if ${IDENT:M-DNO_PROPOLICE}
 CMACHFLAGS+=	-fno-stack-protector
@@ -182,10 +208,13 @@ locore.o trampoline.o: assym.h
 hardlink-obsd:
 	[[ ! -f /bsd ]] || cmp -s bsd /bsd || ln -f /bsd /obsd
 
+reconfig:
+	[[ ! -f /etc/bsd.re-config ]] || config -e -c /etc/bsd.re-config -f bsd
+
 newinstall:
 	install -F -m 700 bsd /bsd && sha256 -h /var/db/kernel.SHA256 /bsd
 
-install: update-link hardlink-obsd newinstall
+install: update-link hardlink-obsd reconfig newinstall
 
 # pull in the dependency information
 .ifnmake clean

@@ -1,4 +1,4 @@
-/*	$OpenBSD: ip6_forward.c,v 1.118 2024/06/07 18:24:16 bluhm Exp $	*/
+/*	$OpenBSD: ip6_forward.c,v 1.126 2025/02/24 20:16:14 bluhm Exp $	*/
 /*	$KAME: ip6_forward.c,v 1.75 2001/06/29 12:42:13 jinmei Exp $	*/
 
 /*
@@ -45,6 +45,9 @@
 #include <net/if_var.h>
 #include <net/if_enc.h>
 #include <net/route.h>
+#if NPF > 0
+#include <net/pfvar.h>
+#endif
 
 #include <netinet/in.h>
 #include <netinet/ip_var.h>
@@ -53,20 +56,15 @@
 #include <netinet6/ip6_var.h>
 #include <netinet/icmp6.h>
 #include <netinet6/nd6.h>
-
-#if NPF > 0
-#include <net/pfvar.h>
-#endif
-
+#include <netinet/udp.h>
+#include <netinet/tcp.h>
+#include <netinet/tcp_timer.h>
+#include <netinet/tcp_var.h>
 #ifdef IPSEC
 #include <netinet/ip_ipsp.h>
 #include <netinet/ip_ah.h>
 #include <netinet/ip_esp.h>
-#include <netinet/udp.h>
 #endif
-#include <netinet/tcp.h>
-#include <netinet/tcp_timer.h>
-#include <netinet/tcp_var.h>
 
 /*
  * Forward a packet.  If some error occurs return the sender
@@ -82,15 +80,24 @@
  */
 
 void
-ip6_forward(struct mbuf *m, struct route *ro, int srcrt)
+ip6_forward(struct mbuf *m, struct route *ro, int flags)
 {
 	struct ip6_hdr *ip6 = mtod(m, struct ip6_hdr *);
 	struct route iproute;
 	struct rtentry *rt;
 	struct sockaddr *dst;
 	struct ifnet *ifp = NULL;
-	int error = 0, type = 0, code = 0, destmtu = 0;
+	u_int rtableid = m->m_pkthdr.ph_rtableid;
+	u_int ifidx = m->m_pkthdr.ph_ifidx;
+	u_int8_t loopcnt = m->m_pkthdr.ph_loopcnt;
+	u_int icmp_len;
+	char icmp_buf[MHLEN];
+	CTASSERT(sizeof(struct ip6_hdr) + sizeof(struct tcphdr) +
+	    MAX_TCPOPTLEN <= sizeof(icmp_buf));
+	u_short mflags, pfflags;
 	struct mbuf *mcopy;
+	int error = 0, type = 0, code = 0, destmtu = 0;
+	u_int orig_rtableid;
 #ifdef IPSEC
 	struct tdb *tdb = NULL;
 #endif /* IPSEC */
@@ -117,9 +124,7 @@ ip6_forward(struct mbuf *m, struct route *ro, int srcrt)
 			log(LOG_DEBUG,
 			    "cannot forward "
 			    "from %s to %s nxt %d received on interface %u\n",
-			    src6, dst6,
-			    ip6->ip6_nxt,
-			    m->m_pkthdr.ph_ifidx);
+			    src6, dst6, ip6->ip6_nxt, ifidx);
 		}
 		m_freem(m);
 		goto done;
@@ -137,13 +142,46 @@ ip6_forward(struct mbuf *m, struct route *ro, int srcrt)
 	 * size of IPv6 + ICMPv6 headers) bytes of the packet in case
 	 * we need to generate an ICMP6 message to the src.
 	 * Thanks to M_EXT, in most cases copy will not occur.
+	 * For small packets copy original onto stack instead of mbuf.
+	 *
+	 * For final protocol header like TCP or UDP, full header chain in
+	 * ICMP6 packet is not necessary.  In this case only copy small
+	 * part of original packet and save it on stack instead of mbuf.
+	 * Although this violates RFC 4443 2.4. (c), it avoids additional
+	 * mbuf allocations.  Also pf nat and rdr do not affect the shared
+	 * mbuf cluster.
 	 *
 	 * It is important to save it before IPsec processing as IPsec
 	 * processing may modify the mbuf.
 	 */
-	mcopy = m_copym(m, 0, imin(m->m_pkthdr.len, ICMPV6_PLD_MAXLEN),
-	    M_NOWAIT);
+	switch (ip6->ip6_nxt) {
+	case IPPROTO_TCP:
+		icmp_len = sizeof(struct ip6_hdr) + sizeof(struct tcphdr) +
+		    MAX_TCPOPTLEN;
+		break;
+	case IPPROTO_UDP:
+		icmp_len = sizeof(struct ip6_hdr) + sizeof(struct udphdr);
+		break;
+	case IPPROTO_ESP:
+		icmp_len = sizeof(struct ip6_hdr) + 2 * sizeof(u_int32_t);
+		break;
+	default:
+		icmp_len = ICMPV6_PLD_MAXLEN;
+		break;
+	}
+	if (icmp_len > m->m_pkthdr.len)
+		icmp_len = m->m_pkthdr.len;
+	if (icmp_len <= sizeof(icmp_buf)) {
+		mflags = m->m_flags;
+		pfflags = m->m_pkthdr.pf.flags;
+		m_copydata(m, 0, icmp_len, icmp_buf);
+		mcopy = NULL;
+	} else {
+		mcopy = m_copym(m, 0, icmp_len, M_NOWAIT);
+		icmp_len = 0;
+	}
 
+	orig_rtableid = m->m_pkthdr.ph_rtableid;
 #if NPF > 0
 reroute:
 #endif
@@ -174,12 +212,10 @@ reroute:
 	    m->m_pkthdr.ph_rtableid);
 	if (rt == NULL) {
 		ip6stat_inc(ip6s_noroute);
-		if (mcopy != NULL) {
-			icmp6_error(mcopy, ICMP6_DST_UNREACH,
-				    ICMP6_DST_UNREACH_NOROUTE, 0);
-		}
+		type = ICMP6_DST_UNREACH;
+		code = ICMP6_DST_UNREACH_NOROUTE;
 		m_freem(m);
-		goto done;
+		goto icmperror;
 	}
 	dst = &ro->ro_dstsa;
 
@@ -190,7 +226,7 @@ reroute:
 	 * unreachable error with Code 2 (beyond scope of source address).
 	 * [draft-ietf-ipngwg-icmp-v3-00.txt, Section 3.1]
 	 */
-	if (in6_addr2scopeid(m->m_pkthdr.ph_ifidx, &ip6->ip6_src) !=
+	if (in6_addr2scopeid(ifidx, &ip6->ip6_src) !=
 	    in6_addr2scopeid(rt->rt_ifidx, &ip6->ip6_src)) {
 		time_t uptime;
 
@@ -205,15 +241,12 @@ reroute:
 			log(LOG_DEBUG,
 			    "cannot forward "
 			    "src %s, dst %s, nxt %d, rcvif %u, outif %u\n",
-			    src6, dst6,
-			    ip6->ip6_nxt,
-			    m->m_pkthdr.ph_ifidx, rt->rt_ifidx);
+			    src6, dst6, ip6->ip6_nxt, ifidx, rt->rt_ifidx);
 		}
-		if (mcopy != NULL)
-			icmp6_error(mcopy, ICMP6_DST_UNREACH,
-				    ICMP6_DST_UNREACH_BEYONDSCOPE, 0);
+		type = ICMP6_DST_UNREACH;
+		code = ICMP6_DST_UNREACH_BEYONDSCOPE;
 		m_freem(m);
-		goto done;
+		goto icmperror;
 	}
 
 #ifdef IPSEC
@@ -223,7 +256,7 @@ reroute:
 	 */
 	if (tdb != NULL) {
 		/* Callee frees mbuf */
-		error = ip6_output_ipsec_send(tdb, m, ro, 0, 1);
+		error = ip6_output_ipsec_send(tdb, m, ro, orig_rtableid, 0, 1);
 		rt = ro->ro_rt;
 		if (error)
 			goto senderr;
@@ -248,9 +281,10 @@ reroute:
 		m_freem(m);
 		goto freecopy;
 	}
-	if (rt->rt_ifidx == m->m_pkthdr.ph_ifidx && !srcrt &&
-	    ip6_sendredirects &&
-	    (rt->rt_flags & (RTF_DYNAMIC|RTF_MODIFIED)) == 0) {
+	if (rt->rt_ifidx == ifidx &&
+	    !ISSET(rt->rt_flags, RTF_DYNAMIC|RTF_MODIFIED) &&
+	    !ISSET(flags, IPV6_REDIRECT) &&
+	    atomic_load_int(&ip6_sendredirects)) {
 		if ((ifp->if_flags & IFF_POINTOPOINT) &&
 		    nd6_is_addr_neighbor(&ro->ro_dstsin6, ifp)) {
 			/*
@@ -268,11 +302,10 @@ reroute:
 			 * type/code is based on suggestion by Rich Draves.
 			 * not sure if it is the best pick.
 			 */
-			if (mcopy != NULL)
-				icmp6_error(mcopy, ICMP6_DST_UNREACH,
-				    ICMP6_DST_UNREACH_ADDR, 0);
+			type = ICMP6_DST_UNREACH;
+			code = ICMP6_DST_UNREACH_ADDR;
 			m_freem(m);
-			goto done;
+			goto icmperror;
 		}
 		type = ND_REDIRECT;
 	}
@@ -305,13 +338,22 @@ reroute:
 	} else if (m->m_pkthdr.pf.flags & PF_TAG_REROUTE) {
 		/* tag as generated to skip over pf_test on rerun */
 		m->m_pkthdr.pf.flags |= PF_TAG_GENERATED;
-		srcrt = 1;
+		SET(flags, IPV6_REDIRECT);
 		if (ro == &iproute)
 			rtfree(ro->ro_rt);
 		ro = NULL;
 		if_put(ifp);
 		ifp = NULL;
 		goto reroute;
+	}
+#endif
+
+#ifdef IPSEC
+	if (ISSET(flags, IPV6_FORWARDING) &&
+	    ISSET(flags, IPV6_FORWARDING_IPSEC) &&
+	    !ISSET(m->m_pkthdr.ph_tagsset, PACKET_TAG_IPSEC_IN_DONE)) {
+		error = EHOSTUNREACH;
+		goto senderr;
 	}
 #endif
 
@@ -323,30 +365,47 @@ reroute:
 	if (error || m == NULL)
 		goto senderr;
 
-	if (mcopy != NULL)
-		icmp6_error(mcopy, ICMP6_PACKET_TOO_BIG, 0, ifp->if_mtu);
+	type = ICMP6_PACKET_TOO_BIG;
+	destmtu = ifp->if_mtu;
 	m_freem(m);
-	goto done;
+	goto icmperror;
 
 senderr:
-	if (mcopy == NULL)
+	if (mcopy == NULL && icmp_len == 0)
 		goto done;
 
 	switch (error) {
 	case 0:
 		if (type == ND_REDIRECT) {
-			icmp6_redirect_output(mcopy, rt);
-			ip6stat_inc(ip6s_redirectsent);
+			if (icmp_len != 0) {
+				mcopy = m_gethdr(M_DONTWAIT, MT_DATA);
+				if (mcopy == NULL)
+					goto done;
+				mcopy->m_len = mcopy->m_pkthdr.len = icmp_len;
+				mcopy->m_flags |= (mflags & M_COPYFLAGS);
+				mcopy->m_pkthdr.ph_rtableid = rtableid;
+				mcopy->m_pkthdr.ph_ifidx = ifidx;
+				mcopy->m_pkthdr.ph_loopcnt = loopcnt;
+				mcopy->m_pkthdr.pf.flags |=
+				    (pfflags & PF_TAG_GENERATED);
+				memcpy(mcopy->m_data, icmp_buf, icmp_len);
+			}
+			if (mcopy != NULL) {
+				icmp6_redirect_output(mcopy, rt);
+				ip6stat_inc(ip6s_redirectsent);
+			}
 			goto done;
 		}
 		goto freecopy;
 
 	case EMSGSIZE:
 		type = ICMP6_PACKET_TOO_BIG;
-		code = 0;
 		if (rt != NULL) {
-			if (rt->rt_mtu) {
-				destmtu = rt->rt_mtu;
+			u_int rtmtu;
+
+			rtmtu = atomic_load_int(&rt->rt_mtu);
+			if (rtmtu != 0) {
+				destmtu = rtmtu;
 			} else {
 				struct ifnet *destifp;
 
@@ -381,7 +440,21 @@ senderr:
 		code = ICMP6_DST_UNREACH_ADDR;
 		break;
 	}
-	icmp6_error(mcopy, type, code, destmtu);
+ icmperror:
+	if (icmp_len != 0) {
+		mcopy = m_gethdr(M_DONTWAIT, MT_DATA);
+		if (mcopy == NULL)
+			goto done;
+		mcopy->m_len = mcopy->m_pkthdr.len = icmp_len;
+		mcopy->m_flags |= (mflags & M_COPYFLAGS);
+		mcopy->m_pkthdr.ph_rtableid = rtableid;
+		mcopy->m_pkthdr.ph_ifidx = ifidx;
+		mcopy->m_pkthdr.ph_loopcnt = loopcnt;
+		mcopy->m_pkthdr.pf.flags |= (pfflags & PF_TAG_GENERATED);
+		memcpy(mcopy->m_data, icmp_buf, icmp_len);
+	}
+	if (mcopy != NULL)
+		icmp6_error(mcopy, type, code, destmtu);
 	goto done;
 
  freecopy:

@@ -1,4 +1,4 @@
-/* $OpenBSD: pkcs12.h,v 1.3 2024/03/02 10:15:16 tb Exp $ */
+/* $OpenBSD: pkcs12.h,v 1.5 2025/03/09 15:45:52 tb Exp $ */
 /*
  * Copyright (c) 2022 Bob Beck <beck@openbsd.org>
  *
@@ -46,6 +46,7 @@ LCRYPTO_USED(PKCS12_unpack_p7encdata);
 LCRYPTO_USED(PKCS12_unpack_authsafes);
 LCRYPTO_USED(PKCS8_add_keyusage);
 LCRYPTO_USED(PKCS12_get_friendlyname);
+LCRYPTO_USED(PKCS12_key_gen_uni);
 LCRYPTO_USED(PKCS12_verify_mac);
 LCRYPTO_USED(PKCS12_set_mac);
 LCRYPTO_USED(OPENSSL_asc2uni);
@@ -67,5 +68,9 @@ LCRYPTO_USED(d2i_PKCS12_bio);
 LCRYPTO_USED(d2i_PKCS12_fp);
 LCRYPTO_USED(PKCS12_newpass);
 LCRYPTO_USED(ERR_load_PKCS12_strings);
+#if defined(LIBRESSL_NAMESPACE)
+extern LCRYPTO_USED(PKCS12_it);
+extern LCRYPTO_USED(PKCS12_SAFEBAG_it);
+#endif
 
 #endif /* _LIBCRYPTO_PKCS12_H */

@@ -1,5 +1,5 @@
 #
-#	$OpenBSD: daily,v 1.99 2024/05/30 14:29:05 sthen Exp $
+#	$OpenBSD: daily,v 1.101 2025/03/31 17:35:28 schwarze Exp $
 #	From: @(#)daily	8.2 (Berkeley) 1/25/94
 #
 # For local additions, create the file /etc/daily.local.
@@ -136,9 +136,6 @@ done
 next_part "Services that should be running but aren't:"
 rcctl ls failed
 
-next_part "Services that are running but shouldn't:"
-rcctl ls rogue
-
 next_part "Filesystems which need to be dumped:"
 dump w | grep -vB1 ^Dump
 
@@ -176,7 +173,7 @@ MAINOUT=/var/log/security.out
 install -o 0 -g 0 -m 600 -b /dev/null $MAINOUT
 
 start_part "Running security(8):"
-export SUIDSKIP
+export PASSWDSKIP SUIDSKIP
 /usr/libexec/security
 end_part
 rm -f $PARTOUT

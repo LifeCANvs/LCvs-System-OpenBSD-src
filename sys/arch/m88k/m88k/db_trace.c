@@ -1,4 +1,4 @@
-/*	$OpenBSD: db_trace.c,v 1.19 2023/04/11 00:45:07 jsg Exp $	*/
+/*	$OpenBSD: db_trace.c,v 1.21 2024/11/07 16:02:29 miod Exp $	*/
 /*
  * Mach Operating System
  * Copyright (c) 1993-1991 Carnegie Mellon University
@@ -45,8 +45,8 @@
 #define	DPRINTF(stmt) do { } while (0)
 #endif
 
-static inline
-u_int br_dest(vaddr_t addr, u_int inst)
+static inline u_int
+br_dest(vaddr_t addr, u_int inst)
 {
 	inst = (inst & 0x03ffffff) << 2;
 	/* check if sign extension is needed */
@@ -481,7 +481,7 @@ stack_decode(vaddr_t addr, vaddr_t *stack, int (*pr)(const char *, ...))
 	 * look back in memory for a prologue pattern.
 	 */
 	if (proc != NULL) {
-		char *names = NULL;
+		const char *names = NULL;
 		db_symbol_values(proc, &names, &function_addr);
 		if (names == NULL)
 			return 0;

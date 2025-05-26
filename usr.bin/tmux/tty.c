@@ -1,4 +1,4 @@
-/* $OpenBSD: tty.c,v 1.436 2024/05/14 10:11:09 nicm Exp $ */
+/* $OpenBSD: tty.c,v 1.444 2025/05/12 09:50:00 nicm Exp $ */
 
 /*
  * Copyright (c) 2007 Nicholas Marriott <nicholas.marriott@gmail.com>
@@ -42,7 +42,6 @@ static void	tty_cursor_pane(struct tty *, const struct tty_ctx *, u_int,
 		    u_int);
 static void	tty_cursor_pane_unless_wrap(struct tty *,
 		    const struct tty_ctx *, u_int, u_int);
-static void	tty_invalidate(struct tty *);
 static void	tty_colours(struct tty *, const struct grid_cell *);
 static void	tty_check_fg(struct tty *, struct colour_palette *,
     		    struct grid_cell *);
@@ -135,6 +134,14 @@ tty_resize(struct tty *tty)
 			ypixel = 0;
 		} else
 			ypixel = ws.ws_ypixel / sy;
+
+		if ((xpixel == 0 || ypixel == 0) &&
+		    tty->out != NULL &&
+		    !(tty->flags & TTY_WINSIZEQUERY) &&
+		    (tty->term->flags & TERM_VT100LIKE)) {
+			tty_puts(tty, "\033[18t\033[14t");
+			tty->flags |= TTY_WINSIZEQUERY;
+		}
 	} else {
 		sx = 80;
 		sy = 24;
@@ -344,6 +351,11 @@ tty_start_tty(struct tty *tty)
 	if (tty_term_has(tty->term, TTYC_ENBP))
 		tty_putcode(tty, TTYC_ENBP);
 
+	if (tty->term->flags & TERM_VT100LIKE) {
+		/* Subscribe to theme changes and request theme now. */
+		tty_puts(tty, "\033[?2031h\033[?996n");
+	}
+
 	evtimer_set(&tty->start_timer, tty_start_timer_callback, tty);
 	evtimer_add(&tty->start_timer, &tv);
 
@@ -455,6 +467,9 @@ tty_stop_tty(struct tty *tty)
 	if (tty_use_margin(tty))
 		tty_raw(tty, tty_term_string(tty->term, TTYC_DSMG));
 	tty_raw(tty, tty_term_string(tty->term, TTYC_RMCUP));
+
+	if (tty->term->flags & TERM_VT100LIKE)
+		tty_raw(tty, "\033[?2031l");
 
 	setblocking(c->fd, 1);
 }
@@ -1354,6 +1369,8 @@ tty_check_codeset(struct tty *tty, const struct grid_cell *gc)
 	/* Characters less than 0x7f are always fine, no matter what. */
 	if (gc->data.size == 1 && *gc->data.data < 0x7f)
 		return (gc);
+	if (gc->flags & GRID_FLAG_TAB)
+		return (gc);
 
 	/* UTF-8 terminal and a UTF-8 character - fine. */
 	if (tty->client->flags & CLIENT_UTF8)
@@ -2247,7 +2264,7 @@ tty_reset(struct tty *tty)
 	memcpy(&tty->last_cell, &grid_default_cell, sizeof tty->last_cell);
 }
 
-static void
+void
 tty_invalidate(struct tty *tty)
 {
 	memcpy(&tty->cell, &grid_default_cell, sizeof tty->cell);
@@ -2617,8 +2634,7 @@ tty_attributes(struct tty *tty, const struct grid_cell *gc,
 	if (changed & GRID_ATTR_ITALICS)
 		tty_set_italics(tty);
 	if (changed & GRID_ATTR_ALL_UNDERSCORE) {
-		if ((changed & GRID_ATTR_UNDERSCORE) ||
-		    !tty_term_has(tty->term, TTYC_SMULX))
+		if (changed & GRID_ATTR_UNDERSCORE)
 			tty_putcode(tty, TTYC_SMUL);
 		else if (changed & GRID_ATTR_UNDERSCORE_2)
 			tty_putcode_i(tty, TTYC_SMULX, 2);
@@ -2656,7 +2672,6 @@ static void
 tty_colours(struct tty *tty, const struct grid_cell *gc)
 {
 	struct grid_cell	*tc = &tty->cell;
-	int			 have_ax;
 
 	/* No changes? Nothing is necessary. */
 	if (gc->fg == tc->fg && gc->bg == tc->bg && gc->us == tc->us)
@@ -2670,28 +2685,18 @@ tty_colours(struct tty *tty, const struct grid_cell *gc)
 	 */
 	if (COLOUR_DEFAULT(gc->fg) || COLOUR_DEFAULT(gc->bg)) {
 		/*
-		 * If don't have AX but do have op, send sgr0 (op can't
-		 * actually be used because it is sometimes the same as sgr0
-		 * and sometimes isn't). This resets both colours to default.
-		 *
+		 * If don't have AX, send sgr0. This resets both colours to default.
 		 * Otherwise, try to set the default colour only as needed.
 		 */
-		have_ax = tty_term_flag(tty->term, TTYC_AX);
-		if (!have_ax && tty_term_has(tty->term, TTYC_OP))
+		if (!tty_term_flag(tty->term, TTYC_AX))
 			tty_reset(tty);
 		else {
 			if (COLOUR_DEFAULT(gc->fg) && !COLOUR_DEFAULT(tc->fg)) {
-				if (have_ax)
-					tty_puts(tty, "\033[39m");
-				else if (tc->fg != 7)
-					tty_putcode_i(tty, TTYC_SETAF, 7);
+				tty_puts(tty, "\033[39m");
 				tc->fg = gc->fg;
 			}
 			if (COLOUR_DEFAULT(gc->bg) && !COLOUR_DEFAULT(tc->bg)) {
-				if (have_ax)
-					tty_puts(tty, "\033[49m");
-				else if (tc->bg != 0)
-					tty_putcode_i(tty, TTYC_SETAB, 0);
+				tty_puts(tty, "\033[49m");
 				tc->bg = gc->bg;
 			}
 		}
@@ -2703,7 +2708,7 @@ tty_colours(struct tty *tty, const struct grid_cell *gc)
 
 	/*
 	 * Set the background colour. This must come after the foreground as
-	 * tty_colour_fg() can call tty_reset().
+	 * tty_colours_fg() can call tty_reset().
 	 */
 	if (!COLOUR_DEFAULT(gc->bg) && gc->bg != tc->bg)
 		tty_colours_bg(tty, gc);
@@ -2754,13 +2759,23 @@ tty_check_fg(struct tty *tty, struct colour_palette *palette,
 	/* Is this a 256-colour colour? */
 	if (gc->fg & COLOUR_FLAG_256) {
 		/* And not a 256 colour mode? */
-		if (colours < 256) {
-			gc->fg = colour_256to16(gc->fg);
-			if (gc->fg & 8) {
-				gc->fg &= 7;
-				if (colours >= 16)
-					gc->fg += 90;
-			}
+		if (colours >= 256)
+			return;
+		gc->fg = colour_256to16(gc->fg);
+		if (~gc->fg & 8)
+			return;
+		gc->fg &= 7;
+		if (colours >= 16)
+			gc->fg += 90;
+		else {
+			/*
+			 * Mapping to black-on-black or white-on-white is not
+			 * much use, so change the foreground.
+			 */
+			if (gc->fg == 0 && gc->bg == 0)
+				gc->fg = 7;
+			else if (gc->fg == 7 && gc->bg == 7)
+				gc->fg = 0;
 		}
 		return;
 	}
@@ -2808,14 +2823,14 @@ tty_check_bg(struct tty *tty, struct colour_palette *palette,
 		 * palette. Bold background doesn't exist portably, so just
 		 * discard the bold bit if set.
 		 */
-		if (colours < 256) {
-			gc->bg = colour_256to16(gc->bg);
-			if (gc->bg & 8) {
-				gc->bg &= 7;
-				if (colours >= 16)
-					gc->bg += 90;
-			}
-		}
+		if (colours >= 256)
+			return;
+		gc->bg = colour_256to16(gc->bg);
+		if (~gc->bg & 8)
+			return;
+		gc->bg &= 7;
+		if (colours >= 16)
+			gc->bg += 90;
 		return;
 	}
 
@@ -2850,6 +2865,15 @@ tty_colours_fg(struct tty *tty, const struct grid_cell *gc)
 {
 	struct grid_cell	*tc = &tty->cell;
 	char			 s[32];
+
+	/*
+	 * If the current colour is an aixterm bright colour and the new is not,
+	 * reset because some terminals do not clear bright correctly.
+	 */
+	if (tty->cell.fg >= 90 &&
+	    tty->cell.bg <= 97 &&
+	    (gc->fg < 90 || gc->fg > 97))
+		tty_reset(tty);
 
 	/* Is this a 24-bit or 256-colour colour? */
 	if (gc->fg & COLOUR_FLAG_RGB || gc->fg & COLOUR_FLAG_256) {

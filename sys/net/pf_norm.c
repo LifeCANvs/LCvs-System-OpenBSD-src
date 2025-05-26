@@ -1,4 +1,4 @@
-/*	$OpenBSD: pf_norm.c,v 1.230 2024/04/22 13:30:22 bluhm Exp $ */
+/*	$OpenBSD: pf_norm.c,v 1.235 2025/05/21 09:33:48 mvs Exp $ */
 
 /*
  * Copyright 2001 Niels Provos <provos@citi.umich.edu>
@@ -168,7 +168,7 @@ pf_normalize_init(void)
 	    IPL_SOFTNET, 0, "pfstscr", NULL);
 
 	pool_sethiwat(&pf_frag_pl, PFFRAG_FRAG_HIWAT);
-	pool_sethardlimit(&pf_frent_pl, PFFRAG_FRENT_HIWAT, NULL, 0);
+	pool_sethardlimit(&pf_frent_pl, PFFRAG_FRENT_HIWAT);
 
 	TAILQ_INIT(&pf_fragqueue);
 
@@ -667,34 +667,21 @@ pf_fillup_fragment(struct pf_frnode *key, u_int32_t id,
 
 		aftercut = frent->fe_off + frent->fe_len - after->fe_off;
 		if (aftercut < after->fe_len) {
-			int old_index, new_index;
-
 			DPFPRINTF(LOG_NOTICE, "frag tail overlap %d", aftercut);
 			m_adj(after->fe_m, aftercut);
-			old_index = pf_frent_index(after);
+			/* Fragment may switch queue as fe_off changes */
+			pf_frent_remove(frag, after);
 			after->fe_off += aftercut;
 			after->fe_len -= aftercut;
-			new_index = pf_frent_index(after);
-			if (old_index != new_index) {
-				DPFPRINTF(LOG_DEBUG, "frag index %d, new %d",
-				    old_index, new_index);
-				/* Fragment switched queue as fe_off changed */
-				after->fe_off -= aftercut;
-				after->fe_len += aftercut;
-				/* Remove restored fragment from old queue */
-				pf_frent_remove(frag, after);
-				after->fe_off += aftercut;
-				after->fe_len -= aftercut;
-				/* Insert into correct queue */
-				if (pf_frent_insert(frag, after, prev)) {
-					DPFPRINTF(LOG_WARNING,
-					    "fragment requeue limit exceeded");
-					m_freem(after->fe_m);
-					pool_put(&pf_frent_pl, after);
-					pf_status.fragments--;
-					/* There is not way to recover */
-					goto free_fragment;
-				}
+			/* Insert into correct queue */
+			if (pf_frent_insert(frag, after, prev)) {
+				DPFPRINTF(LOG_WARNING,
+				    "fragment requeue limit exceeded");
+				m_freem(after->fe_m);
+				pool_put(&pf_frent_pl, after);
+				pf_status.fragments--;
+				/* There is not way to recover */
+				goto free_fragment;
 			}
 			break;
 		}
@@ -1011,7 +998,20 @@ pf_refragment6(struct mbuf **m0, struct m_tag *mtag, struct sockaddr_in6 *dst,
 	while ((m = ml_dequeue(&ml)) != NULL) {
 		m->m_pkthdr.pf.flags |= PF_TAG_REFRAGMENTED;
 		if (ifp == NULL) {
-			ip6_forward(m, NULL, 0);
+			int flags = 0;
+
+			switch (atomic_load_int(&ip6_forwarding)) {
+			case 2:
+				SET(flags, IPV6_FORWARDING_IPSEC);
+				/* FALLTHROUGH */
+			case 1:
+				SET(flags, IPV6_FORWARDING);
+				break;
+			default:
+				ip6stat_inc(ip6s_cantforward);
+				return (PF_DROP);
+			}
+			ip6_forward(m, NULL, flags);
 		} else if ((u_long)m->m_pkthdr.len <= ifp->if_mtu) {
 			ifp->if_output(ifp, m, sin6tosa(dst), rt);
 		} else {

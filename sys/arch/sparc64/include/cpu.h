@@ -1,4 +1,4 @@
-/*	$OpenBSD: cpu.h,v 1.107 2024/03/29 21:27:53 miod Exp $	*/
+/*	$OpenBSD: cpu.h,v 1.109 2024/11/06 12:06:15 miod Exp $	*/
 /*	$NetBSD: cpu.h,v 1.28 2001/06/14 22:56:58 thorpej Exp $ */
 
 /*
@@ -81,6 +81,7 @@
 #include <sys/clockintr.h>
 #include <sys/sched.h>
 #include <sys/srp.h>
+#include <uvm/uvm_percpu.h>
 
 /*
  * The cpu_info structure is part of a 64KB structure mapped both the kernel
@@ -123,6 +124,8 @@ struct cpu_info {
 #ifdef MULTIPROCESSOR
 	int			ci_itid;
 	struct srp_hazard	ci_srp_hazards[SRP_HAZARD_NUM];
+#define __HAVE_UVM_PERCPU
+	struct uvm_pmr_cache	ci_uvm;		/* [o] page cache */
 #endif
 	int			ci_node;
 	u_int32_t 		ci_randseed;
@@ -130,7 +133,8 @@ struct cpu_info {
 
 	int			ci_want_resched;
 	int			ci_handled_intr_level;
-	void			*ci_intrpending[16][8];
+	int			ci_idepth;
+	struct intrhand		*ci_intrpending[16];
 	struct clockqueue	ci_queue;
 	struct intrhand		ci_tickintr;
 

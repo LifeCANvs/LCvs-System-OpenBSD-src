@@ -1,4 +1,4 @@
-/*	$OpenBSD: exec_elf.c,v 1.186 2024/04/02 08:39:16 deraadt Exp $	*/
+/*	$OpenBSD: exec_elf.c,v 1.192 2025/05/24 06:49:16 deraadt Exp $	*/
 
 /*
  * Copyright (c) 1996 Per Fogelstrom
@@ -89,6 +89,7 @@
 
 #include <machine/reg.h>
 #include <machine/exec.h>
+#include <machine/elf.h>
 
 int	elf_load_file(struct proc *, char *, struct exec_package *,
 	    struct elf_args *);
@@ -96,7 +97,7 @@ int	elf_check_header(Elf_Ehdr *);
 int	elf_read_from(struct proc *, struct vnode *, u_long, void *, int);
 void	elf_load_psection(struct exec_vmcmd_set *, struct vnode *,
 	    Elf_Phdr *, Elf_Addr *, Elf_Addr *, int *, int);
-int	elf_os_pt_note_name(Elf_Note *);
+int	elf_os_pt_note_name(Elf_Note *, int *);
 int	elf_os_pt_note(struct proc *, struct exec_package *, Elf_Ehdr *, int *);
 int	elf_read_pintable(struct proc *p, struct vnode *vp, Elf_Phdr *pp,
 	    u_int **pinp, int is_ldso, size_t len);
@@ -310,8 +311,10 @@ elf_read_pintable(struct proc *p, struct vnode *vp, Elf_Phdr *pp,
 	for (i = 0; i < nsyscalls; i++) {
 		if (syscalls[i].sysno <= 0 ||
 		    syscalls[i].sysno >= SYS_MAXSYSCALL ||
-		    syscalls[i].offset > len)
+		    syscalls[i].offset > len) {
+			npins = 0;
 			goto bad;
+		}
 		npins = MAX(npins, syscalls[i].sysno);
 	}
 	if (is_ldso)
@@ -568,8 +571,10 @@ elf_load_file(struct proc *p, char *path, struct exec_package *epp,
 			pr->ps_pin.pn_end = base + len;
 			pr->ps_pin.pn_pins = pins;
 			pr->ps_pin.pn_npins = npins;
-			pr->ps_flags |= PS_PIN;
 		}
+	} else {
+		error = EINVAL;	/* no pin table */
+		goto bad1;
 	}
 
 	vn_marktext(nd.ni_vp);
@@ -866,7 +871,6 @@ exec_elf_makecmds(struct proc *p, struct exec_package *epp)
 			epp->ep_pinend = base + len;
 			epp->ep_pins = pins;
 			epp->ep_npins = npins;
-			p->p_p->ps_flags |= PS_PIN;
 		}
 	}
 
@@ -922,6 +926,14 @@ bad:
 		return (ENOEXEC);
 	return (error);
 }
+
+#ifdef __HAVE_CPU_HWCAP
+unsigned long hwcap;
+#endif /* __HAVE_CPU_HWCAP */
+
+#ifdef __HAVE_CPU_HWCAP2
+unsigned long hwcap2;
+#endif /* __HAVE_CPU_HWCAP2 */
 
 /*
  * Phase II of load. It is now safe to load the interpreter. Info collected
@@ -995,6 +1007,18 @@ exec_elf_fixup(struct proc *p, struct exec_package *epp)
 		a->au_v = ap->arg_entry;
 		a++;
 
+#ifdef __HAVE_CPU_HWCAP
+		a->au_id = AUX_hwcap;
+		a->au_v = hwcap;
+		a++;
+#endif /* __HAVE_CPU_HWCAP */
+
+#ifdef __HAVE_CPU_HWCAP2
+		a->au_id = AUX_hwcap2;
+		a->au_v = hwcap2;
+		a++;
+#endif /* __HAVE_CPU_HWCAP2 */
+
 		a->au_id = AUX_openbsd_timekeep;
 		a->au_v = p->p_p->ps_timekeep;
 		a++;
@@ -1012,7 +1036,7 @@ exec_elf_fixup(struct proc *p, struct exec_package *epp)
 }
 
 int
-elf_os_pt_note_name(Elf_Note *np)
+elf_os_pt_note_name(Elf_Note *np, int *typep)
 {
 	int i, j;
 
@@ -1028,8 +1052,10 @@ elf_os_pt_note_name(Elf_Note *np)
 		for (j = np->descsz; j < elfround(np->descsz); j++)
 			if (((char *)(np + 1))[j] != '\0')
 				continue;
-		if (strcmp((char *)(np + 1), elf_note_names[i].name) == 0)
+		if (strcmp((char *)(np + 1), elf_note_names[i].name) == 0) {
+			*typep = np->type;
 			return elf_note_names[i].id;
+		}
 	}
 	return (0);
 }
@@ -1074,6 +1100,7 @@ elf_os_pt_note(struct proc *p, struct exec_package *epp, Elf_Ehdr *eh, int *name
 
 		for (offset = 0; offset < ph->p_filesz; offset += total) {
 			Elf_Note *np2 = (Elf_Note *)((char *)np + offset);
+			int name, type;
 
 			if (offset + sizeof(Elf_Note) > ph->p_filesz)
 				break;
@@ -1081,7 +1108,11 @@ elf_os_pt_note(struct proc *p, struct exec_package *epp, Elf_Ehdr *eh, int *name
 			    elfround(np2->descsz);
 			if (offset + total > ph->p_filesz)
 				break;
-			names |= elf_os_pt_note_name(np2);
+			name = elf_os_pt_note_name(np2, &type);
+			if (name == ELF_NOTE_NAME_OPENBSD &&
+			    type == NT_OPENBSD_PROF)
+				epp->ep_flags |= EXEC_PROFILE;
+			names |= name;
 		}
 	}
 

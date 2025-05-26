@@ -1,4 +1,4 @@
-/* $OpenBSD: p5_pbe.c,v 1.27 2024/03/28 00:44:26 tb Exp $ */
+/* $OpenBSD: p5_pbe.c,v 1.30 2025/05/24 02:57:14 tb Exp $ */
 /* Written by Dr Stephen N Henson (steve@openssl.org) for the OpenSSL
  * project 1999.
  */
@@ -61,10 +61,13 @@
 #include <string.h>
 
 #include <openssl/asn1t.h>
-#include <openssl/err.h>
 #include <openssl/x509.h>
 
+#include "err_local.h"
 #include "x509_local.h"
+
+/* RFC 8018, section 6.1 specifies an eight-octet salt for PBES1. */
+#define PKCS5_PBE1_SALT_LEN	8
 
 /* PKCS#5 password based encryption structure */
 
@@ -89,6 +92,7 @@ const ASN1_ITEM PBEPARAM_it = {
 	.size = sizeof(PBEPARAM),
 	.sname = "PBEPARAM",
 };
+LCRYPTO_ALIAS(PBEPARAM_it);
 
 
 PBEPARAM *
@@ -138,7 +142,7 @@ PKCS5_pbe_set0_algor(X509_ALGOR *algor, int alg, int iter,
 		goto err;
 	}
 	if (!saltlen)
-		saltlen = PKCS5_SALT_LEN;
+		saltlen = PKCS5_PBE1_SALT_LEN;
 	if (!ASN1_STRING_set(pbe->salt, NULL, saltlen)) {
 		ASN1error(ERR_R_MALLOC_FAILURE);
 		goto err;

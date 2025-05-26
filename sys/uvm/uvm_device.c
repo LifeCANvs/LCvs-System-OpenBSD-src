@@ -1,4 +1,4 @@
-/*	$OpenBSD: uvm_device.c,v 1.66 2021/12/15 12:53:53 mpi Exp $	*/
+/*	$OpenBSD: uvm_device.c,v 1.68 2024/12/15 11:02:59 mpi Exp $	*/
 /*	$NetBSD: uvm_device.c,v 1.30 2000/11/25 06:27:59 chs Exp $	*/
 
 /*
@@ -245,8 +245,6 @@ udv_detach(struct uvm_object *uobj)
 {
 	struct uvm_device *udv = (struct uvm_device *)uobj;
 
-	KERNEL_ASSERT_LOCKED();
-
 	/*
 	 * loop until done
 	 */
@@ -333,7 +331,7 @@ udv_fault(struct uvm_faultinfo *ufi, vaddr_t vaddr, vm_page_t *pps, int npages,
 	 */
 	if (UVM_ET_ISCOPYONWRITE(entry)) {
 		uvmfault_unlockall(ufi, ufi->entry->aref.ar_amap, uobj);
-		return(VM_PAGER_ERROR);
+		return EACCES;
 	}
 
 	/*
@@ -356,7 +354,7 @@ udv_fault(struct uvm_faultinfo *ufi, vaddr_t vaddr, vm_page_t *pps, int npages,
 	/*
 	 * loop over the page range entering in as needed
 	 */
-	retval = VM_PAGER_OK;
+	retval = 0;
 	for (lcv = 0 ; lcv < npages ; lcv++, curr_offset += PAGE_SIZE,
 	    curr_va += PAGE_SIZE) {
 		if ((flags & PGO_ALLPAGES) == 0 && lcv != centeridx)
@@ -367,7 +365,7 @@ udv_fault(struct uvm_faultinfo *ufi, vaddr_t vaddr, vm_page_t *pps, int npages,
 
 		paddr = (*mapfn)(device, curr_offset, access_type);
 		if (paddr == -1) {
-			retval = VM_PAGER_ERROR;
+			retval = EACCES; /* XXX */
 			break;
 		}
 		mapprot = ufi->entry->protection;
@@ -389,11 +387,11 @@ udv_fault(struct uvm_faultinfo *ufi, vaddr_t vaddr, vm_page_t *pps, int npages,
 			/* sync what we have so far */
 			pmap_update(ufi->orig_map->pmap);      
 			uvm_wait("udv_fault");
-			return (VM_PAGER_REFAULT);
+			return ERESTART;
 		}
 	}
 
 	uvmfault_unlockall(ufi, ufi->entry->aref.ar_amap, uobj);
 	pmap_update(ufi->orig_map->pmap);
-	return (retval);
+	return retval;
 }

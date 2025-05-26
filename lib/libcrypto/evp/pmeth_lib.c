@@ -1,4 +1,4 @@
-/* $OpenBSD: pmeth_lib.c,v 1.40 2024/04/09 13:52:41 beck Exp $ */
+/* $OpenBSD: pmeth_lib.c,v 1.43 2025/05/10 05:54:38 tb Exp $ */
 /* Written by Dr Stephen N Henson (steve@openssl.org) for the OpenSSL
  * project 2006.
  */
@@ -63,12 +63,12 @@
 
 #include <openssl/opensslconf.h>
 
-#include <openssl/err.h>
 #include <openssl/evp.h>
 #include <openssl/objects.h>
 #include <openssl/x509v3.h>
 
 #include "asn1_local.h"
+#include "err_local.h"
 #include "evp_local.h"
 
 extern const EVP_PKEY_METHOD cmac_pkey_meth;
@@ -80,6 +80,7 @@ extern const EVP_PKEY_METHOD hkdf_pkey_meth;
 extern const EVP_PKEY_METHOD hmac_pkey_meth;
 extern const EVP_PKEY_METHOD rsa_pkey_meth;
 extern const EVP_PKEY_METHOD rsa_pss_pkey_meth;
+extern const EVP_PKEY_METHOD tls1_prf_pkey_meth;
 extern const EVP_PKEY_METHOD x25519_pkey_meth;
 
 static const EVP_PKEY_METHOD *pkey_methods[] = {
@@ -92,6 +93,7 @@ static const EVP_PKEY_METHOD *pkey_methods[] = {
 	&hmac_pkey_meth,
 	&rsa_pkey_meth,
 	&rsa_pss_pkey_meth,
+	&tls1_prf_pkey_meth,
 	&x25519_pkey_meth,
 };
 
@@ -242,6 +244,11 @@ EVP_PKEY_CTX_ctrl(EVP_PKEY_CTX *ctx, int keytype, int optype, int cmd,
 }
 LCRYPTO_ALIAS(EVP_PKEY_CTX_ctrl);
 
+/*
+ * This is practically unused and would best be a part of the openssl(1) code,
+ * but, unfortunately, openssl-ruby exposes this directly in an interface and
+ * it's currently the only way to do RSA-PSS in Ruby.
+ */
 int
 EVP_PKEY_CTX_ctrl_str(EVP_PKEY_CTX *ctx, const char *name, const char *value)
 {

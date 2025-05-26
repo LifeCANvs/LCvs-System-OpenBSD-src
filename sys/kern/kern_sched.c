@@ -1,4 +1,4 @@
-/*	$OpenBSD: kern_sched.c,v 1.96 2024/06/03 12:48:25 claudio Exp $	*/
+/*	$OpenBSD: kern_sched.c,v 1.105 2025/05/16 13:40:30 mpi Exp $	*/
 /*
  * Copyright (c) 2007, 2008 Artur Grabowski <art@openbsd.org>
  *
@@ -95,7 +95,7 @@ sched_init_cpu(struct cpu_info *ci)
 
 	kthread_create_deferred(sched_kthreads_create, ci);
 
-	LIST_INIT(&spc->spc_deadproc);
+	TAILQ_INIT(&spc->spc_deadproc);
 	SIMPLEQ_INIT(&spc->spc_deferred);
 
 	/*
@@ -167,8 +167,8 @@ sched_idle(void *v)
 			mi_switch();
 			SCHED_UNLOCK();
 
-			while ((dead = LIST_FIRST(&spc->spc_deadproc))) {
-				LIST_REMOVE(dead, p_hash);
+			while ((dead = TAILQ_FIRST(&spc->spc_deadproc))) {
+				TAILQ_REMOVE(&spc->spc_deadproc, dead, p_runq);
 				exit2(dead);
 			}
 		}
@@ -206,15 +206,15 @@ sched_idle(void *v)
  * stack torn from under us before we manage to switch to another proc.
  * Therefore we have a per-cpu list of dead processes where we put this
  * proc and have idle clean up that list and move it to the reaper list.
- * All this will be unnecessary once we can bind the reaper this cpu
- * and not risk having it switch to another in case it sleeps.
  */
 void
 sched_exit(struct proc *p)
 {
 	struct schedstate_percpu *spc = &curcpu()->ci_schedstate;
 
-	LIST_INSERT_HEAD(&spc->spc_deadproc, p, p_hash);
+	TAILQ_INSERT_TAIL(&spc->spc_deadproc, p, p_runq);
+
+	tuagg_add_runtime();
 
 	KERNEL_ASSERT_LOCKED();
 	sched_toidle();
@@ -248,8 +248,9 @@ sched_toidle(void)
 	idle->p_stat = SRUN;
 
 	uvmexp.swtch++;
-	TRACEPOINT(sched, off__cpu, idle->p_tid + THREAD_PID_OFFSET,
-	    idle->p_p->ps_pid);
+	if (curproc != NULL)
+		TRACEPOINT(sched, off__cpu, idle->p_tid + THREAD_PID_OFFSET,
+		    idle->p_p->ps_pid);
 	cpu_switchto(NULL, idle);
 	panic("cpu_switchto returned");
 }
@@ -274,6 +275,7 @@ setrunqueue(struct cpu_info *ci, struct proc *p, uint8_t prio)
 	KASSERT(ci != NULL);
 	SCHED_ASSERT_LOCKED();
 	KASSERT(p->p_wchan == NULL);
+	KASSERT(!ISSET(p->p_flag, P_INSCHED));
 
 	p->p_cpu = ci;
 	p->p_stat = SRUN;
@@ -364,6 +366,7 @@ again:
 	} 
 
 	KASSERT(p->p_wchan == NULL);
+	KASSERT(!ISSET(p->p_flag, P_INSCHED));
 	return (p);
 }
 
@@ -566,7 +569,6 @@ log2(unsigned int i)
  * Just total guesstimates for now.
  */
 
-int sched_cost_load = 1;
 int sched_cost_priority = 1;
 int sched_cost_runnable = 3;
 int sched_cost_resident = 1;
@@ -631,6 +633,14 @@ sched_peg_curproc(struct cpu_info *ci)
 	p->p_ru.ru_nvcsw++;
 	mi_switch();
 	SCHED_UNLOCK();
+}
+
+void
+sched_unpeg_curproc(void)
+{
+	struct proc *p = curproc;
+
+	atomic_clearbits_int(&p->p_flag, P_CPUPEG);
 }
 
 #ifdef MULTIPROCESSOR
@@ -699,7 +709,7 @@ sched_barrier_task(void *arg)
 
 	sched_peg_curproc(ci);
 	cond_signal(&sb->cond);
-	atomic_clearbits_int(&curproc->p_flag, P_CPUPEG);
+	sched_unpeg_curproc();
 }
 
 void

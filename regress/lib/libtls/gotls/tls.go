@@ -45,6 +45,8 @@ const (
 )
 
 var protocolNames = map[ProtocolVersion]string{
+	ProtocolTLSv10: "TLSv1",
+	ProtocolTLSv11: "TLSv1.1",
 	ProtocolTLSv12: "TLSv1.2",
 	ProtocolTLSv13: "TLSv1.3",
 	ProtocolsAll:   "all",
@@ -198,6 +200,15 @@ func (t *TLS) PeerCertIssuer() (string, error) {
 		return "", errors.New("no issuer returned")
 	}
 	return C.GoString(issuer), nil
+}
+
+// PeerCertCommonName returns the common name of the peer certificate.
+func (t *TLS) PeerCertCommonName() (string, error) {
+	commonName := C.tls_peer_cert_common_name(t.ctx)
+	if commonName == nil {
+		return "", errors.New("no peer cert common name returned")
+	}
+	return C.GoString(commonName), nil
 }
 
 // PeerCertSubject returns the subject of the peer certificate.

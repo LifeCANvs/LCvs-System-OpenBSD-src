@@ -1,4 +1,4 @@
-/*	$OpenBSD: apldcp.c,v 1.1 2024/01/22 18:54:01 kettenis Exp $	*/
+/*	$OpenBSD: apldcp.c,v 1.4 2025/02/14 18:42:43 kettenis Exp $	*/
 /*
  * Copyright (c) 2023 Mark Kettenis <kettenis@openbsd.org>
  *
@@ -18,6 +18,7 @@
 #include <sys/param.h>
 #include <sys/systm.h>
 #include <sys/device.h>
+#include <sys/pool.h>
 
 #include <machine/intr.h>
 #include <machine/bus.h>
@@ -103,12 +104,15 @@ apldcp_activate(struct device *self, int act)
 
 #include <arm64/dev/rtkit.h>
 
+struct apple_rtkit_task {
+	struct apple_rtkit_ep *rtkep;
+	struct task task;
+	uint64_t msg;
+};
+
 struct apple_rtkit_ep {
 	struct apple_rtkit *rtk;
 	uint8_t ep;
-
-	struct task task;
-	uint64_t msg;
 };
 
 struct apple_rtkit {
@@ -117,6 +121,7 @@ struct apple_rtkit {
 	void *cookie;
 	struct platform_device *pdev;
 	const struct apple_rtkit_ops *ops;
+	struct pool task_pool;
 	struct taskq *tq;
 };
 
@@ -126,54 +131,62 @@ apple_rtkit_logmap(void *cookie, bus_addr_t addr)
 	struct apple_rtkit *rtk = cookie;
 	int idx, len, node;
 	uint32_t *phandles;
-	uint32_t iommu_addresses[5];
+	uint32_t iommu_addrs[5];
+	bus_addr_t trunc_addr;
 	bus_addr_t start;
 	bus_size_t size;
 	uint64_t reg[2];
 
-	len = OF_getproplen(rtk->pdev->node, "memory-region");
-	idx = OF_getindex(rtk->pdev->node, "dcp_data", "memory-region-names");
-	if (idx < 0 || idx >= len / sizeof(uint32_t))
-		return addr;
+	/* XXX some machines have truncated DVAs in "iommu-addresses" */
+	trunc_addr = addr & 0xffffffff;
 
+	len = OF_getproplen(rtk->pdev->node, "memory-region");
 	phandles = malloc(len, M_TEMP, M_WAITOK | M_ZERO);
 	OF_getpropintarray(rtk->pdev->node, "memory-region",
 	    phandles, len);
-	node = OF_getnodebyphandle(phandles[idx]);
+
+	for (idx = 0; idx < len / sizeof(uint32_t); idx++) {
+		node = OF_getnodebyphandle(phandles[idx]);
+		if (node == 0)
+			continue;
+
+		if (!OF_is_compatible(node, "apple,asc-mem"))
+			continue;
+
+		if (OF_getpropint64array(node, "reg", reg,
+		    sizeof(reg)) != sizeof(reg))
+			continue;
+
+		if (OF_getpropintarray(node, "iommu-addresses", iommu_addrs,
+		    sizeof(iommu_addrs)) < sizeof(iommu_addrs))
+			continue;
+		start = (uint64_t)iommu_addrs[1] << 32 | iommu_addrs[2];
+		size = (uint64_t)iommu_addrs[3] << 32 | iommu_addrs[4];
+
+		if (addr >= start && addr < start + size) {
+			free(phandles, M_TEMP, len);
+			return (reg[0] + (addr - start)) | PMAP_NOCACHE;
+		}
+
+		if (trunc_addr >= start && trunc_addr < start + size) {
+			free(phandles, M_TEMP, len);
+			return (reg[0] + (trunc_addr - start)) | PMAP_NOCACHE;
+		}
+	}
+
 	free(phandles, M_TEMP, len);
-
-	if (node == 0)
-		return addr;
-
-	if (!OF_is_compatible(node, "apple,asc-mem"))
-		return addr;
-
-	if (OF_getpropint64array(node, "reg", reg, sizeof(reg)) != sizeof(reg))
-		return addr;
-
-	if (OF_getpropintarray(node, "iommu-addresses", iommu_addresses,
-	    sizeof(iommu_addresses)) < sizeof(iommu_addresses))
-		return addr;
-	start = (uint64_t)iommu_addresses[1] << 32 | iommu_addresses[2];
-	size = (uint64_t)iommu_addresses[3] << 32 | iommu_addresses[4];
-	if (addr >= start && addr < start + size)
-		return reg[0] + (addr - start);
-
-	/* XXX some machines have truncated DVAs in "iommu-addresses" */
-	addr &= 0xffffffff;
-	if (addr >= start && addr < start + size)
-		return reg[0] + (addr - start);
-
-	return (paddr_t)-1;
+	return addr | PMAP_NOCACHE;
 }
 
 void
 apple_rtkit_do_recv(void *arg)
 {
-	struct apple_rtkit_ep *rtkep = arg;
+	struct apple_rtkit_task *rtktask = arg;
+	struct apple_rtkit_ep *rtkep = rtktask->rtkep;
 	struct apple_rtkit *rtk = rtkep->rtk;
 
-	rtk->ops->recv_message(rtk->cookie, rtkep->ep, rtkep->msg);
+	rtk->ops->recv_message(rtk->cookie, rtkep->ep, rtktask->msg);
+	pool_put(&rtk->task_pool, rtktask);
 }
 
 void
@@ -181,9 +194,15 @@ apple_rtkit_recv(void *cookie, uint64_t msg)
 {
 	struct apple_rtkit_ep *rtkep = cookie;
 	struct apple_rtkit *rtk = rtkep->rtk;
+	struct apple_rtkit_task *rtktask;
 
-	rtkep->msg = msg;
-	task_add(rtk->tq, &rtkep->task);
+	rtktask = pool_get(&rtk->task_pool, PR_NOWAIT | PR_ZERO);
+	KASSERT(rtktask != NULL);
+
+	rtktask->rtkep = rtkep;
+	rtktask->msg = msg;
+	task_set(&rtktask->task, apple_rtkit_do_recv, rtktask);
+	task_add(rtk->tq, &rtktask->task);
 }
 
 int
@@ -195,8 +214,6 @@ apple_rtkit_start_ep(struct apple_rtkit *rtk, uint8_t ep)
 	rtkep = &rtk->ep[ep];
 	rtkep->rtk = rtk;
 	rtkep->ep = ep;
-	task_set(&rtkep->task, apple_rtkit_do_recv, rtkep);
-
 	error = rtkit_start_endpoint(rtk->state, ep, apple_rtkit_recv, rtkep);
 	return -error;
 }
@@ -238,6 +255,9 @@ devm_apple_rtkit_init(struct device *dev, void *cookie,
 		free(rtk, M_DEVBUF, sizeof(*rtk));
 		return ERR_PTR(ENOMEM);
 	}
+
+	pool_init(&rtk->task_pool, sizeof(struct apple_rtkit_task), 0, IPL_TTY,
+	    0, "apldcp_rtkit", NULL);
 
 	rk = malloc(sizeof(*rk), M_DEVBUF, M_WAITOK | M_ZERO);
 	rk->rk_cookie = rtk;

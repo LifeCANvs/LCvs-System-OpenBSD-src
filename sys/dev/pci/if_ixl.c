@@ -1,4 +1,4 @@
-/*	$OpenBSD: if_ixl.c,v 1.101 2024/05/24 06:02:53 jsg Exp $ */
+/*	$OpenBSD: if_ixl.c,v 1.107 2025/05/22 06:41:20 jmatthew Exp $ */
 
 /*
  * Copyright (c) 2013-2015, Intel Corporation
@@ -49,6 +49,7 @@
 
 #include "bpfilter.h"
 #include "kstat.h"
+#include "vlan.h"
 
 #include <sys/param.h>
 #include <sys/systm.h>
@@ -882,6 +883,8 @@ struct ixl_rx_wb_desc_16 {
 
 #define IXL_RX_DESC_PTYPE_SHIFT		30
 #define IXL_RX_DESC_PTYPE_MASK		(0xffULL << IXL_RX_DESC_PTYPE_SHIFT)
+#define IXL_RX_DESC_PTYPE_MAC_IPV4_TCP	26
+#define IXL_RX_DESC_PTYPE_MAC_IPV6_TCP	92
 
 #define IXL_RX_DESC_PLEN_SHIFT		38
 #define IXL_RX_DESC_PLEN_MASK		(0x3fffULL << IXL_RX_DESC_PLEN_SHIFT)
@@ -921,54 +924,6 @@ CTASSERT(MAXMCLBYTES < IXL_TSO_SIZE);
 #define IXL_AQ_MASK			(IXL_AQ_NUM - 1)
 #define IXL_AQ_ALIGN			64 /* lol */
 #define IXL_AQ_BUFLEN			4096
-
-/* Packet Classifier Types for filters */
-/* bits 0-28 are reserved for future use */
-#define IXL_PCT_NONF_IPV4_UDP_UCAST	(1ULL << 29)	/* 722 */
-#define IXL_PCT_NONF_IPV4_UDP_MCAST	(1ULL << 30)	/* 722 */
-#define IXL_PCT_NONF_IPV4_UDP		(1ULL << 31)
-#define IXL_PCT_NONF_IPV4_TCP_SYN_NOACK	(1ULL << 32)	/* 722 */
-#define IXL_PCT_NONF_IPV4_TCP		(1ULL << 33)
-#define IXL_PCT_NONF_IPV4_SCTP		(1ULL << 34)
-#define IXL_PCT_NONF_IPV4_OTHER		(1ULL << 35)
-#define IXL_PCT_FRAG_IPV4		(1ULL << 36)
-/* bits 37-38 are reserved for future use */
-#define IXL_PCT_NONF_IPV6_UDP_UCAST	(1ULL << 39)	/* 722 */
-#define IXL_PCT_NONF_IPV6_UDP_MCAST	(1ULL << 40)	/* 722 */
-#define IXL_PCT_NONF_IPV6_UDP		(1ULL << 41)
-#define IXL_PCT_NONF_IPV6_TCP_SYN_NOACK	(1ULL << 42)	/* 722 */
-#define IXL_PCT_NONF_IPV6_TCP		(1ULL << 43)
-#define IXL_PCT_NONF_IPV6_SCTP		(1ULL << 44)
-#define IXL_PCT_NONF_IPV6_OTHER		(1ULL << 45)
-#define IXL_PCT_FRAG_IPV6		(1ULL << 46)
-/* bit 47 is reserved for future use */
-#define IXL_PCT_FCOE_OX			(1ULL << 48)
-#define IXL_PCT_FCOE_RX			(1ULL << 49)
-#define IXL_PCT_FCOE_OTHER		(1ULL << 50)
-/* bits 51-62 are reserved for future use */
-#define IXL_PCT_L2_PAYLOAD		(1ULL << 63)
-
-#define IXL_RSS_HENA_BASE_DEFAULT		\
-	IXL_PCT_NONF_IPV4_UDP |			\
-	IXL_PCT_NONF_IPV4_TCP |			\
-	IXL_PCT_NONF_IPV4_SCTP |		\
-	IXL_PCT_NONF_IPV4_OTHER |		\
-	IXL_PCT_FRAG_IPV4 |			\
-	IXL_PCT_NONF_IPV6_UDP |			\
-	IXL_PCT_NONF_IPV6_TCP |			\
-	IXL_PCT_NONF_IPV6_SCTP |		\
-	IXL_PCT_NONF_IPV6_OTHER |		\
-	IXL_PCT_FRAG_IPV6 |			\
-	IXL_PCT_L2_PAYLOAD
-
-#define IXL_RSS_HENA_BASE_710		IXL_RSS_HENA_BASE_DEFAULT
-#define IXL_RSS_HENA_BASE_722		IXL_RSS_HENA_BASE_DEFAULT | \
-	IXL_PCT_NONF_IPV4_UDP_UCAST |		\
-	IXL_PCT_NONF_IPV4_UDP_MCAST |		\
-	IXL_PCT_NONF_IPV6_UDP_UCAST |		\
-	IXL_PCT_NONF_IPV6_UDP_MCAST |		\
-	IXL_PCT_NONF_IPV4_TCP_SYN_NOACK |	\
-	IXL_PCT_NONF_IPV6_TCP_SYN_NOACK
 
 #define IXL_HMC_ROUNDUP			512
 #define IXL_HMC_PGSIZE			4096
@@ -1966,11 +1921,20 @@ ixl_attach(struct device *parent, struct device *self, void *aux)
 	strlcpy(ifp->if_xname, DEVNAME(sc), IFNAMSIZ);
 	ifq_init_maxlen(&ifp->if_snd, sc->sc_tx_ring_ndescs);
 
-	ifp->if_capabilities = IFCAP_VLAN_HWTAGGING;
+	ifp->if_capabilities = IFCAP_VLAN_MTU;
+#if NVLAN > 0
+	ifp->if_capabilities |= IFCAP_VLAN_HWTAGGING;
+#endif
 	ifp->if_capabilities |= IFCAP_CSUM_IPv4 |
 	    IFCAP_CSUM_TCPv4 | IFCAP_CSUM_UDPv4 |
 	    IFCAP_CSUM_TCPv6 | IFCAP_CSUM_UDPv6;
 	ifp->if_capabilities |= IFCAP_TSOv4 | IFCAP_TSOv6;
+
+	ifp->if_capabilities |= IFCAP_LRO;
+#if notyet
+	/* for now tcplro at ixl(4) is default off */
+	ifp->if_xflags |= IFXF_LRO;
+#endif
 
 	ifmedia_init(&sc->sc_media, 0, ixl_media_change, ixl_media_status);
 
@@ -2724,6 +2688,8 @@ ixl_txr_clean(struct ixl_softc *sc, struct ixl_tx_ring *txr)
 		m_freem(txm->txm_m);
 		txm->txm_m = NULL;
 	}
+
+	ifq_clr_oactive(txr->txr_ifq);
 }
 
 static int
@@ -2806,11 +2772,13 @@ ixl_tx_setup_offload(struct mbuf *m0, struct ixl_tx_ring *txr,
 	uint64_t hlen;
 	uint64_t offload = 0;
 
+#if NVLAN > 0
 	if (ISSET(m0->m_flags, M_VLANTAG)) {
 		uint64_t vtag = m0->m_pkthdr.ether_vtag;
 		offload |= IXL_TX_DESC_CMD_IL2TAG1;
 		offload |= vtag << IXL_TX_DESC_L2TAG1_SHIFT;
 	}
+#endif
 
 	if (!ISSET(m0->m_pkthdr.csum_flags,
 	    M_IPV4_CSUM_OUT|M_TCP_CSUM_OUT|M_UDP_CSUM_OUT|M_TCP_TSO))
@@ -3249,9 +3217,11 @@ ixl_rxeof(struct ixl_softc *sc, struct ixl_rx_ring *rxr)
 	struct ixl_rx_map *rxm;
 	bus_dmamap_t map;
 	unsigned int cons, prod;
+	struct mbuf_list mltcp = MBUF_LIST_INITIALIZER();
 	struct mbuf_list ml = MBUF_LIST_INITIALIZER();
 	struct mbuf *m;
 	uint64_t word;
+	unsigned int ptype;
 	unsigned int len;
 	unsigned int mask;
 	int done = 0;
@@ -3288,6 +3258,8 @@ ixl_rxeof(struct ixl_softc *sc, struct ixl_rx_ring *rxr)
 		m = rxm->rxm_m;
 		rxm->rxm_m = NULL;
 
+		ptype = (word & IXL_RX_DESC_PTYPE_MASK)
+		    >> IXL_RX_DESC_PTYPE_SHIFT;
 		len = (word & IXL_RX_DESC_PLEN_MASK) >> IXL_RX_DESC_PLEN_SHIFT;
 		m->m_len = len;
 		m->m_pkthdr.len = 0;
@@ -3309,14 +3281,24 @@ ixl_rxeof(struct ixl_softc *sc, struct ixl_rx_ring *rxr)
 					m->m_pkthdr.csum_flags |= M_FLOWID;
 				}
 
+#if NVLAN > 0
 				if (ISSET(word, IXL_RX_DESC_L2TAG1P)) {
 					m->m_pkthdr.ether_vtag =
 					    lemtoh16(&rxd->l2tag1);
 					SET(m->m_flags, M_VLANTAG);
 				}
+#endif
 
 				ixl_rx_checksum(m, word);
-				ml_enqueue(&ml, m);
+
+#ifndef SMALL_KERNEL
+				if (ISSET(ifp->if_xflags, IFXF_LRO) &&
+				    (ptype == IXL_RX_DESC_PTYPE_MAC_IPV4_TCP ||
+				     ptype == IXL_RX_DESC_PTYPE_MAC_IPV6_TCP))
+					tcp_softlro_glue(&mltcp, m, ifp);
+				else
+#endif
+					ml_enqueue(&ml, m);
 			} else {
 				ifp->if_ierrors++; /* XXX */
 				m_freem(m);
@@ -3333,8 +3315,14 @@ ixl_rxeof(struct ixl_softc *sc, struct ixl_rx_ring *rxr)
 	} while (cons != prod);
 
 	if (done) {
+		int livelocked = 0;
+
 		rxr->rxr_cons = cons;
+		if (ifiq_input(ifiq, &mltcp))
+			livelocked = 1;
 		if (ifiq_input(ifiq, &ml))
+			livelocked = 1;
+		if (livelocked)
 			if_rxr_livelocked(&rxr->rxr_acct);
 		ixl_rxfill(sc, rxr);
 	}

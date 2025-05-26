@@ -1,4 +1,4 @@
-/*	$OpenBSD: uipc_socket2.c,v 1.155 2024/05/17 19:11:14 mvs Exp $	*/
+/*	$OpenBSD: uipc_socket2.c,v 1.185 2025/03/12 14:08:31 mvs Exp $	*/
 /*	$NetBSD: uipc_socket2.c,v 1.11 1996/02/04 02:17:55 christos Exp $	*/
 
 /*
@@ -47,7 +47,7 @@
  * Primitive routines for operating on sockets and socket buffers
  */
 
-u_long	sb_max = SB_MAX;		/* patchable */
+u_long sb_max = SB_MAX;		/* [I] patchable */
 
 extern struct pool mclpools[];
 extern struct pool mbpool;
@@ -100,26 +100,15 @@ soisconnected(struct socket *so)
 	so->so_state |= SS_ISCONNECTED;
 
 	if (head != NULL && so->so_onq == &head->so_q0) {
-		int persocket = solock_persocket(so);
+		soref(head);
+		sounlock(so);
+		solock(head);
+		solock(so);
 
-		if (persocket) {
-			soref(so);
-			soref(head);
-
-			sounlock(so);
-			solock(head);
-			solock(so);
-
-			if (so->so_onq != &head->so_q0) {
-				sounlock(head);
-				sorele(head);
-				sorele(so);
-
-				return;
-			}
-
+		if (so->so_onq != &head->so_q0) {
+			sounlock(head);
 			sorele(head);
-			sorele(so);
+			return;
 		}
 
 		soqremque(so, 0);
@@ -127,8 +116,8 @@ soisconnected(struct socket *so)
 		sorwakeup(head);
 		wakeup_one(&head->so_timeo);
 
-		if (persocket)
-			sounlock(head);
+		sounlock(head);
+		sorele(head);
 	} else {
 		wakeup(&so->so_timeo);
 		sorwakeup(so);
@@ -160,8 +149,6 @@ void
 soisdisconnected(struct socket *so)
 {
 	soassertlocked(so);
-	so->so_state &= ~(SS_ISCONNECTING|SS_ISCONNECTED|SS_ISDISCONNECTING);
-	so->so_state |= SS_ISDISCONNECTED;
 
 	mtx_enter(&so->so_rcv.sb_mtx);
 	so->so_rcv.sb_state |= SS_CANTRCVMORE;
@@ -170,6 +157,9 @@ soisdisconnected(struct socket *so)
 	mtx_enter(&so->so_snd.sb_mtx);
 	so->so_snd.sb_state |= SS_CANTSENDMORE;
 	mtx_leave(&so->so_snd.sb_mtx);
+
+	so->so_state &= ~(SS_ISCONNECTING|SS_ISCONNECTED|SS_ISDISCONNECTING);
+	so->so_state |= SS_ISDISCONNECTED;
 
 	wakeup(&so->so_timeo);
 	sowwakeup(so);
@@ -188,14 +178,8 @@ struct socket *
 sonewconn(struct socket *head, int connstatus, int wait)
 {
 	struct socket *so;
-	int persocket = solock_persocket(head);
 	int soqueue = connstatus ? 1 : 0;
 
-	/*
-	 * XXXSMP as long as `so' and `head' share the same lock, we
-	 * can call soreserve() and pr_attach() below w/o explicitly
-	 * locking `so'.
-	 */
 	soassertlocked(head);
 
 	if (m_pool_used() > 95)
@@ -220,8 +204,7 @@ sonewconn(struct socket *head, int connstatus, int wait)
 	/*
 	 * Lock order will be `head' -> `so' while these sockets are linked.
 	 */
-	if (persocket)
-		solock(so);
+	solock_nonet(so);
 
 	/*
 	 * Inherit watermarks but those may get clamped in low mem situations.
@@ -254,14 +237,10 @@ sonewconn(struct socket *head, int connstatus, int wait)
 		wakeup(&head->so_timeo);
 	}
 
-	if (persocket)
-		sounlock(so);
-
 	return (so);
 
 fail:
-	if (persocket)
-		sounlock(so);
+	sounlock_nonet(so);
 	sigio_free(&so->so_sigio);
 	klist_free(&so->so_rcv.sb_klist);
 	klist_free(&so->so_snd.sb_klist);
@@ -335,9 +314,6 @@ socantsendmore(struct socket *so)
 void
 socantrcvmore(struct socket *so)
 {
-	if ((so->so_rcv.sb_flags & SB_MTXLOCK) == 0)
-		soassertlocked(so);
-
 	mtx_enter(&so->so_rcv.sb_mtx);
 	so->so_rcv.sb_state |= SS_CANTRCVMORE;
 	mtx_leave(&so->so_rcv.sb_mtx);
@@ -364,16 +340,22 @@ solock_shared(struct socket *so)
 	switch (so->so_proto->pr_domain->dom_family) {
 	case PF_INET:
 	case PF_INET6:
-		if (so->so_proto->pr_usrreqs->pru_lock != NULL) {
-			NET_LOCK_SHARED();
-			rw_enter_write(&so->so_lock);
-		} else
-			NET_LOCK();
-		break;
-	default:
-		rw_enter_write(&so->so_lock);
+		NET_LOCK_SHARED();
 		break;
 	}
+	rw_enter_write(&so->so_lock);
+}
+
+void
+solock_nonet(struct socket *so)
+{
+	switch (so->so_proto->pr_domain->dom_family) {
+	case PF_INET:
+	case PF_INET6:
+		NET_ASSERT_LOCKED();
+		break;
+	}
+	rw_enter_write(&so->so_lock);
 }
 
 int
@@ -391,16 +373,22 @@ solock_persocket(struct socket *so)
 void
 solock_pair(struct socket *so1, struct socket *so2)
 {
-	KASSERT(so1 != so2);
 	KASSERT(so1->so_type == so2->so_type);
-	KASSERT(solock_persocket(so1));
 
-	if (so1 < so2) {
-		solock(so1);
-		solock(so2);
+	switch (so1->so_proto->pr_domain->dom_family) {
+	case PF_INET:
+	case PF_INET6:
+		NET_LOCK_SHARED();
+		break;
+	}
+	if (so1 == so2) {
+		rw_enter_write(&so1->so_lock);
+	} else if (so1 < so2) {
+		rw_enter_write(&so1->so_lock);
+		rw_enter_write(&so2->so_lock);
 	} else {
-		solock(so2);
-		solock(so1);
+		rw_enter_write(&so2->so_lock);
+		rw_enter_write(&so1->so_lock);
 	}
 }
 
@@ -421,17 +409,37 @@ sounlock(struct socket *so)
 void
 sounlock_shared(struct socket *so)
 {
+	rw_exit_write(&so->so_lock);
 	switch (so->so_proto->pr_domain->dom_family) {
 	case PF_INET:
 	case PF_INET6:
-		if (so->so_proto->pr_usrreqs->pru_unlock != NULL) {
-			rw_exit_write(&so->so_lock);
-			NET_UNLOCK_SHARED();
-		} else
-			NET_UNLOCK();
+		NET_UNLOCK_SHARED();
 		break;
-	default:
-		rw_exit_write(&so->so_lock);
+	}
+}
+
+void
+sounlock_nonet(struct socket *so)
+{
+	rw_exit_write(&so->so_lock);
+}
+
+void
+sounlock_pair(struct socket *so1, struct socket *so2)
+{
+	if (so1 == so2)
+		rw_exit_write(&so1->so_lock);
+	else if (so1 < so2) {
+		rw_exit_write(&so2->so_lock);
+		rw_exit_write(&so1->so_lock);
+	} else {
+		rw_exit_write(&so1->so_lock);
+		rw_exit_write(&so2->so_lock);
+	}
+	switch (so1->so_proto->pr_domain->dom_family) {
+	case PF_INET:
+	case PF_INET6:
+		NET_UNLOCK_SHARED();
 		break;
 	}
 }
@@ -459,7 +467,7 @@ soassertlocked(struct socket *so)
 		if (rw_status(&netlock) == RW_READ) {
 			NET_ASSERT_LOCKED();
 
-			if (splassert_ctl > 0 && pru_locked(so) == 0 &&
+			if (splassert_ctl > 0 &&
 			    rw_status(&so->so_lock) != RW_WRITE)
 				splassert_fail(0, RW_WRITE, __func__);
 		} else
@@ -480,15 +488,11 @@ sosleep_nsec(struct socket *so, void *ident, int prio, const char *wmesg,
 	switch (so->so_proto->pr_domain->dom_family) {
 	case PF_INET:
 	case PF_INET6:
-		if (so->so_proto->pr_usrreqs->pru_unlock != NULL &&
-		    rw_status(&netlock) == RW_READ) {
+		if (rw_status(&netlock) == RW_READ)
 			rw_exit_write(&so->so_lock);
-		}
 		ret = rwsleep_nsec(ident, &netlock, prio, wmesg, nsecs);
-		if (so->so_proto->pr_usrreqs->pru_lock != NULL &&
-		    rw_status(&netlock) == RW_READ) {
+		if (rw_status(&netlock) == RW_READ)
 			rw_enter_write(&so->so_lock);
-		}
 		break;
 	default:
 		ret = rwsleep_nsec(ident, &so->so_lock, prio, wmesg, nsecs);
@@ -499,40 +503,24 @@ sosleep_nsec(struct socket *so, void *ident, int prio, const char *wmesg,
 }
 
 void
-sbmtxassertlocked(struct socket *so, struct sockbuf *sb)
+sbmtxassertlocked(struct sockbuf *sb)
 {
-	if (sb->sb_flags & SB_MTXLOCK) {
-		if (splassert_ctl > 0 && mtx_owned(&sb->sb_mtx) == 0)
-			splassert_fail(0, RW_WRITE, __func__);
-	} else
-		soassertlocked(so);
+	MUTEX_ASSERT_LOCKED(&sb->sb_mtx);
 }
 
 /*
  * Wait for data to arrive at/drain from a socket buffer.
  */
 int
-sbwait(struct socket *so, struct sockbuf *sb)
+sbwait(struct sockbuf *sb)
 {
-	uint64_t timeo_nsecs;
 	int prio = (sb->sb_flags & SB_NOINTR) ? PSOCK : PSOCK | PCATCH;
 
-	if (sb->sb_flags & SB_MTXLOCK) {
-		MUTEX_ASSERT_LOCKED(&sb->sb_mtx);
+	MUTEX_ASSERT_LOCKED(&sb->sb_mtx);
 
-		sb->sb_flags |= SB_WAIT;
-		return msleep_nsec(&sb->sb_cc, &sb->sb_mtx, prio, "sbwait",
-		    sb->sb_timeo_nsecs);
-	}
-
-	soassertlocked(so);
-
-	mtx_enter(&sb->sb_mtx);
-	timeo_nsecs = sb->sb_timeo_nsecs;
 	sb->sb_flags |= SB_WAIT;
-	mtx_leave(&sb->sb_mtx);
-
-	return sosleep_nsec(so, &sb->sb_cc, prio, "netio", timeo_nsecs);
+	return msleep_nsec(&sb->sb_cc, &sb->sb_mtx, prio, "sbwait",
+	    sb->sb_timeo_nsecs);
 }
 
 int
@@ -625,14 +613,14 @@ soreserve(struct socket *so, u_long sndcc, u_long rcvcc)
 
 	mtx_enter(&so->so_rcv.sb_mtx);
 	mtx_enter(&so->so_snd.sb_mtx);
-	if (sbreserve(so, &so->so_snd, sndcc))
+	if (sbreserve(&so->so_snd, sndcc))
 		goto bad;
 	so->so_snd.sb_wat = sndcc;
 	if (so->so_snd.sb_lowat == 0)
 		so->so_snd.sb_lowat = MCLBYTES;
 	if (so->so_snd.sb_lowat > so->so_snd.sb_hiwat)
 		so->so_snd.sb_lowat = so->so_snd.sb_hiwat;
-	if (sbreserve(so, &so->so_rcv, rcvcc))
+	if (sbreserve(&so->so_rcv, rcvcc))
 		goto bad2;
 	so->so_rcv.sb_wat = rcvcc;
 	if (so->so_rcv.sb_lowat == 0)
@@ -642,7 +630,7 @@ soreserve(struct socket *so, u_long sndcc, u_long rcvcc)
 
 	return (0);
 bad2:
-	sbrelease(so, &so->so_snd);
+	sbrelease(&so->so_snd);
 bad:
 	mtx_leave(&so->so_snd.sb_mtx);
 	mtx_leave(&so->so_rcv.sb_mtx);
@@ -655,9 +643,9 @@ bad:
  * if buffering efficiency is near the normal case.
  */
 int
-sbreserve(struct socket *so, struct sockbuf *sb, u_long cc)
+sbreserve(struct sockbuf *sb, u_long cc)
 {
-	sbmtxassertlocked(so, sb);
+	sbmtxassertlocked(sb);
 
 	if (cc == 0 || cc > sb_max)
 		return (1);
@@ -683,24 +671,30 @@ int
 sbchecklowmem(void)
 {
 	static int sblowmem;
-	unsigned int used = m_pool_used();
+	unsigned int used;
 
+	/*
+	 * m_pool_used() is thread safe.  Global variable sblowmem is updated
+	 * by multiple CPUs, but most times with the same value.  And even
+	 * if the value is not correct for a short time, it does not matter.
+	 */
+	used = m_pool_used();
 	if (used < 60)
-		sblowmem = 0;
+		atomic_store_int(&sblowmem, 0);
 	else if (used > 80)
-		sblowmem = 1;
+		atomic_store_int(&sblowmem, 1);
 
-	return (sblowmem);
+	return (atomic_load_int(&sblowmem));
 }
 
 /*
  * Free mbufs held by a socket, and reserved mbuf space.
  */
 void
-sbrelease(struct socket *so, struct sockbuf *sb)
+sbrelease(struct sockbuf *sb)
 {
 
-	sbflush(so, sb);
+	sbflush(sb);
 	sb->sb_hiwat = sb->sb_mbmax = 0;
 }
 
@@ -791,14 +785,14 @@ do {									\
  * discarded and mbufs are compacted where possible.
  */
 void
-sbappend(struct socket *so, struct sockbuf *sb, struct mbuf *m)
+sbappend(struct sockbuf *sb, struct mbuf *m)
 {
 	struct mbuf *n;
 
 	if (m == NULL)
 		return;
 
-	sbmtxassertlocked(so, sb);
+	sbmtxassertlocked(sb);
 	SBLASTRECORDCHK(sb, "sbappend 1");
 
 	if ((n = sb->sb_lastrecord) != NULL) {
@@ -809,7 +803,7 @@ sbappend(struct socket *so, struct sockbuf *sb, struct mbuf *m)
 		 */
 		do {
 			if (n->m_flags & M_EOR) {
-				sbappendrecord(so, sb, m); /* XXXXXX!!!! */
+				sbappendrecord(sb, m); /* XXXXXX!!!! */
 				return;
 			}
 		} while (n->m_next && (n = n->m_next));
@@ -820,7 +814,7 @@ sbappend(struct socket *so, struct sockbuf *sb, struct mbuf *m)
 		 */
 		sb->sb_lastrecord = m;
 	}
-	sbcompress(so, sb, m, n);
+	sbcompress(sb, m, n);
 	SBLASTRECORDCHK(sb, "sbappend 2");
 }
 
@@ -830,16 +824,15 @@ sbappend(struct socket *so, struct sockbuf *sb, struct mbuf *m)
  * in the socket buffer, that is, a stream protocol (such as TCP).
  */
 void
-sbappendstream(struct socket *so, struct sockbuf *sb, struct mbuf *m)
+sbappendstream(struct sockbuf *sb, struct mbuf *m)
 {
-	KASSERT(sb == &so->so_rcv || sb == &so->so_snd);
-	soassertlocked(so);
+	sbmtxassertlocked(sb);
 	KDASSERT(m->m_nextpkt == NULL);
 	KASSERT(sb->sb_mb == sb->sb_lastrecord);
 
 	SBLASTMBUFCHK(sb, __func__);
 
-	sbcompress(so, sb, m, sb->sb_mbtail);
+	sbcompress(sb, m, sb->sb_mbtail);
 
 	sb->sb_lastrecord = sb->sb_mb;
 	SBLASTRECORDCHK(sb, __func__);
@@ -875,11 +868,11 @@ sbcheck(struct socket *so, struct sockbuf *sb)
  * begins a new record.
  */
 void
-sbappendrecord(struct socket *so, struct sockbuf *sb, struct mbuf *m0)
+sbappendrecord(struct sockbuf *sb, struct mbuf *m0)
 {
 	struct mbuf *m;
 
-	sbmtxassertlocked(so, sb);
+	sbmtxassertlocked(sb);
 
 	if (m0 == NULL)
 		return;
@@ -888,7 +881,7 @@ sbappendrecord(struct socket *so, struct sockbuf *sb, struct mbuf *m0)
 	 * Put the first mbuf on the queue.
 	 * Note this permits zero length records.
 	 */
-	sballoc(so, sb, m0);
+	sballoc(sb, m0);
 	SBLASTRECORDCHK(sb, "sbappendrecord 1");
 	SBLINKRECORD(sb, m0);
 	m = m0->m_next;
@@ -897,7 +890,7 @@ sbappendrecord(struct socket *so, struct sockbuf *sb, struct mbuf *m0)
 		m0->m_flags &= ~M_EOR;
 		m->m_flags |= M_EOR;
 	}
-	sbcompress(so, sb, m, m0);
+	sbcompress(sb, m, m0);
 	SBLASTRECORDCHK(sb, "sbappendrecord 2");
 }
 
@@ -908,13 +901,13 @@ sbappendrecord(struct socket *so, struct sockbuf *sb, struct mbuf *m0)
  * Returns 0 if no space in sockbuf or insufficient mbufs.
  */
 int
-sbappendaddr(struct socket *so, struct sockbuf *sb, const struct sockaddr *asa,
-    struct mbuf *m0, struct mbuf *control)
+sbappendaddr(struct sockbuf *sb, const struct sockaddr *asa, struct mbuf *m0,
+    struct mbuf *control)
 {
 	struct mbuf *m, *n, *nlast;
 	int space = asa->sa_len;
 
-	sbmtxassertlocked(so, sb);
+	sbmtxassertlocked(sb);
 
 	if (m0 && (m0->m_flags & M_PKTHDR) == 0)
 		panic("sbappendaddr");
@@ -925,7 +918,7 @@ sbappendaddr(struct socket *so, struct sockbuf *sb, const struct sockaddr *asa,
 		if (n->m_next == NULL)	/* keep pointer to last control buf */
 			break;
 	}
-	if (space > sbspace(so, sb))
+	if (space > sbspace_locked(sb))
 		return (0);
 	if (asa->sa_len > MLEN)
 		return (0);
@@ -943,8 +936,8 @@ sbappendaddr(struct socket *so, struct sockbuf *sb, const struct sockaddr *asa,
 	SBLASTRECORDCHK(sb, "sbappendaddr 1");
 
 	for (n = m; n->m_next != NULL; n = n->m_next)
-		sballoc(so, sb, n);
-	sballoc(so, sb, n);
+		sballoc(sb, n);
+	sballoc(sb, n);
 	nlast = n;
 	SBLINKRECORD(sb, m);
 
@@ -957,13 +950,12 @@ sbappendaddr(struct socket *so, struct sockbuf *sb, const struct sockaddr *asa,
 }
 
 int
-sbappendcontrol(struct socket *so, struct sockbuf *sb, struct mbuf *m0,
-    struct mbuf *control)
+sbappendcontrol(struct sockbuf *sb, struct mbuf *m0, struct mbuf *control)
 {
 	struct mbuf *m, *mlast, *n;
 	int eor = 0, space = 0;
 
-	sbmtxassertlocked(so, sb);
+	sbmtxassertlocked(sb);
 
 	if (control == NULL)
 		panic("sbappendcontrol");
@@ -983,15 +975,15 @@ sbappendcontrol(struct socket *so, struct sockbuf *sb, struct mbuf *m0,
 				m->m_flags &= ~M_EOR;
 		}
 	}
-	if (space > sbspace(so, sb))
+	if (space > sbspace_locked(sb))
 		return (0);
 	n->m_next = m0;			/* concatenate data to control */
 
 	SBLASTRECORDCHK(sb, "sbappendcontrol 1");
 
 	for (m = control; m->m_next != NULL; m = m->m_next)
-		sballoc(so, sb, m);
-	sballoc(so, sb, m);
+		sballoc(sb, m);
+	sballoc(sb, m);
 	mlast = m;
 	SBLINKRECORD(sb, control);
 
@@ -1009,8 +1001,7 @@ sbappendcontrol(struct socket *so, struct sockbuf *sb, struct mbuf *m0,
  * is null, the buffer is presumed empty.
  */
 void
-sbcompress(struct socket *so, struct sockbuf *sb, struct mbuf *m,
-    struct mbuf *n)
+sbcompress(struct sockbuf *sb, struct mbuf *m, struct mbuf *n)
 {
 	int eor = 0;
 	struct mbuf *o;
@@ -1046,7 +1037,7 @@ sbcompress(struct socket *so, struct sockbuf *sb, struct mbuf *m,
 		else
 			sb->sb_mb = m;
 		sb->sb_mbtail = m;
-		sballoc(so, sb, m);
+		sballoc(sb, m);
 		n = m;
 		m->m_flags &= ~M_EOR;
 		m = m->m_next;
@@ -1066,13 +1057,12 @@ sbcompress(struct socket *so, struct sockbuf *sb, struct mbuf *m,
  * Check that all resources are reclaimed.
  */
 void
-sbflush(struct socket *so, struct sockbuf *sb)
+sbflush(struct sockbuf *sb)
 {
-	KASSERT(sb == &so->so_rcv || sb == &so->so_snd);
 	rw_assert_unlocked(&sb->sb_lock);
 
 	while (sb->sb_mbcnt)
-		sbdrop(so, sb, (int)sb->sb_cc);
+		sbdrop(sb, (int)sb->sb_cc);
 
 	KASSERT(sb->sb_cc == 0);
 	KASSERT(sb->sb_datacc == 0);
@@ -1085,12 +1075,12 @@ sbflush(struct socket *so, struct sockbuf *sb)
  * Drop data from (the front of) a sockbuf.
  */
 void
-sbdrop(struct socket *so, struct sockbuf *sb, int len)
+sbdrop(struct sockbuf *sb, int len)
 {
 	struct mbuf *m, *mn;
 	struct mbuf *next;
 
-	sbmtxassertlocked(so, sb);
+	sbmtxassertlocked(sb);
 
 	next = (m = sb->sb_mb) ? m->m_nextpkt : NULL;
 	while (len > 0) {
@@ -1110,12 +1100,12 @@ sbdrop(struct socket *so, struct sockbuf *sb, int len)
 			break;
 		}
 		len -= m->m_len;
-		sbfree(so, sb, m);
+		sbfree(sb, m);
 		mn = m_free(m);
 		m = mn;
 	}
 	while (m && m->m_len == 0) {
-		sbfree(so, sb, m);
+		sbfree(sb, m);
 		mn = m_free(m);
 		m = mn;
 	}
@@ -1142,7 +1132,7 @@ sbdrop(struct socket *so, struct sockbuf *sb, int len)
  * and move the next record to the front.
  */
 void
-sbdroprecord(struct socket *so, struct sockbuf *sb)
+sbdroprecord(struct sockbuf *sb)
 {
 	struct mbuf *m, *mn;
 
@@ -1150,7 +1140,7 @@ sbdroprecord(struct socket *so, struct sockbuf *sb)
 	if (m) {
 		sb->sb_mb = m->m_nextpkt;
 		do {
-			sbfree(so, sb, m);
+			sbfree(sb, m);
 			mn = m_free(m);
 		} while ((m = mn) != NULL);
 	}

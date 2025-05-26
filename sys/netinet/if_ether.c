@@ -1,4 +1,4 @@
-/*	$OpenBSD: if_ether.c,v 1.267 2023/12/18 13:30:44 bluhm Exp $	*/
+/*	$OpenBSD: if_ether.c,v 1.272 2025/03/02 21:28:32 bluhm Exp $	*/
 /*	$NetBSD: if_ether.c,v 1.31 1996/05/11 12:59:58 mycroft Exp $	*/
 
 /*
@@ -85,9 +85,9 @@ struct llinfo_arp {
 #define LA_HOLD_TOTAL 100
 
 /* timer values */
-int 	arpt_prune = (5 * 60);	/* [I] walk list every 5 minutes */
-int 	arpt_keep = (20 * 60);	/* [a] once resolved, cache for 20 minutes */
-int 	arpt_down = 20;	/* [a] once declared down, don't send for 20 secs */
+int	arpt_prune = (5 * 60);	/* [I] walk list every 5 minutes */
+int	arpt_keep = (20 * 60);	/* [a] once resolved, cache for 20 minutes */
+int	arpt_down = 20;	/* [a] once declared down, don't send for 20 secs */
 
 struct mbuf *arppullup(struct mbuf *m);
 void arpinvalidate(struct rtentry *);
@@ -354,8 +354,8 @@ arpresolve(struct ifnet *ifp, struct rtentry *rt0, struct mbuf *m,
 	uptime = getuptime();
 	rt = rt_getll(rt0);
 
-	if (ISSET(rt->rt_flags, RTF_REJECT) &&
-	    (rt->rt_expire == 0 || rt->rt_expire > uptime)) {
+	if (rt == NULL || (ISSET(rt->rt_flags, RTF_REJECT) &&
+	    (rt->rt_expire == 0 || rt->rt_expire > uptime))) {
 		m_freem(m);
 		return (rt == rt0 ? EHOSTDOWN : EHOSTUNREACH);
 	}
@@ -515,7 +515,7 @@ arppullup(struct mbuf *m)
  * then the protocol-specific routine is called.
  */
 void
-arpinput(struct ifnet *ifp, struct mbuf *m)
+arpinput(struct ifnet *ifp, struct mbuf *m, struct netstack *ns)
 {
 	if ((m = arppullup(m)) == NULL)
 		return;
@@ -844,7 +844,7 @@ arpproxy(struct in_addr in, unsigned int rtableid)
  * then the protocol-specific routine is called.
  */
 void
-revarpinput(struct ifnet *ifp, struct mbuf *m)
+revarpinput(struct ifnet *ifp, struct mbuf *m, struct netstack *ns)
 {
 	if ((m = arppullup(m)) == NULL)
 		return;

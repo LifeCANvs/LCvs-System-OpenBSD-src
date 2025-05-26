@@ -1,4 +1,4 @@
-/*	$OpenBSD: syslogd.c,v 1.280 2024/01/06 19:34:54 bluhm Exp $	*/
+/*	$OpenBSD: syslogd.c,v 1.284 2025/01/23 12:27:42 henning Exp $	*/
 
 /*
  * Copyright (c) 2014-2021 Alexander Bluhm <bluhm@genua.de>
@@ -314,6 +314,7 @@ int	 reserve_accept4(int, int, struct event *,
 void	 tcp_acceptcb(int, short, void *);
 void	 tls_acceptcb(int, short, void *);
 void	 acceptcb(int, short, void *, int);
+void	 tls_handshakecb(struct bufferevent *, void *);
 int	 octet_counting(struct evbuffer *, char **, int);
 int	 non_transparent_framing(struct evbuffer *, char **);
 void	 tcp_readcb(struct bufferevent *, void *);
@@ -1171,8 +1172,8 @@ acceptcb(int lfd, short event, void *arg, int usetls)
 		return;
 	}
 	p->p_fd = fd;
-	if ((p->p_bufev = bufferevent_new(fd, tcp_readcb, NULL, tcp_closecb,
-	    p)) == NULL) {
+	if ((p->p_bufev = bufferevent_new(fd, tcp_readcb,
+	    usetls ? tls_handshakecb : NULL, tcp_closecb, p)) == NULL) {
 		log_warn("bufferevent \"%s\"", peername);
 		free(p);
 		close(fd);
@@ -1207,6 +1208,34 @@ acceptcb(int lfd, short event, void *arg, int usetls)
 
 	log_info(LOG_DEBUG, "%s logger \"%s\" accepted",
 	    p->p_ctx ? "tls" : "tcp", peername);
+}
+
+void
+tls_handshakecb(struct bufferevent *bufev, void *arg)
+{
+	struct peer *p = arg;
+	const char *cn;
+	char *cntmp;
+
+	log_debug("Completed tls handshake");
+
+	if (tls_peer_cert_provided(p->p_ctx)) {
+		if ((cn = tls_peer_cert_common_name(p->p_ctx)) != NULL &&
+		    strlen(cn) > 0) {
+			if (stravis(&cntmp, cn, VIS_WHITE) == -1)
+				log_warn("tls_handshakecb stravis");
+			else {
+				log_info(LOG_INFO, "%s using hostname \"%s\" "
+				    "from certificate", p->p_hostname, cntmp);
+				free(p->p_hostname);
+				p->p_hostname = cntmp;
+			}
+		} else
+			log_info(LOG_NOTICE,
+			    "cannot get hostname from peer certificate");
+	}
+
+	bufferevent_setcb(bufev, tcp_readcb, NULL, tcp_closecb, p);
 }
 
 /*
@@ -1582,7 +1611,6 @@ void
 udp_resolvecb(int fd, short event, void *arg)
 {
 	struct filed		*f = arg;
-	struct timeval		 to;
 
 	if (loghost_resolve(f) != 0) {
 		loghost_retry(f);

@@ -1,4 +1,4 @@
-/*	$OpenBSD: cdefs.h,v 1.43 2018/10/29 17:10:40 guenther Exp $	*/
+/*	$OpenBSD: cdefs.h,v 1.45 2025/05/13 15:16:43 millert Exp $	*/
 /*	$NetBSD: cdefs.h,v 1.16 1996/04/03 20:46:39 christos Exp $	*/
 
 /*
@@ -94,17 +94,29 @@
  * GCC >= 2.5 uses the __attribute__((attrs)) style.  All of these
  * work for GNU C++ (modulo a slight glitch in the C++ grammar in
  * the distribution version of 2.5.5).
+ *
+ * GCC defines a pure function as depending only on its arguments and
+ * global variables.  Typical examples are strlen and sqrt.
  */
 
 #if !__GNUC_PREREQ__(2, 5) && !defined(__PCC__)
 #define	__attribute__(x)	/* delete __attribute__ if non-gcc or gcc1 */
-#if defined(__GNUC__) && !defined(__STRICT_ANSI__)
-#define	__dead		__volatile
-#define	__pure		__const
 #endif
-#else
+
+#if __GNUC_PREREQ__(2, 5)
 #define __dead		__attribute__((__noreturn__))
-#define __pure		__attribute__((__const__))
+#elif defined(__GNUC__)
+#define	__dead		__volatile
+#else
+#define	__dead		/* delete */
+#endif
+
+#if __GNUC_PREREQ__(2, 96)
+#define	__pure		__attribute__((__pure__))
+#elif defined(__GNUC__)
+#define	__pure		__const
+#else
+#define	__pure		/* delete */
 #endif
 
 #if __GNUC_PREREQ__(2, 7)
@@ -287,11 +299,16 @@
  * _XOPEN_SOURCE == 520				XPG5v2
  * _XOPEN_SOURCE == 600				POSIX 1003.1-2001 with XSI
  * _XOPEN_SOURCE == 700				POSIX 1003.1-2008 with XSI
+ * _XOPEN_SOURCE == 800				POSIX 1003.1-2024 with XSI
  *
  * The XPG spec implies a specific value for _POSIX_C_SOURCE.
  */
 #ifdef _XOPEN_SOURCE
-# if (_XOPEN_SOURCE - 0 >= 700)
+# if (_XOPEN_SOURCE - 0 >= 800)
+#  define __XPG_VISIBLE		800
+#  undef _POSIX_C_SOURCE
+#  define _POSIX_C_SOURCE	202405L
+# elif (_XOPEN_SOURCE - 0 >= 700)
 #  define __XPG_VISIBLE		700
 #  undef _POSIX_C_SOURCE
 #  define _POSIX_C_SOURCE	200809L
@@ -327,12 +344,16 @@
  *				and the omnibus ISO/IEC 9945-1:1996
  * _POSIX_C_SOURCE == 200112L   1003.1-2001
  * _POSIX_C_SOURCE == 200809L   1003.1-2008
+ * _POSIX_C_SOURCE == 202405L   1003.1-2024
  *
  * The POSIX spec implies a specific value for __ISO_C_VISIBLE, though
  * this may be overridden by the _ISOC99_SOURCE macro later.
  */
 #ifdef _POSIX_C_SOURCE
-# if (_POSIX_C_SOURCE - 0 >= 200809)
+# if (_POSIX_C_SOURCE - 0 >= 202405)
+#  define __POSIX_VISIBLE	202405
+#  define __ISO_C_VISIBLE	2017
+# elif (_POSIX_C_SOURCE - 0 >= 200809)
 #  define __POSIX_VISIBLE	200809
 #  define __ISO_C_VISIBLE	1999
 # elif (_POSIX_C_SOURCE - 0 >= 200112)
@@ -398,13 +419,13 @@
  * Default values.
  */
 #ifndef __XPG_VISIBLE
-# define __XPG_VISIBLE		700
+# define __XPG_VISIBLE		800
 #endif
 #ifndef __POSIX_VISIBLE
-# define __POSIX_VISIBLE	200809
+# define __POSIX_VISIBLE	202405
 #endif
 #ifndef __ISO_C_VISIBLE
-# define __ISO_C_VISIBLE	2011
+# define __ISO_C_VISIBLE	2017
 #endif
 #ifndef __BSD_VISIBLE
 # define __BSD_VISIBLE		1

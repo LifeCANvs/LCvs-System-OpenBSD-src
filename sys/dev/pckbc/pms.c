@@ -1,4 +1,4 @@
-/* $OpenBSD: pms.c,v 1.98 2023/08/16 20:53:47 bru Exp $ */
+/* $OpenBSD: pms.c,v 1.101 2025/04/28 13:35:39 deraadt Exp $ */
 /* $NetBSD: psm.c,v 1.11 2000/06/05 22:20:57 sommerfeld Exp $ */
 
 /*-
@@ -778,20 +778,26 @@ int
 pmsactivate(struct device *self, int act)
 {
 	struct pms_softc *sc = (struct pms_softc *)self;
+	int rv;
 
 	switch (act) {
-	case DVACT_SUSPEND:
+	case DVACT_QUIESCE:
+		rv = config_activate_children(self, act);
 		if (sc->sc_state == PMS_STATE_ENABLED)
 			pms_change_state(sc, PMS_STATE_SUSPENDED,
 			    PMS_DEV_IGNORE);
 		break;
-	case DVACT_RESUME:
+	case DVACT_WAKEUP:
 		if (sc->sc_state == PMS_STATE_SUSPENDED)
 			pms_change_state(sc, PMS_STATE_ENABLED,
 			    PMS_DEV_IGNORE);
+		rv = config_activate_children(self, act);
+		break;
+	default:
+		rv = config_activate_children(self, act);
 		break;
 	}
-	return (0);
+	return (rv);
 }
 
 int

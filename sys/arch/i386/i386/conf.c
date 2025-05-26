@@ -1,4 +1,4 @@
-/*	$OpenBSD: conf.c,v 1.176 2023/03/06 17:20:06 miod Exp $	*/
+/*	$OpenBSD: conf.c,v 1.179 2024/11/27 10:33:31 jsg Exp $	*/
 /*	$NetBSD: conf.c,v 1.75 1996/05/03 19:40:20 christos Exp $	*/
 
 /*
@@ -109,20 +109,8 @@ cdev_decl(fd);
 cdev_decl(lpt);
 #include "ch.h"
 #include "bpfilter.h"
-#if 0
-#include "pcmcia.h"
-cdev_decl(pcmcia);
-#endif
 #include "spkr.h"
 cdev_decl(spkr);
-#if 0 /* old (non-wsmouse) drivers */
-#include "mms.h"
-cdev_decl(mms);
-#include "lms.h"
-cdev_decl(lms);
-#include "opms.h"
-cdev_decl(pms);
-#endif
 #include "cy.h"
 cdev_decl(cy);
 #include "tun.h"
@@ -148,7 +136,6 @@ cdev_decl(cztty);
 #include "nvram.h"
 cdev_decl(nvram);
 #include "drm.h"
-cdev_decl(drm);
 
 #include "wsdisplay.h"
 #include "wskbd.h"
@@ -200,11 +187,7 @@ struct cdevsw	cdevsw[] =
 	cdev_fd_init(1,filedesc),	/* 22: file descriptor pseudo-device */
 	cdev_bpf_init(NBPFILTER,bpf),	/* 23: Berkeley packet filter */
 	cdev_notdef(),			/* 24 */
-#if 0
-	cdev_ocis_init(NPCMCIA,pcmcia), /* 25: PCMCIA Bus */
-#else
 	cdev_notdef(),			/* 25 */
-#endif
 	cdev_joy_init(NJOY,joy),        /* 26: joystick */
 	cdev_spkr_init(NSPKR,spkr),	/* 27: PC speaker */
 	cdev_notdef(),			/* 28: was LKM */

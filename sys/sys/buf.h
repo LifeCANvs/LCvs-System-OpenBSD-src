@@ -1,4 +1,4 @@
-/*	$OpenBSD: buf.h,v 1.114 2024/02/03 18:51:58 beck Exp $	*/
+/*	$OpenBSD: buf.h,v 1.117 2025/05/17 10:13:40 jsg Exp $	*/
 /*	$NetBSD: buf.h,v 1.25 1997/04/09 21:12:17 mycroft Exp $	*/
 
 /*
@@ -84,12 +84,10 @@ struct bufq {
 };
 
 int		 bufq_init(struct bufq *, int);
-int		 bufq_switch(struct bufq *, int);
 void		 bufq_destroy(struct bufq *);
 
 void		 bufq_queue(struct bufq *, struct buf *);
 struct buf	*bufq_dequeue(struct bufq *);
-void		 bufq_requeue(struct bufq *, struct buf *);
 int		 bufq_peek(struct bufq *);
 void		 bufq_drain(struct bufq *);
 
@@ -164,9 +162,6 @@ struct bufcache {
 	struct bufqueue coldqueue;
 	struct bufqueue warmqueue;
 };
-
-/* Device driver compatibility definitions. */
-#define	b_active b_bcount		/* Driver queue head: drive active. */
 
 /*
  * These flags are kept in b_flags.
@@ -252,7 +247,6 @@ int bread(struct vnode *, daddr_t, int, struct buf **);
 int breadn(struct vnode *, daddr_t, int, daddr_t *, int *, int,
     struct buf **);
 void	brelse(struct buf *);
-#define bremfree bufcache_take
 void	bufinit(void);
 void	buf_dirty(struct buf *);
 void    buf_undirty(struct buf *);

@@ -1,4 +1,4 @@
-/*	$OpenBSD: relayd.c,v 1.191 2023/06/25 08:07:38 op Exp $	*/
+/*	$OpenBSD: relayd.c,v 1.194 2025/04/24 20:32:33 claudio Exp $	*/
 
 /*
  * Copyright (c) 2007 - 2016 Reyk Floeter <reyk@openbsd.org>
@@ -27,6 +27,7 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 
+#include <agentx.h>
 #include <signal.h>
 #include <string.h>
 #include <stdio.h>
@@ -224,6 +225,13 @@ main(int argc, char *argv[])
 
 	if (unveil("/", "rx") == -1)
 		err(1, "unveil /");
+	if (env->sc_conf.flags & F_AGENTX) {
+		if (unveil(env->sc_conf.agentx_path, "w") == -1)
+			err(1, "unveil %s", env->sc_conf.agentx_path);
+	} else {
+		if (unveil(AGENTX_MASTER_PATH, "w") == -1)
+			err(1, "unveil %s", env->sc_conf.agentx_path);
+	}
 	if (unveil(NULL, NULL) == -1)
 		err(1, "unveil");
 
@@ -401,11 +409,15 @@ parent_dispatch_pfe(int fd, struct privsep_proc *p, struct imsg *imsg)
 	case IMSG_DEMOTE:
 		IMSG_SIZE_CHECK(imsg, &demote);
 		memcpy(&demote, imsg->data, sizeof(demote));
+		demote.group[sizeof(demote.group) - 1] = '\0';
 		carp_demote_set(demote.group, demote.level);
 		break;
 	case IMSG_RTMSG:
 		IMSG_SIZE_CHECK(imsg, &crt);
 		memcpy(&crt, imsg->data, sizeof(crt));
+		crt.host.name[sizeof(crt.host.name) - 1] = '\0';
+		crt.rt.name[sizeof(crt.rt.name) - 1] = '\0';
+		crt.rt.label[sizeof(crt.rt.label) - 1] = '\0';
 		pfe_route(env, &crt);
 		break;
 	case IMSG_CTL_RESET:
@@ -446,6 +458,8 @@ parent_dispatch_hce(int fd, struct privsep_proc *p, struct imsg *imsg)
 	case IMSG_SCRIPT:
 		IMSG_SIZE_CHECK(imsg, &scr);
 		bcopy(imsg->data, &scr, sizeof(scr));
+		scr.name[sizeof(scr.name) - 1] = '\0';
+		scr.path[sizeof(scr.path) - 1] = '\0';
 		scr.retval = script_exec(env, &scr);
 		proc_compose(ps, PROC_HCE, IMSG_SCRIPT, &scr, sizeof(scr));
 		break;
@@ -1358,6 +1372,14 @@ relay_load_certfiles(struct relayd *env, struct relay *rlay, const char *name)
 
 	if ((rlay->rl_conf.flags & F_TLS) == 0)
 		return (0);
+
+	if (strlen(proto->tlsclientca) && rlay->rl_tls_client_ca_fd == -1) {
+		if ((rlay->rl_tls_client_ca_fd =
+		    open(proto->tlsclientca, O_RDONLY)) == -1)
+			return (-1);
+		log_debug("%s: using client ca %s", __func__,
+		    proto->tlsclientca);
+	}
 
 	if (name == NULL &&
 	    print_host(&rlay->rl_conf.ss, hbuf, sizeof(hbuf)) == NULL)

@@ -1,4 +1,4 @@
-/*	$OpenBSD: if_ix.c,v 1.215 2024/05/21 11:19:39 bluhm Exp $	*/
+/*	$OpenBSD: if_ix.c,v 1.220 2025/05/22 10:50:10 jan Exp $	*/
 
 /******************************************************************************
 
@@ -401,7 +401,6 @@ ixgbe_activate(struct device *self, int act)
 	struct ifnet *ifp = &sc->arpcom.ac_if;
 	struct ixgbe_hw		*hw = &sc->hw;
 	uint32_t			 ctrl_ext;
-	int rv = 0;
 
 	switch (act) {
 	case DVACT_QUIESCE:
@@ -430,10 +429,8 @@ ixgbe_activate(struct device *self, int act)
 		if (ifp->if_flags & IFF_UP)
 			ixgbe_init(sc);
 		break;
-	default:
-		break;
 	}
-	return (rv);
+	return (0);
 }
 
 /*********************************************************************
@@ -511,8 +508,7 @@ ixgbe_start(struct ifqueue *ifq)
 	 * hardware that this frame is available to transmit.
 	 */
 	if (post)
-		IXGBE_WRITE_REG(&sc->hw, IXGBE_TDT(txr->me),
-		    txr->next_avail_desc);
+		IXGBE_WRITE_REG(&sc->hw, txr->tail, txr->next_avail_desc);
 }
 
 /*********************************************************************
@@ -551,6 +547,19 @@ ixgbe_ioctl(struct ifnet * ifp, u_long command, caddr_t data)
 		} else {
 			if (ifp->if_flags & IFF_RUNNING)
 				ixgbe_stop(sc);
+		}
+		break;
+
+	case SIOCSIFXFLAGS:
+		if (ISSET(ifr->ifr_flags, IFXF_LRO) !=
+		    ISSET(ifp->if_xflags, IFXF_LRO)) {
+			if (ISSET(ifr->ifr_flags, IFXF_LRO))
+				SET(ifp->if_xflags, IFXF_LRO);
+			else
+				CLR(ifp->if_xflags, IFXF_LRO);
+
+			if (ifp->if_flags & IFF_UP)
+				ixgbe_init(sc);
 		}
 		break;
 
@@ -709,7 +718,7 @@ ixgbe_watchdog(struct ifnet * ifp)
 	for (i = 0; i < sc->num_queues; i++, txr++) {
 		printf("%s: Queue(%d) tdh = %d, hw tdt = %d\n", ifp->if_xname, i,
 		    IXGBE_READ_REG(hw, IXGBE_TDH(i)),
-		    IXGBE_READ_REG(hw, IXGBE_TDT(i)));
+		    IXGBE_READ_REG(hw, sc->tx_rings[i].tail));
 		printf("%s: TX(%d) Next TX to Clean = %d\n", ifp->if_xname,
 		    i, txr->next_to_clean);
 	}
@@ -766,8 +775,15 @@ ixgbe_init(void *arg)
 	ixgbe_init_hw(&sc->hw);
 	ixgbe_initialize_transmit_units(sc);
 
-	/* Use 2k clusters, even for jumbo frames */
-	sc->rx_mbuf_sz = MCLBYTES + ETHER_ALIGN;
+	/*
+	 * Use 4k clusters in LRO mode to avoid m_defrag calls in case of
+	 * socket splicing.  Or, use 2k clusters in non-LRO mode, even for
+	 * jumbo frames.
+	 */
+	if (ISSET(ifp->if_xflags, IFXF_LRO))
+		sc->rx_mbuf_sz = MCLBYTES * 2 - ETHER_ALIGN;
+	else
+		sc->rx_mbuf_sz = MCLBYTES + ETHER_ALIGN;
 
 	/* Prepare receive descriptors and buffers */
 	if (ixgbe_setup_receive_structures(sc)) {
@@ -829,7 +845,7 @@ ixgbe_init(void *arg)
 				msec_delay(1);
 		}
 		IXGBE_WRITE_FLUSH(&sc->hw);
-		IXGBE_WRITE_REG(&sc->hw, IXGBE_RDT(i), rxr->last_desc_filled);
+		IXGBE_WRITE_REG(&sc->hw, rxr[i].tail, rxr->last_desc_filled);
 	}
 
 	/* Set up VLAN support and filter */
@@ -2368,9 +2384,12 @@ ixgbe_initialize_transmit_units(struct ix_softc *sc)
 		IXGBE_WRITE_REG(hw, IXGBE_TDLEN(i),
 		    sc->num_tx_desc * sizeof(struct ixgbe_legacy_tx_desc));
 
+		/* Set Tx Tail register */
+		txr->tail = IXGBE_TDT(i);
+
 		/* Setup the HW Tx Head and Tail descriptor pointers */
 		IXGBE_WRITE_REG(hw, IXGBE_TDH(i), 0);
-		IXGBE_WRITE_REG(hw, IXGBE_TDT(i), 0);
+		IXGBE_WRITE_REG(hw, txr->tail, 0);
 
 		/* Setup Transmit Descriptor Cmd Settings */
 		txr->txd_cmd = IXGBE_TXD_CMD_IFCS;
@@ -2700,7 +2719,7 @@ ixgbe_get_buf(struct ix_rxring *rxr, int i)
 		return (ENOBUFS);
 	}
 
-	/* needed in any case so prealocate since this one will fail for sure */
+	/* needed in any case so preallocate since this one will fail for sure */
 	mp = MCLGETL(NULL, M_DONTWAIT, sc->rx_mbuf_sz);
 	if (!mp)
 		return (ENOBUFS);
@@ -2847,8 +2866,7 @@ ixgbe_rxrefill(void *xrxr)
 
 	if (ixgbe_rxfill(rxr)) {
 		/* Advance the Rx Queue "Tail Pointer" */
-		IXGBE_WRITE_REG(&sc->hw, IXGBE_RDT(rxr->me),
-		    rxr->last_desc_filled);
+		IXGBE_WRITE_REG(&sc->hw, rxr->tail, rxr->last_desc_filled);
 	} else if (if_rxr_inuse(&rxr->rx_ring) == 0)
 		timeout_add(&rxr->rx_refill, 1);
 
@@ -2943,6 +2961,9 @@ ixgbe_initialize_receive_units(struct ix_softc *sc)
 		srrctl = bufsz | IXGBE_SRRCTL_DESCTYPE_ADV_ONEBUF;
 		IXGBE_WRITE_REG(hw, IXGBE_SRRCTL(i), srrctl);
 
+		/* Capture Rx Tail index */
+		rxr->tail = IXGBE_RDT(i);
+
 		if (ISSET(ifp->if_xflags, IFXF_LRO)) {
 			rdrxctl = IXGBE_READ_REG(&sc->hw, IXGBE_RSCCTL(i));
 
@@ -2955,7 +2976,7 @@ ixgbe_initialize_receive_units(struct ix_softc *sc)
 
 		/* Setup the HW Rx Head and Tail Descriptor Pointers */
 		IXGBE_WRITE_REG(hw, IXGBE_RDH(i), 0);
-		IXGBE_WRITE_REG(hw, IXGBE_RDT(i), 0);
+		IXGBE_WRITE_REG(hw, rxr->tail, 0);
 	}
 
 	if (sc->hw.mac.type != ixgbe_mac_82598EB) {

@@ -1,4 +1,4 @@
-/*	$OpenBSD: filemode.c,v 1.45 2024/06/08 13:34:59 tb Exp $ */
+/*	$OpenBSD: filemode.c,v 1.58 2025/02/25 15:55:26 claudio Exp $ */
 /*
  * Copyright (c) 2019 Claudio Jeker <claudio@openbsd.org>
  * Copyright (c) 2019 Kristaps Dzonsons <kristaps@bsd.lv>
@@ -191,6 +191,10 @@ parse_load_certchain(char *uri)
 	for (i = 0; i < MAX_CERT_DEPTH; i++) {
 		if ((cert = uripath_lookup(uri)) != NULL) {
 			a = auth_find(&auths, cert->certid);
+			if (a == NULL) {
+				warnx("failed to find issuer for %s", uri);
+				goto fail;
+			}
 			break;
 		}
 		filestack[i] = uri;
@@ -223,7 +227,7 @@ parse_load_certchain(char *uri)
 		cert->talid = a->cert->talid;
 		a = auth_insert(uri, &auths, cert, a);
 		uripath_add(uri, cert);
-		stack[i] = NULL;
+		stack[i - 1] = NULL;
 	}
 
 	return a;
@@ -263,7 +267,7 @@ parse_load_ta(struct tal *tal)
 
 	cert->talid = tal->id;
 	auth_insert(file, &auths, cert, NULL);
-	for (i = 0; i < tal->urisz; i++) {
+	for (i = 0; i < tal->num_uris; i++) {
 		if (strncasecmp(tal->uri[i], RSYNC_PROTO, RSYNC_PROTO_LEN) != 0)
 			continue;
 		/* Add all rsync uri since any of them could be used as AIA. */
@@ -309,7 +313,7 @@ print_signature_path(const char *crl, const char *aia, const struct auth *a)
 {
 	if (crl != NULL)
 		printf("Signature path:           %s\n", crl);
-	if (a->cert->mft != NULL)
+	if (a != NULL && a->cert != NULL && a->cert->mft != NULL)
 		printf("                          %s\n", a->cert->mft);
 	if (aia != NULL)
 		printf("                          %s\n", aia);
@@ -347,8 +351,9 @@ proc_parser_file(char *file, unsigned char *buf, size_t len)
 	struct tal *tal = NULL;
 	char *aia = NULL;
 	char *crl_uri = NULL;
-	time_t *expires = NULL, *notafter = NULL;
-	struct auth *a;
+	time_t *notbefore = NULL, *expires = NULL, *notafter = NULL;
+	time_t now;
+	struct auth *a = NULL;
 	struct crl *c;
 	const char *errstr = NULL, *valid;
 	int status = 0;
@@ -356,6 +361,8 @@ proc_parser_file(char *file, unsigned char *buf, size_t len)
 	char *hash;
 	enum rtype type;
 	int is_ta = 0;
+
+	now = get_current_time();
 
 	if (outformats & FORMAT_JSON) {
 		json_do_start(stdout);
@@ -398,6 +405,7 @@ proc_parser_file(char *file, unsigned char *buf, size_t len)
 			break;
 		aia = aspa->aia;
 		expires = &aspa->expires;
+		notbefore = &aspa->notbefore;
 		notafter = &aspa->notafter;
 		break;
 	case RTYPE_CER:
@@ -414,6 +422,7 @@ proc_parser_file(char *file, unsigned char *buf, size_t len)
 		if (X509_up_ref(x509) == 0)
 			errx(1, "%s: X509_up_ref failed", __func__);
 		expires = &cert->expires;
+		notbefore = &cert->notbefore;
 		notafter = &cert->notafter;
 		break;
 	case RTYPE_CRL:
@@ -428,6 +437,7 @@ proc_parser_file(char *file, unsigned char *buf, size_t len)
 			break;
 		aia = mft->aia;
 		expires = &mft->expires;
+		notbefore = &mft->thisupdate;
 		notafter = &mft->nextupdate;
 		break;
 	case RTYPE_GBR:
@@ -436,6 +446,7 @@ proc_parser_file(char *file, unsigned char *buf, size_t len)
 			break;
 		aia = gbr->aia;
 		expires = &gbr->expires;
+		notbefore = &gbr->notbefore;
 		notafter = &gbr->notafter;
 		break;
 	case RTYPE_GEOFEED:
@@ -444,6 +455,7 @@ proc_parser_file(char *file, unsigned char *buf, size_t len)
 			break;
 		aia = geofeed->aia;
 		expires = &geofeed->expires;
+		notbefore = &geofeed->notbefore;
 		notafter = &geofeed->notafter;
 		break;
 	case RTYPE_ROA:
@@ -452,6 +464,7 @@ proc_parser_file(char *file, unsigned char *buf, size_t len)
 			break;
 		aia = roa->aia;
 		expires = &roa->expires;
+		notbefore = &roa->notbefore;
 		notafter = &roa->notafter;
 		break;
 	case RTYPE_RSC:
@@ -460,6 +473,7 @@ proc_parser_file(char *file, unsigned char *buf, size_t len)
 			break;
 		aia = rsc->aia;
 		expires = &rsc->expires;
+		notbefore = &rsc->notbefore;
 		notafter = &rsc->notafter;
 		break;
 	case RTYPE_SPL:
@@ -468,6 +482,7 @@ proc_parser_file(char *file, unsigned char *buf, size_t len)
 			break;
 		aia = spl->aia;
 		expires = &spl->expires;
+		notbefore = &spl->notbefore;
 		notafter = &spl->notafter;
 		break;
 	case RTYPE_TAK:
@@ -476,6 +491,7 @@ proc_parser_file(char *file, unsigned char *buf, size_t len)
 			break;
 		aia = tak->aia;
 		expires = &tak->expires;
+		notbefore = &tak->notbefore;
 		notafter = &tak->notafter;
 		break;
 	case RTYPE_TAL:
@@ -550,7 +566,7 @@ proc_parser_file(char *file, unsigned char *buf, size_t len)
 	}
 
 	if (expires != NULL) {
-		if (status && aia != NULL)
+		if ((status && aia != NULL) || is_ta)
 			*expires = x509_find_expires(*notafter, a, &crlt);
 
 		switch (type) {
@@ -586,9 +602,16 @@ proc_parser_file(char *file, unsigned char *buf, size_t len)
 		}
 	}
 
-	if (status)
-		valid = "OK";
-	else if (aia == NULL)
+	if (status) {
+		if (notbefore != NULL && *notbefore > now)
+			valid = "Not yet valid";
+		else if (notafter != NULL && *notafter < now)
+			valid = "Expired";
+		else if (expires != NULL && *expires < now)
+			valid = "Signature path expired";
+		else
+			valid = "OK";
+	} else if (aia == NULL)
 		valid = "N/A";
 	else
 		valid = "Failed";
@@ -608,7 +631,7 @@ proc_parser_file(char *file, unsigned char *buf, size_t len)
 	else {
 		printf("\n");
 
-		if (status && aia != NULL) {
+		if (aia != NULL && status) {
 			print_signature_path(crl_uri, aia, a);
 			if (expires != NULL)
 				printf("Signature path expires:   %s\n",
@@ -699,8 +722,8 @@ void
 proc_filemode(int fd)
 {
 	struct entityq	 q;
-	struct msgbuf	 msgq;
 	struct pollfd	 pfd;
+	struct msgbuf	*msgq;
 	struct entity	*entp;
 	struct ibuf	*b, *inbuf = NULL;
 
@@ -718,16 +741,17 @@ proc_filemode(int fd)
 
 	if ((ctx = X509_STORE_CTX_new()) == NULL)
 		err(1, "X509_STORE_CTX_new");
+
 	TAILQ_INIT(&q);
 
-	msgbuf_init(&msgq);
-	msgq.fd = fd;
-
+	if ((msgq = msgbuf_new_reader(sizeof(size_t), io_parse_hdr, NULL)) ==
+	    NULL)
+		err(1, NULL);
 	pfd.fd = fd;
 
 	for (;;) {
 		pfd.events = POLLIN;
-		if (msgq.queued)
+		if (msgbuf_queuelen(msgq) > 0)
 			pfd.events |= POLLOUT;
 
 		if (poll(&pfd, 1, INFTIM) == -1) {
@@ -744,8 +768,13 @@ proc_filemode(int fd)
 			break;
 
 		if ((pfd.revents & POLLIN)) {
-			b = io_buf_read(fd, &inbuf);
-			if (b != NULL) {
+			switch (ibuf_read(fd, msgq)) {
+			case -1:
+				err(1, "ibuf_read");
+			case 0:
+				errx(1, "ibuf_read: connection closed");
+			}
+			while ((b = io_buf_get(msgq)) != NULL) {
 				entp = calloc(1, sizeof(struct entity));
 				if (entp == NULL)
 					err(1, NULL);
@@ -756,18 +785,18 @@ proc_filemode(int fd)
 		}
 
 		if (pfd.revents & POLLOUT) {
-			switch (msgbuf_write(&msgq)) {
-			case 0:
-				errx(1, "write: connection closed");
-			case -1:
-				err(1, "write");
+			if (msgbuf_write(fd, msgq) == -1) {
+				if (errno == EPIPE)
+					errx(1, "write: connection closed");
+				else
+					err(1, "write");
 			}
 		}
 
-		parse_file(&q, &msgq);
+		parse_file(&q, msgq);
 	}
 
-	msgbuf_clear(&msgq);
+	msgbuf_free(msgq);
 	while ((entp = TAILQ_FIRST(&q)) != NULL) {
 		TAILQ_REMOVE(&q, entp, entries);
 		entity_free(entp);
@@ -777,6 +806,7 @@ proc_filemode(int fd)
 	crl_tree_free(&crlt);
 
 	X509_STORE_CTX_free(ctx);
+
 	ibuf_free(inbuf);
 
 	exit(0);

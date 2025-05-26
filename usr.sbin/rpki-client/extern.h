@@ -1,4 +1,4 @@
-/*	$OpenBSD: extern.h,v 1.224 2024/06/08 13:30:35 tb Exp $ */
+/*	$OpenBSD: extern.h,v 1.239 2025/04/03 14:29:44 tb Exp $ */
 /*
  * Copyright (c) 2019 Kristaps Dzonsons <kristaps@bsd.lv>
  *
@@ -26,6 +26,8 @@
 
 #define CTASSERT(x)	extern char  _ctassert[(x) ? 1 : -1 ] \
 			    __attribute__((__unused__))
+
+#define MAX_MSG_SIZE	(50 * 1024 * 1024)
 
 enum cert_as_type {
 	CERT_AS_ID, /* single identifier */
@@ -120,13 +122,14 @@ enum cert_purpose {
  * inheriting.
  */
 struct cert {
-	struct cert_ip	*ips; /* list of IP address ranges */
-	size_t		 ipsz; /* length of "ips" */
-	struct cert_as	*as; /* list of AS numbers and ranges */
-	size_t		 asz; /* length of "asz" */
+	struct cert_ip	*ips;	/* list of IP address ranges */
+	size_t		 num_ips;
+	struct cert_as	*ases;	/* list of AS numbers and ranges */
+	size_t		 num_ases;
 	int		 talid; /* cert is covered by which TAL */
 	int		 certid;
 	unsigned int	 repoid; /* repository of this cert file */
+	char		*path; /* filename without .rrdp and .rsync prefix */
 	char		*repo; /* CA repository (rsync:// uri) */
 	char		*mft; /* manifest (rsync:// uri) */
 	char		*notify; /* RRDP notify (https:// uri) */
@@ -143,6 +146,27 @@ struct cert {
 };
 
 /*
+ * Non-functional CA tree element.
+ * Initially all CA and TA certs are added to this tree.
+ * They are removed once they are the issuer of a valid mft.
+ */
+struct nonfunc_ca {
+	RB_ENTRY(nonfunc_ca)	 entry;
+	char			*location;
+	char			*carepo;
+	char			*mfturi;
+	char			*ski;
+	int			 certid;
+	int			 talid;
+};
+
+/*
+ * Tree of nonfunc CAs, sorted by certid.
+ */
+RB_HEAD(nca_tree, nonfunc_ca);
+RB_PROTOTYPE(nca_tree, nonfunc_ca, entry, ncacmp);
+
+/*
  * The TAL file conforms to RFC 7730.
  * It is the top-level structure of RPKI and defines where we can find
  * certificates for TAs (trust anchors).
@@ -151,7 +175,7 @@ struct cert {
  */
 struct tal {
 	char		**uri; /* well-formed rsync URIs */
-	size_t		 urisz; /* number of URIs */
+	size_t		 num_uris;
 	unsigned char	*pkey; /* DER-encoded public key */
 	size_t		 pkeysz; /* length of pkey */
 	char		*descr; /* basename of tal file */
@@ -219,6 +243,7 @@ struct mft {
 	unsigned int	 repoid;
 	int		 talid;
 	int		 certid;
+	int		 seqnum_gap; /* was there a gap compared to prev mft? */
 };
 
 /*
@@ -240,8 +265,8 @@ struct roa_ip {
  */
 struct roa {
 	uint32_t	 asid; /* asID of ROA (if 0, RFC 6483 sec 4) */
-	struct roa_ip	*ips; /* IP prefixes */
-	size_t		 ipsz; /* number of IP prefixes */
+	struct roa_ip	*ips;	/* IP prefixes */
+	size_t		 num_ips;
 	int		 talid; /* ROAs are covered by which TAL */
 	int		 valid; /* validated resources */
 	char		*aia; /* AIA */
@@ -265,12 +290,12 @@ struct rscfile {
 struct rsc {
 	int		 talid; /* RSC covered by what TAL */
 	int		 valid; /* eContent resources covered by EE's 3779? */
-	struct cert_ip	*ips; /* IP prefixes */
-	size_t		 ipsz; /* number of IP prefixes */
-	struct cert_as	*as; /* AS resources */
-	size_t		 asz; /* number of AS resources */
+	struct cert_ip	*ips;	/* IP prefixes */
+	size_t		 num_ips;
+	struct cert_as	*ases;	/* AS resources */
+	size_t		 num_ases;
 	struct rscfile	*files; /* FileAndHashes in the RSC */
-	size_t		 filesz; /* number of FileAndHashes */
+	size_t		 num_files;
 	char		*aia; /* AIA */
 	char		*aki; /* AKI */
 	char		*ski; /* SKI */
@@ -294,8 +319,8 @@ struct spl_pfx {
  */
 struct spl {
 	uint32_t	 asid;
-	struct spl_pfx	*pfxs;
-	size_t		 pfxsz;
+	struct spl_pfx	*prefixes;
+	size_t		 num_prefixes;
 	int		 talid;
 	char		*aia;
 	char		*aki;
@@ -313,9 +338,9 @@ struct spl {
  */
 struct takey {
 	char		**comments; /* Comments */
-	size_t		 commentsz; /* number of Comments */
+	size_t		 num_comments;
 	char		**uris; /* CertificateURI */
-	size_t		 urisz; /* number of CertificateURIs */
+	size_t		 num_uris;
 	unsigned char	*pubkey; /* DER encoded SubjectPublicKeyInfo */
 	size_t		 pubkeysz;
 	char		*ski; /* hex encoded SubjectKeyIdentifier of pubkey */
@@ -352,7 +377,7 @@ struct geoip {
  */
 struct geofeed {
 	struct geoip	*geoips; /* Prefix + location entry in the CSV */
-	size_t		 geoipsz; /* number of IPs */
+	size_t		 num_geoips;
 	char		*aia; /* AIA */
 	char		*aki; /* AKI */
 	char		*ski; /* SKI */
@@ -391,7 +416,7 @@ struct aspa {
 	char			*ski; /* SKI */
 	uint32_t		 custasid; /* the customerASID */
 	uint32_t		*providers; /* the providers */
-	size_t			 providersz; /* number of providers */
+	size_t			 num_providers;
 	time_t			 signtime; /* CMS signing-time attribute */
 	time_t			 notbefore; /* EE cert's Not Before */
 	time_t			 notafter; /* notAfter of the ASPA EE cert */
@@ -406,7 +431,7 @@ struct vap {
 	RB_ENTRY(vap)		 entry;
 	uint32_t		 custasid;
 	uint32_t		*providers;
-	size_t			 providersz;
+	size_t			 num_providers;
 	time_t			 expires;
 	int			 talid;
 	unsigned int		 repoid;
@@ -447,7 +472,7 @@ struct vsp {
 	RB_ENTRY(vsp)	 entry;
 	uint32_t	 asid;
 	struct spl_pfx	*prefixes;
-	size_t		 prefixesz;
+	size_t		 num_prefixes;
 	time_t		 expires;
 	int		 talid;
 	unsigned int	 repoid;
@@ -584,6 +609,9 @@ enum stype {
 	STYPE_DEC_UNIQUE,
 	STYPE_PROVIDERS,
 	STYPE_OVERFLOW,
+	STYPE_SEQNUM_GAP,
+	STYPE_FUNC,
+	STYPE_NONFUNC,
 };
 
 struct repo;
@@ -597,7 +625,9 @@ RB_HEAD(filepath_tree, filepath);
 struct repotalstats {
 	uint32_t	 certs; /* certificates */
 	uint32_t	 certs_fail; /* invalid certificate */
+	uint32_t	 certs_nonfunc; /* non-functional CA certificates */
 	uint32_t	 mfts; /* total number of manifests */
+	uint32_t	 mfts_gap; /* manifests with sequence gaps */
 	uint32_t	 mfts_fail; /* failing syntactic parse */
 	uint32_t	 roas; /* route origin authorizations */
 	uint32_t	 roas_fail; /* failing syntactic parse */
@@ -658,6 +688,7 @@ extern int noop;
 extern int filemode;
 extern int excludeaspa;
 extern int experimental;
+extern int excludeas0;
 extern const char *tals[];
 extern const char *taldescs[];
 extern unsigned int talrepocnt[];
@@ -681,6 +712,9 @@ struct cert	*ta_parse(const char *, struct cert *, const unsigned char *,
 		    size_t);
 struct cert	*cert_read(struct ibuf *);
 void		 cert_insert_brks(struct brk_tree *, struct cert *);
+void		 cert_insert_nca(struct nca_tree *, const struct cert *,
+		    struct repo *);
+void		 cert_remove_nca(struct nca_tree *, int, struct repo *);
 
 enum rtype	 rtype_from_file_extension(const char *);
 void		 mft_buffer(struct ibuf *, const struct mft *);
@@ -690,6 +724,8 @@ struct mft	*mft_parse(X509 **, const char *, int, const unsigned char *,
 struct mft	*mft_read(struct ibuf *);
 int		 mft_compare_issued(const struct mft *, const struct mft *);
 int		 mft_compare_seqnum(const struct mft *, const struct mft *);
+int		 mft_seqnum_gap_present(const struct mft *, const struct mft *,
+		    BN_CTX *);
 
 void		 roa_buffer(struct ibuf *, const struct roa *);
 void		 roa_free(struct roa *);
@@ -831,7 +867,8 @@ void		 proc_http(char *, int) __attribute__((noreturn));
 void		 proc_rrdp(int) __attribute__((noreturn));
 
 /* Repository handling */
-int		 filepath_add(struct filepath_tree *, char *, int, time_t);
+int		 filepath_add(struct filepath_tree *, char *, int, time_t, int);
+int		 filepath_valid(struct filepath_tree *, char *, int);
 void		 rrdp_clear(unsigned int);
 void		 rrdp_session_save(unsigned int, struct rrdp_session *);
 void		 rrdp_session_free(struct rrdp_session *);
@@ -897,8 +934,8 @@ void		 io_close_buffer(struct msgbuf *, struct ibuf *);
 void		 io_read_buf(struct ibuf *, void *, size_t);
 void		 io_read_str(struct ibuf *, char **);
 void		 io_read_buf_alloc(struct ibuf *, void **, size_t *);
-struct ibuf	*io_buf_read(int, struct ibuf **);
-struct ibuf	*io_buf_recvfd(int, struct ibuf **);
+struct ibuf	*io_parse_hdr(struct ibuf *, void *, int *);
+struct ibuf	*io_buf_get(struct msgbuf *);
 
 /* X509 helpers. */
 
@@ -915,7 +952,10 @@ char		*x509_get_pubkey(X509 *, const char *);
 char		*x509_pubkey_get_ski(X509_PUBKEY *, const char *);
 enum cert_purpose	 x509_get_purpose(X509 *, const char *);
 int		 x509_get_time(const ASN1_TIME *, time_t *);
-char		*x509_convert_seqnum(const char *, const ASN1_INTEGER *);
+char		*x509_convert_seqnum(const char *, const char *,
+		    const ASN1_INTEGER *);
+int		 x509_valid_seqnum(const char *, const char *,
+		    const ASN1_INTEGER *);
 int		 x509_location(const char *, const char *, GENERAL_NAME *,
 		    char **);
 int		 x509_inherits(X509 *);
@@ -954,22 +994,24 @@ extern int	 outformats;
 #define FORMAT_OMETRIC	0x10
 
 int		 outputfiles(struct vrp_tree *v, struct brk_tree *b,
-		    struct vap_tree *, struct vsp_tree *, struct stats *);
+		    struct vap_tree *, struct vsp_tree *, struct nca_tree *,
+		    struct stats *);
 int		 outputheader(FILE *, struct stats *);
 int		 output_bgpd(FILE *, struct vrp_tree *, struct brk_tree *,
-		    struct vap_tree *, struct vsp_tree *, struct stats *);
-int		 output_bird1v4(FILE *, struct vrp_tree *, struct brk_tree *,
-		    struct vap_tree *, struct vsp_tree *, struct stats *);
-int		 output_bird1v6(FILE *, struct vrp_tree *, struct brk_tree *,
-		    struct vap_tree *, struct vsp_tree *, struct stats *);
-int		 output_bird2(FILE *, struct vrp_tree *, struct brk_tree *,
-		    struct vap_tree *, struct vsp_tree *, struct stats *);
+		    struct vap_tree *, struct vsp_tree *, struct nca_tree *,
+		    struct stats *);
+int		 output_bird(FILE *, struct vrp_tree *, struct brk_tree *,
+		    struct vap_tree *, struct vsp_tree *, struct nca_tree *,
+		    struct stats *);
 int		 output_csv(FILE *, struct vrp_tree *, struct brk_tree *,
-		    struct vap_tree *, struct vsp_tree *, struct stats *);
+		    struct vap_tree *, struct vsp_tree *, struct nca_tree *,
+		    struct stats *);
 int		 output_json(FILE *, struct vrp_tree *, struct brk_tree *,
-		    struct vap_tree *, struct vsp_tree *, struct stats *);
+		    struct vap_tree *, struct vsp_tree *, struct nca_tree *,
+		    struct stats *);
 int		 output_ometric(FILE *, struct vrp_tree *, struct brk_tree *,
-		    struct vap_tree *, struct vsp_tree *, struct stats *);
+		    struct vap_tree *, struct vsp_tree *, struct nca_tree *,
+		    struct stats *);
 
 void		 logx(const char *fmt, ...)
 		    __attribute__((format(printf, 1, 2)));
@@ -983,6 +1025,9 @@ int	mkpathat(int, const char *);
 #define RPKI_PATH_BASE_DIR	"/var/cache/rpki-client"
 
 #define DEFAULT_SKIPLIST_FILE	"/etc/rpki/skiplist"
+
+/* Interval in which random reinitialization to an RRDP snapshot happens. */
+#define RRDP_RANDOM_REINIT_MAX	12 /* weeks */
 
 /* Maximum number of TAL files we'll load. */
 #define	TALSZ_MAX		8
@@ -1000,7 +1045,7 @@ int	mkpathat(int, const char *);
 
 /* Min/Max acceptable file size */
 #define MIN_FILE_SIZE		100
-#define MAX_FILE_SIZE		4000000
+#define MAX_FILE_SIZE		8000000
 
 /* Maximum number of FileNameAndHash entries per RSC checklist. */
 #define MAX_CHECKLIST_ENTRIES	100000

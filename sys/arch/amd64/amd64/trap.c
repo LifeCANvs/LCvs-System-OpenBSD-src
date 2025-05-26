@@ -1,4 +1,4 @@
-/*	$OpenBSD: trap.c,v 1.105 2024/02/21 15:53:07 deraadt Exp $	*/
+/*	$OpenBSD: trap.c,v 1.107 2025/05/05 23:02:39 guenther Exp $	*/
 /*	$NetBSD: trap.c,v 1.2 2003/05/04 23:51:56 fvdl Exp $	*/
 
 /*-
@@ -182,7 +182,7 @@ upageflttrap(struct trapframe *frame, uint64_t cr2)
 	int signal, sicode, error;
 
 	/*
-	 * If NX is not enabled, we cant distinguish between PROT_READ
+	 * If NX is not enabled, we can't distinguish between PROT_READ
 	 * and PROT_EXEC access, so try both.
 	 */
 	error = uvm_fault(&p->p_vmspace->vm_map, va, 0, access_type);
@@ -465,6 +465,8 @@ trap_print(struct trapframe *frame, int type)
 	    frame->tf_rflags, rcr2(), curcpu()->ci_ilevel, frame->tf_rsp);
 	printf("gsbase %p  kgsbase %p\n",
 	    (void *)rdmsr(MSR_GSBASE), (void *)rdmsr(MSR_KERNELGSBASE));
+	if (type == T_TRCTRAP)
+		printf("dr6 %llx dr7 %llx\n", rdr6(), rdr7());
 }
 
 

@@ -1,4 +1,4 @@
-/*	$OpenBSD: mroute.c,v 1.26 2019/09/02 12:48:44 bluhm Exp $	*/
+/*	$OpenBSD: mroute.c,v 1.28 2025/05/20 00:08:28 bluhm Exp $	*/
 /*	$NetBSD: mroute.c,v 1.10 1996/05/11 13:51:27 mycroft Exp $	*/
 
 /*
@@ -74,18 +74,9 @@ mroutepr(void)
 
 	if (sysctl(mib, sizeof(mib) / sizeof(mib[0]),
 	    &mrtproto, &len, NULL, 0) == -1) {
-		if (errno != ENOPROTOOPT)
+		if (errno != EOPNOTSUPP)
 			warn("mroute");
-		return;
-	}
-	switch (mrtproto) {
-	case 0:
 		printf("no multicast routing compiled into this system\n");
-		return;
-	case IGMP_DVMRP:
-		break;
-	default:
-		printf("multicast routing protocol %u, unknown\n", mrtproto);
 		return;
 	}
 
@@ -158,40 +149,23 @@ mroutepr(void)
 void
 mrt_stats(void)
 {
-	u_int mrtproto;
 	struct mrtstat mrtstat;
-	int mib[] = { CTL_NET, PF_INET, IPPROTO_IP, IPCTL_MRTPROTO };
-	int mib2[] = { CTL_NET, PF_INET, IPPROTO_IP, IPCTL_MRTSTATS };
-	size_t len = sizeof(int);
+	int mib[] = { CTL_NET, PF_INET, IPPROTO_IP, IPCTL_MRTSTATS };
+	size_t len = sizeof(mrtstat);
 
 	if (sysctl(mib, sizeof(mib) / sizeof(mib[0]),
-	    &mrtproto, &len, NULL, 0) == -1) {
-		if (errno != ENOPROTOOPT)
-			warn("mroute");
-		return;
-	}
-	switch (mrtproto) {
-	case 0:
-		printf("no multicast routing compiled into this system\n");
-		return;
-
-	case IGMP_DVMRP:
-		break;
-
-	default:
-		printf("multicast routing protocol %u, unknown\n", mrtproto);
-		return;
-	}
-
-	len = sizeof(mrtstat);
-	if (sysctl(mib2, sizeof(mib2) / sizeof(mib2[0]),
 	    &mrtstat, &len, NULL, 0) == -1) {
-		if (errno != ENOPROTOOPT)
+		if (errno != EOPNOTSUPP)
 			warn("mroute");
+		printf("no multicast routing compiled into this system\n");
 		return;
 	}
 
 	printf("multicast routing:\n");
+	printf("\t%lu multicast forwarding cache lookup%s\n",
+	    mrtstat.mrts_mfc_lookups, plural(mrtstat.mrts_mfc_lookups));
+	printf("\t%lu multicast forwarding cache miss%s\n",
+	    mrtstat.mrts_mfc_misses, plurales(mrtstat.mrts_mfc_misses));
 	printf("\t%lu datagram%s with no route for origin\n",
 	    mrtstat.mrts_no_route, plural(mrtstat.mrts_no_route));
 	printf("\t%lu upcall%s made to mrouted\n",

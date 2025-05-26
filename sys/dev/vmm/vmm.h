@@ -1,4 +1,4 @@
-/* $OpenBSD: vmm.h,v 1.4 2024/01/11 17:13:48 jan Exp $ */
+/* $OpenBSD: vmm.h,v 1.10 2025/05/20 13:51:27 dv Exp $ */
 /*
  * Copyright (c) 2014-2023 Mike Larkin <mlarkin@openbsd.org>
  *
@@ -20,8 +20,18 @@
 
 #include <uvm/uvm_extern.h>
 
+#include <machine/vmmvar.h>
+
 #ifndef DEV_VMM_H
 #define DEV_VMM_H
+
+#define VMM_MAX_MEM_RANGES	16
+#define VMM_MAX_DISKS_PER_VM	4
+#define VMM_MAX_NAME_LEN	64
+#define VMM_MAX_VCPUS		512
+#define VMM_MAX_VCPUS_PER_VM	64
+#define VMM_MAX_VM_MEM_SIZE	128L * 1024 * 1024 * 1024
+#define VMM_MAX_NICS_PER_VM	4
 
 struct vm_mem_range {
 	paddr_t vmr_gpa;
@@ -39,9 +49,13 @@ struct vm_create_params {
 	size_t			vcp_ncpus;
 	struct vm_mem_range	vcp_memranges[VMM_MAX_MEM_RANGES];
 	char			vcp_name[VMM_MAX_NAME_LEN];
+	int			vcp_sev;
+	int			vcp_seves;
 
         /* Output parameter from VMM_IOC_CREATE */
         uint32_t		vcp_id;
+        uint32_t		vcp_poscbit;
+        uint32_t		vcp_asid[VMM_MAX_VCPUS];
 };
 
 struct vm_info_result {
@@ -81,6 +95,38 @@ struct vm_sharemem_params {
 	uint32_t		vsp_vm_id;
 	size_t			vsp_nmemranges;
 	struct vm_mem_range	vsp_memranges[VMM_MAX_MEM_RANGES];
+
+	/* Output parameters from VMM_IOC_SHAREMEM */
+	vaddr_t			vsp_va[VMM_MAX_MEM_RANGES];
+};
+
+struct vm_run_params {
+	/* Input parameters to VMM_IOC_RUN */
+	uint32_t	vrp_vm_id;
+	uint32_t	vrp_vcpu_id;
+	struct vcpu_inject_event	vrp_inject;
+	uint8_t		vrp_intr_pending;	/* Additional intrs pending? */
+
+	/* Input/output parameter to VMM_IOC_RUN */
+	struct vm_exit	*vrp_exit;		/* updated exit data */
+
+	/* Output parameter from VMM_IOC_RUN */
+	uint16_t	vrp_exit_reason;	/* exit reason */
+	uint8_t		vrp_irqready;		/* ready for IRQ on entry */
+};
+
+#define VM_RWVMPARAMS_PVCLOCK_SYSTEM_GPA 0x1	/* read/write pvclock gpa */
+#define VM_RWVMPARAMS_PVCLOCK_VERSION	 0x2	/* read/write pvclock version */
+#define VM_RWVMPARAMS_ALL	(VM_RWVMPARAMS_PVCLOCK_SYSTEM_GPA | \
+    VM_RWVMPARAMS_PVCLOCK_VERSION)
+
+struct vm_rwvmparams_params {
+	/* Input parameters to VMM_IOC_READVMPARAMS/VMM_IOC_WRITEVMPARAMS */
+	uint32_t		vpp_vm_id;
+	uint32_t		vpp_vcpu_id;
+	uint32_t		vpp_mask;
+	paddr_t			vpp_pvclock_system_gpa;
+	uint32_t		vpp_pvclock_version;
 };
 
 /* IOCTL definitions */
@@ -95,7 +141,7 @@ struct vm_sharemem_params {
 #define VMM_IOC_READVMPARAMS _IOWR('V', 9, struct vm_rwvmparams_params)
 /* Set VM params */
 #define VMM_IOC_WRITEVMPARAMS _IOW('V', 10, struct vm_rwvmparams_params)
-#define VMM_IOC_SHAREMEM _IOW('V', 11, struct vm_sharemem_params)
+#define VMM_IOC_SHAREMEM _IOWR('V', 11, struct vm_sharemem_params)
 
 #ifdef _KERNEL
 
@@ -126,14 +172,17 @@ enum {
  *	V	vmm_softc's vm_lock
  */
 struct vm {
-	struct vmspace		 *vm_vmspace;		/* [K] */
-	vm_map_t		 vm_map;		/* [K] */
+	pmap_t			 vm_pmap;		/* [r] */
+
 	uint32_t		 vm_id;			/* [I] */
 	pid_t			 vm_creator_pid;	/* [I] */
+
 	size_t			 vm_nmemranges;		/* [I] */
 	size_t			 vm_memory_size;	/* [I] */
-	char			 vm_name[VMM_MAX_NAME_LEN];
 	struct vm_mem_range	 vm_memranges[VMM_MAX_MEM_RANGES];
+	struct uvm_object	*vm_memory_slot[VMM_MAX_MEM_RANGES]; /* [I] */
+
+	char			 vm_name[VMM_MAX_NAME_LEN];
 	struct refcnt		 vm_refcnt;		/* [a] */
 
 	struct vcpu_head	 vm_vcpu_list;		/* [v] */
@@ -185,6 +234,12 @@ struct vmm_softc {
 	uint8_t			vpids[512];	/* [p] bitmap of VPID/ASIDs */
 };
 
+extern struct vmm_softc *vmm_softc;
+extern struct pool vm_pool;
+extern struct pool vcpu_pool;
+extern struct cfdriver vmm_cd;
+extern const struct cfattach vmm_ca;
+
 int vmm_probe(struct device *, void *, void *);
 int vmm_activate(struct device *, int);
 void vmm_attach(struct device *, struct device *,  void *);
@@ -200,8 +255,10 @@ void vm_teardown(struct vm **);
 int vm_get_info(struct vm_info_params *);
 int vm_terminate(struct vm_terminate_params *);
 int vm_resetcpu(struct vm_resetcpu_params *);
+int vm_rwvmparams(struct vm_rwvmparams_params *, int);
 int vcpu_must_stop(struct vcpu *);
 int vm_share_mem(struct vm_sharemem_params *, struct proc *);
+int vm_run(struct vm_run_params *);
 
 #ifdef VMM_DEBUG
 void dump_vcpu(struct vcpu *);

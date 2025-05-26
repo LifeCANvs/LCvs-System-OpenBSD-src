@@ -1,4 +1,4 @@
-/*	$OpenBSD: vfs_subr.c,v 1.319 2024/02/03 18:51:58 beck Exp $	*/
+/*	$OpenBSD: vfs_subr.c,v 1.329 2025/04/27 00:58:55 tedu Exp $	*/
 /*	$NetBSD: vfs_subr.c,v 1.53 1996/04/22 01:39:13 christos Exp $	*/
 
 /*
@@ -72,6 +72,11 @@
 
 #include "softraid.h"
 
+/*
+ * Locks used to protect data:
+ *	a	atomic
+ */
+
 void sr_quiesce(void);
 
 enum vtype iftovt_tab[16] = {
@@ -84,8 +89,7 @@ int	vttoif_tab[9] = {
 	S_IFSOCK, S_IFIFO, S_IFMT,
 };
 
-int prtactive = 0;		/* 1 => print out reclaim of active vnodes */
-int suid_clear = 1;		/* 1 => clear SUID / SGID on owner change */
+int prtactive = 0;	/* 1 => print out reclaim of active vnodes */
 
 /*
  * Insq/Remq for the vnode usage lists.
@@ -176,6 +180,7 @@ vfs_mount_alloc(struct vnode *vp, struct vfsconf *vfsp)
 	struct mount *mp;
 
 	mp = malloc(sizeof(*mp), M_MOUNT, M_WAITOK|M_ZERO);
+	refcnt_init(&mp->mnt_refs);
 	rw_init_flags(&mp->mnt_lock, "vfslock", RWL_IS_VNODE);
 	(void)vfs_busy(mp, VB_READ|VB_NOWAIT);
 
@@ -191,14 +196,29 @@ vfs_mount_alloc(struct vnode *vp, struct vfsconf *vfsp)
 	return (mp);
 }
 
+struct mount *
+vfs_mount_take(struct mount *mp)
+{
+	refcnt_take(&mp->mnt_refs);
+	return (mp);
+}
+
+static void
+vfs_mount_rele(struct mount *mp)
+{
+	if (refcnt_rele(&mp->mnt_refs))
+		free(mp, M_MOUNT, sizeof(*mp));
+}
+
 /*
  * Release a mount point.
  */
 void
 vfs_mount_free(struct mount *mp)
 {
+	SET(mp->mnt_flag, MNT_UNMOUNT);
 	atomic_dec_int(&mp->mnt_vfc->vfc_refcount);
-	free(mp, M_MOUNT, sizeof(*mp));
+	vfs_mount_rele(mp);
 }
 
 /*
@@ -211,27 +231,27 @@ vfs_mount_free(struct mount *mp)
 int
 vfs_busy(struct mount *mp, int flags)
 {
-	int rwflags = 0;
+	int rwflags = ISSET(flags, VB_WRITE) ? RW_WRITE : RW_READ;
+	int error = 0;
 
-	if (flags & VB_WRITE)
-		rwflags |= RW_WRITE;
-	else
-		rwflags |= RW_READ;
-
-	if (flags & VB_WAIT)
-		rwflags |= RW_SLEEPFAIL;
-	else
+	if (!ISSET(flags, VB_WAIT))
 		rwflags |= RW_NOSLEEP;
 
 #ifdef WITNESS
-	if (flags & VB_DUPOK)
+	if (ISSET(flags, VB_DUPOK))
 		rwflags |= RW_DUPOK;
 #endif
 
-	if (rw_enter(&mp->mnt_lock, rwflags))
-		return (EBUSY);
+	vfs_mount_take(mp);
+	if (rw_enter(&mp->mnt_lock, rwflags) != 0)
+		error = EBUSY;
+	else if (ISSET(mp->mnt_flag, MNT_UNMOUNT)) {
+		rw_exit(&mp->mnt_lock);
+		error = EBUSY;
+	}
+	vfs_mount_rele(mp);
 
-	return (0);
+	return (error);
 }
 
 /*
@@ -246,10 +266,7 @@ vfs_unbusy(struct mount *mp)
 int
 vfs_isbusy(struct mount *mp)
 {
-	if (RWLOCK_OWNER(&mp->mnt_lock) > 0)
-		return (1);
-	else
-		return (0);
+	return (rw_status(&mp->mnt_lock) != 0);
 }
 
 /*
@@ -982,7 +999,7 @@ vflush_vnode(struct vnode *vp, void *arg)
 	if (empty)
 		return (0);
 
-#ifdef DEBUG_SYSCTL
+#if defined(DEBUG_SYSCTL) && (defined(DEBUG) || defined(DIAGNOSTIC))
 	if (busyprt)
 		vprint("vflush: busy vnode", vp);
 #endif
@@ -1826,7 +1843,7 @@ vfs_syncwait(struct proc *p, int verbose)
 			 */
 			if (bp->b_flags & B_DELWRI) {
 				s = splbio();
-				bremfree(bp);
+				bufcache_take(bp);
 				buf_acquire(bp);
 				splx(s);
 				nbusy++;
@@ -1856,46 +1873,6 @@ vfs_syncwait(struct proc *p, int verbose)
 	}
 
 	return nbusy;
-}
-
-/*
- * posix file system related system variables.
- */
-int
-fs_posix_sysctl(int *name, u_int namelen, void *oldp, size_t *oldlenp,
-    void *newp, size_t newlen, struct proc *p)
-{
-	/* all sysctl names at this level are terminal */
-	if (namelen != 1)
-		return (ENOTDIR);
-
-	switch (name[0]) {
-	case FS_POSIX_SETUID:
-		return (sysctl_securelevel_int(oldp, oldlenp, newp, newlen,
-		    &suid_clear));
-	default:
-		return (EOPNOTSUPP);
-	}
-	/* NOTREACHED */
-}
-
-/*
- * file system related system variables.
- */
-int
-fs_sysctl(int *name, u_int namelen, void *oldp, size_t *oldlenp, void *newp,
-    size_t newlen, struct proc *p)
-{
-	sysctlfn *fn;
-
-	switch (name[0]) {
-	case FS_POSIX:
-		fn = fs_posix_sysctl;
-		break;
-	default:
-		return (EOPNOTSUPP);
-	}
-	return (*fn)(name + 1, namelen - 1, oldp, oldlenp, newp, newlen, p);
 }
 
 
@@ -2007,7 +1984,7 @@ loop:
 				}
 				break;
 			}
-			bremfree(bp);
+			bufcache_take(bp);
 			/*
 			 * XXX Since there are no node locks for NFS, I believe
 			 * there is a slight chance that a delayed write will
@@ -2060,7 +2037,7 @@ loop:
 			continue;
 		if ((bp->b_flags & B_DELWRI) == 0)
 			panic("vflushbuf: not dirty");
-		bremfree(bp);
+		bufcache_take(bp);
 		buf_acquire(bp);
 		splx(s);
 		/*
@@ -2223,18 +2200,6 @@ reassignbuf(struct buf *bp)
 		}
 	}
 	bufinsvn(bp, listheadp);
-}
-
-/*
- * Check if vnode represents a disk device
- */
-int
-vn_isdisk(struct vnode *vp, int *errp)
-{
-	if (vp->v_type != VBLK && vp->v_type != VCHR)
-		return (0);
-
-	return (1);
 }
 
 #ifdef DDB

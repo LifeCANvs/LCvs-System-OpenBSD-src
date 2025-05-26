@@ -1,4 +1,4 @@
-/* $OpenBSD: kstat.c,v 1.2 2022/01/31 05:09:17 dlg Exp $ */
+/* $OpenBSD: kstat.c,v 1.5 2025/01/18 12:31:49 mglocker Exp $ */
 
 /*
  * Copyright (c) 2020 David Gwynne <dlg@openbsd.org>
@@ -252,7 +252,7 @@ kstatioc_leave(struct kstat_req *ksreq, struct kstat *ks)
 
 			/* KSTAT_F_REALLOC */
 			KASSERTMSG(ks->ks_datalen == klen,
-			    "kstat doesnt support resized data yet");
+			    "kstat doesn't support resized data yet");
 
 			error = (*ks->ks_copy)(ks, buf);
 		}
@@ -593,7 +593,7 @@ kstat_cpu_enter(void *p)
 void
 kstat_cpu_leave(void *p)
 {
-	atomic_clearbits_int(&curproc->p_flag, P_CPUPEG);
+	sched_unpeg_curproc();
 }
 
 void
@@ -685,10 +685,13 @@ kstat_kv_unit_init(struct kstat_kv *kv, const char *name,
 	switch (type) {
 	case KSTAT_KV_T_COUNTER64:
 	case KSTAT_KV_T_COUNTER32:
+	case KSTAT_KV_T_COUNTER16:
 	case KSTAT_KV_T_UINT64:
 	case KSTAT_KV_T_INT64:
 	case KSTAT_KV_T_UINT32:
 	case KSTAT_KV_T_INT32:
+	case KSTAT_KV_T_UINT16:
+	case KSTAT_KV_T_INT16:
 		break;
 	default:
 		panic("kv unit init %s: unit for non-integer type", name);

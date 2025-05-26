@@ -1,4 +1,4 @@
-/*	$OpenBSD: pfvar.h,v 1.538 2024/05/13 01:15:53 jsg Exp $ */
+/*	$OpenBSD: pfvar.h,v 1.543 2025/04/14 20:02:34 sf Exp $ */
 
 /*
  * Copyright (c) 2001 Daniel Hartmeier
@@ -36,7 +36,6 @@
 
 #include <sys/queue.h>
 #include <sys/tree.h>
-#include <sys/rwlock.h>
 #include <sys/syslimits.h>
 #include <sys/refcnt.h>
 #include <sys/timeout.h>
@@ -1034,10 +1033,6 @@ struct pfr_ktable {
 #define pfrkt_nomatch	pfrkt_ts.pfrts_nomatch
 #define pfrkt_tzero	pfrkt_ts.pfrts_tzero
 
-RB_HEAD(pf_state_tree_ext_gwy, pf_state_key);
-RB_PROTOTYPE(pf_state_tree_ext_gwy, pf_state_key,
-    entry_ext_gwy, pf_state_compare_ext_gwy)
-
 RB_HEAD(pfi_ifhead, pfi_kif);
 
 /* state tables */
@@ -1246,7 +1241,7 @@ struct pf_status {
 #define PF_PRIO_ZERO		0xff		/* match "prio 0" packets */
 
 struct pf_queue_bwspec {
-	u_int		absolute;
+	uint64_t	absolute;
 	u_int		percent;
 };
 
@@ -1863,25 +1858,26 @@ void			 pf_mbuf_unlink_inpcb(struct mbuf *);
 u_int8_t*		 pf_find_tcpopt(u_int8_t *, u_int8_t *, size_t,
 			    u_int8_t, u_int8_t);
 u_int8_t		 pf_get_wscale(struct pf_pdesc *);
-u_int16_t		 pf_get_mss(struct pf_pdesc *);
+u_int16_t		 pf_get_mss(struct pf_pdesc *, uint16_t);
 struct mbuf *		 pf_build_tcp(const struct pf_rule *, sa_family_t,
 			    const struct pf_addr *, const struct pf_addr *,
 			    u_int16_t, u_int16_t, u_int32_t, u_int32_t,
 			    u_int8_t, u_int16_t, u_int16_t, u_int8_t, int,
-			    u_int16_t, u_int, u_int);
+			    u_int16_t, u_int, u_int, u_short *);
 void			 pf_send_tcp(const struct pf_rule *, sa_family_t,
 			    const struct pf_addr *, const struct pf_addr *,
 			    u_int16_t, u_int16_t, u_int32_t, u_int32_t,
 			    u_int8_t, u_int16_t, u_int16_t, u_int8_t, int,
-			    u_int16_t, u_int);
+			    u_int16_t, u_int, u_short *);
 void			 pf_syncookies_init(void);
 int			 pf_syncookies_setmode(u_int8_t);
 int			 pf_syncookies_setwats(u_int32_t, u_int32_t);
 int			 pf_syncookies_getwats(struct pfioc_synflwats *);
 int			 pf_synflood_check(struct pf_pdesc *);
-void			 pf_syncookie_send(struct pf_pdesc *);
+void			 pf_syncookie_send(struct pf_pdesc *, u_short *);
 u_int8_t		 pf_syncookie_validate(struct pf_pdesc *);
-struct mbuf *		 pf_syncookie_recreate_syn(struct pf_pdesc *);
+struct mbuf *		 pf_syncookie_recreate_syn(struct pf_pdesc *,
+			    u_short *);
 #endif /* _KERNEL */
 
 #endif /* _NET_PFVAR_H_ */

@@ -1,4 +1,4 @@
-/*	$OpenBSD: sysctl.c,v 1.261 2024/05/09 08:35:40 florian Exp $	*/
+/*	$OpenBSD: sysctl.c,v 1.265 2025/04/29 02:24:32 tedu Exp $	*/
 /*	$NetBSD: sysctl.c,v 1.9 1995/09/30 07:12:50 thorpej Exp $	*/
 
 /*
@@ -111,7 +111,6 @@
 struct ctlname topname[] = CTL_NAMES;
 struct ctlname kernname[] = CTL_KERN_NAMES;
 struct ctlname vmname[] = CTL_VM_NAMES;
-struct ctlname fsname[] = CTL_FS_NAMES;
 struct ctlname netname[] = CTL_NET_NAMES;
 struct ctlname hwname[] = CTL_HW_NAMES;
 struct ctlname debugname[CTL_DEBUG_MAXID];
@@ -147,7 +146,7 @@ struct list secondlevel[] = {
 	{ 0, 0 },			/* CTL_UNSPEC */
 	{ kernname, KERN_MAXID },	/* CTL_KERN */
 	{ vmname, VM_MAXID },		/* CTL_VM */
-	{ fsname, FS_MAXID },		/* CTL_FS */
+	{ 0, 0 },			/* was CTL_FS */
 	{ netname, NET_MAXID },		/* CTL_NET */
 	{ 0, CTL_DEBUG_MAXID },		/* CTL_DEBUG */
 	{ hwname, HW_MAXID },		/* CTL_HW */
@@ -232,8 +231,9 @@ int
 main(int argc, char *argv[])
 {
 	int ch, lvl1;
+	const char *conffile = NULL;
 
-	while ((ch = getopt(argc, argv, "Aanqw")) != -1) {
+	while ((ch = getopt(argc, argv, "Aaf:nqw")) != -1) {
 		switch (ch) {
 
 		case 'A':
@@ -242,6 +242,10 @@ main(int argc, char *argv[])
 
 		case 'a':
 			aflag = 1;
+			break;
+
+		case 'f':
+			conffile = optarg;
 			break;
 
 		case 'n':
@@ -269,16 +273,40 @@ main(int argc, char *argv[])
 		err(1,"unveil %s", _PATH_DEVDB);
 	if (unveil("/dev", "r") == -1 && errno != ENOENT)
 		err(1, "unveil /dev");
+	if (conffile != NULL)
+		if (unveil(conffile, "r") == -1 && errno != ENOENT)
+			err(1, "unveil %s", conffile);
 	if (unveil(NULL, NULL) == -1)
 		err(1, "unveil");
 
-	if (argc == 0 || (Aflag || aflag)) {
+	if ((argc == 0 && conffile == NULL) || (Aflag || aflag)) {
 		debuginit();
 		vfsinit();
 		for (lvl1 = 1; lvl1 < CTL_MAXID; lvl1++)
 			listall(topname[lvl1].ctl_name, &secondlevel[lvl1]);
 		return (0);
 	}
+
+	if (conffile != NULL) {
+		FILE *fp;
+		char *line = NULL, *lp;
+		size_t sz = 0;
+
+		if ((fp = fopen(conffile, "r")) == NULL)
+			err(1, "fopen");
+
+		while (getline(&line, &sz, fp) != -1) {
+			lp = line + strspn(line, " \t");
+			line[strcspn(line, " \t\n#")] = '\0';
+
+			if (lp[0] != '\0')
+				parse(line, 1);
+		}
+
+		free(line);
+		fclose(fp);
+	}
+
 	for (; *argv != NULL; ++argv)
 		parse(*argv, 1);
 	return (0);
@@ -778,12 +806,6 @@ parse(char *string, int flags)
 		}
 #endif
 		break;
-
-	case CTL_FS:
-		len = sysctl_fs(string, &bufp, mib, flags, &type);
-		if (len >= 0)
-			break;
-		return;
 
 	case CTL_VFS:
 		if (mib[1])
@@ -1400,28 +1422,6 @@ sysctl_vfs(char *string, char **bufpp, int mib[], int flags, int *typep)
 	mib[1] = vfs_typenums[mib[1]];
 	mib[2] = indx;
 	*typep = lp->list[indx].ctl_type;
-	return (3);
-}
-
-struct ctlname posixname[] = CTL_FS_POSIX_NAMES;
-struct list fslist = { posixname, FS_POSIX_MAXID };
-
-/*
- * handle file system requests
- */
-int
-sysctl_fs(char *string, char **bufpp, int mib[], int flags, int *typep)
-{
-	int indx;
-
-	if (*bufpp == NULL) {
-		listall(string, &fslist);
-		return (-1);
-	}
-	if ((indx = findname(string, "third", bufpp, &fslist)) == -1)
-		return (-1);
-	mib[2] = indx;
-	*typep = fslist.list[indx].ctl_type;
 	return (3);
 }
 
@@ -2973,8 +2973,7 @@ findname(char *string, char *level, char **bufp, struct list *namelist)
 void
 usage(void)
 {
-
 	(void)fprintf(stderr,
-	    "usage: sysctl [-Aanq] [name[=value]]\n");
+	    "usage: sysctl [-Aanq] [-f file] [name[=value] ...]\n");
 	exit(1);
 }

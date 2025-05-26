@@ -1,4 +1,4 @@
-/*	$OpenBSD: gpt.h,v 1.20 2022/04/20 17:14:35 krw Exp $	*/
+/*	$OpenBSD: gpt.h,v 1.22 2025/05/25 03:26:43 krw Exp $	*/
 /*
  * Copyright (c) 2015 Markus Muller <mmu@grummel.net>
  * Copyright (c) 2015 Kenneth R Westerback <krw@openbsd.org>
@@ -17,6 +17,7 @@
  */
 
 int		GPT_read(const int);
+int		GPT_recover_partition(const char *, const char *, const char *);
 int		GPT_get_lba_start(const unsigned int);
 int		GPT_get_lba_end(const unsigned int);
 int		GPT_get_name(const unsigned int);

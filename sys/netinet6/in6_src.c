@@ -1,4 +1,4 @@
-/*	$OpenBSD: in6_src.c,v 1.99 2024/04/21 17:32:11 florian Exp $	*/
+/*	$OpenBSD: in6_src.c,v 1.101 2025/05/20 05:51:43 bluhm Exp $	*/
 /*	$KAME: in6_src.c,v 1.36 2001/02/06 04:08:17 itojun Exp $	*/
 
 /*
@@ -91,21 +91,20 @@ int in6_selectif(const struct in6_addr *, struct ip6_pktopts *,
  * the values set at pcb level can be overridden via cmsg.
  */
 int
-in6_pcbselsrc(const struct in6_addr **in6src, struct sockaddr_in6 *dstsock,
-    struct inpcb *inp, struct ip6_pktopts *opts)
+in6_pcbselsrc(const struct in6_addr **in6src,
+    const struct sockaddr_in6 *dstsock, struct inpcb *inp,
+    struct ip6_pktopts *opts)
 {
-	struct ip6_moptions *mopts = inp->inp_moptions6;
-	struct rtentry *rt;
+	const struct in6_addr *dst = &dstsock->sin6_addr;
 	const struct in6_addr *laddr = &inp->inp_laddr6;
+	struct rtentry *rt;
+	struct ip6_moptions *mopts = inp->inp_moptions6;
 	u_int rtableid = inp->inp_rtableid;
 	struct ifnet *ifp = NULL;
 	struct sockaddr	*ip6_source = NULL;
-	struct in6_addr *dst;
 	struct in6_ifaddr *ia6 = NULL;
 	struct in6_pktinfo *pi = NULL;
 	int	error;
-
-	dst = &dstsock->sin6_addr;
 
 	/*
 	 * If the source address is explicitly specified by the caller,
@@ -232,14 +231,13 @@ in6_pcbselsrc(const struct in6_addr **in6src, struct sockaddr_in6 *dstsock,
  * an entry to the caller for later use.
  */
 int
-in6_selectsrc(const struct in6_addr **in6src, struct sockaddr_in6 *dstsock,
+in6_selectsrc(const struct in6_addr **in6src,
+    const struct sockaddr_in6 *dstsock,
     struct ip6_moptions *mopts, unsigned int rtableid)
 {
+	const struct in6_addr *dst = &dstsock->sin6_addr;
 	struct ifnet *ifp = NULL;
-	struct in6_addr *dst;
 	struct in6_ifaddr *ia6 = NULL;
-
-	dst = &dstsock->sin6_addr;
 
 	/*
 	 * If the destination address is a link-local unicast address or
@@ -318,7 +316,7 @@ in6_selectroute(const struct in6_addr *dst, struct ip6_pktopts *opts,
 		    opts->ip6po_pktinfo->ipi6_ifindex) {
 			if (rt != NULL && !ISSET(rt->rt_flags, RTF_LOCAL) &&
 			    rt->rt_ifidx != opts->ip6po_pktinfo->ipi6_ifindex) {
-			    	return (NULL);
+				return (NULL);
 			}
 		}
 
@@ -349,7 +347,7 @@ in6_selectif(const struct in6_addr *dst, struct ip6_pktopts *opts,
 	 */
 	if (IN6_IS_ADDR_MULTICAST(dst) &&
 	    mopts != NULL && (*retifp = if_get(mopts->im6o_ifidx)) != NULL)
-	    	return (0);
+		return (0);
 
 	rt = in6_selectroute(dst, opts, ro, rtableid);
 	if (rt == NULL)

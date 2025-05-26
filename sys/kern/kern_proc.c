@@ -1,4 +1,4 @@
-/*	$OpenBSD: kern_proc.c,v 1.98 2024/05/20 10:32:20 claudio Exp $	*/
+/*	$OpenBSD: kern_proc.c,v 1.102 2025/03/10 09:28:56 claudio Exp $	*/
 /*	$NetBSD: kern_proc.c,v 1.14 1996/02/09 18:59:41 christos Exp $	*/
 
 /*
@@ -319,7 +319,9 @@ enterthispgrp(struct process *pr, struct pgrp *pgrp)
 	fixjobc(pr, savepgrp, 0);
 
 	LIST_REMOVE(pr, ps_pglist);
+	mtx_enter(&pr->ps_mtx);
 	pr->ps_pgrp = pgrp;
+	mtx_leave(&pr->ps_mtx);
 	LIST_INSERT_HEAD(&pgrp->pg_members, pr, ps_pglist);
 	if (LIST_EMPTY(&savepgrp->pg_members))
 		pgdelete(savepgrp);
@@ -337,7 +339,9 @@ leavepgrp(struct process *pr)
 	LIST_REMOVE(pr, ps_pglist);
 	if (LIST_EMPTY(&pr->ps_pgrp->pg_members))
 		pgdelete(pr->ps_pgrp);
+	mtx_enter(&pr->ps_mtx);
 	pr->ps_pgrp = NULL;
+	mtx_leave(&pr->ps_mtx);
 }
 
 /*
@@ -462,7 +466,7 @@ orphanpg(struct pgrp *pg)
 	struct process *pr;
 
 	LIST_FOREACH(pr, &pg->pg_members, ps_pglist) {
-		if (pr->ps_mainproc->p_stat == SSTOP) {
+		if (pr->ps_flags & PS_STOPPED) {
 			LIST_FOREACH(pr, &pg->pg_members, ps_pglist) {
 				prsignal(pr, SIGHUP);
 				prsignal(pr, SIGCONT);
@@ -497,15 +501,15 @@ proc_printit(struct proc *p, const char *modif,
 	    p->p_runpri, p->p_usrpri, p->p_slppri, p->p_p->ps_nice);
 	(*pr)("    wchan=%p, wmesg=%s, ps_single=%p scnt=%d ecnt=%d\n",
 	    p->p_wchan, (p->p_wchan && p->p_wmesg) ?  p->p_wmesg : "",
-	    p->p_p->ps_single, p->p_p->ps_singlecnt, p->p_p->ps_exitcnt);
+	    p->p_p->ps_single, p->p_p->ps_suspendcnt, p->p_p->ps_exitcnt);
 	(*pr)("    forw=%p, list=%p,%p\n",
 	    TAILQ_NEXT(p, p_runq), p->p_list.le_next, p->p_list.le_prev);
 	(*pr)("    process=%p user=%p, vmspace=%p\n",
 	    p->p_p, p->p_addr, p->p_vmspace);
 	(*pr)("    estcpu=%u, cpticks=%d, pctcpu=%u.%u, "
-	    "user=%u, sys=%u, intr=%u\n",
+	    "user=%llu, sys=%llu, intr=%llu\n",
 	    p->p_estcpu, p->p_cpticks, p->p_pctcpu / 100, p->p_pctcpu % 100,
-	    p->p_uticks, p->p_sticks, p->p_iticks);
+	    p->p_tu.tu_uticks, p->p_tu.tu_sticks, p->p_tu.tu_iticks);
 }
 #include <machine/db_machdep.h>
 

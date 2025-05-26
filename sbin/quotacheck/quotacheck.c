@@ -1,4 +1,4 @@
-/*	$OpenBSD: quotacheck.c,v 1.42 2024/02/03 18:51:57 beck Exp $	*/
+/*	$OpenBSD: quotacheck.c,v 1.44 2025/04/20 17:15:57 kn Exp $	*/
 /*	$NetBSD: quotacheck.c,v 1.12 1996/03/30 22:34:25 mark Exp $	*/
 
 /*
@@ -235,7 +235,7 @@ needchk(struct fstab *fs)
 	    strcmp(fs->fs_vfstype, "mfs"))
 		return (NULL);
 	if ((qnp = malloc(sizeof(*qnp))) == NULL)
-		err(1, "%s", strerror(errno));
+		err(1, NULL);
 	qnp->flags = 0;
 	if (gflag && hasquota(fs, GRPQUOTA, &qfnp)) {
 		strlcpy(qnp->grpqfname, qfnp, sizeof qnp->grpqfname);
@@ -269,7 +269,6 @@ chkquota(const char *vfstype, const char *fsname, const char *mntpt,
 	int cg, i, mode, errs = 0, status;
 	ino_t ino, inosused;
 	pid_t pid;
-	char *cp;
 
 	switch (pid = fork()) {
 	case -1:	/* error */
@@ -607,7 +606,7 @@ addid(u_int32_t id, int type, char *name)
 	else
 		len = 10;
 	if ((fup = calloc(1, sizeof(*fup) + len)) == NULL)
-		err(1, "%s", strerror(errno));
+		err(1, NULL);
 	fhp = &fuhead[type][id & (FUHASH - 1)];
 	fup->fu_next = *fhp;
 	*fhp = fup;

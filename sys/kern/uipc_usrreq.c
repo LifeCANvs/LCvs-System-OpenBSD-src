@@ -1,4 +1,4 @@
-/*	$OpenBSD: uipc_usrreq.c,v 1.206 2024/05/03 17:43:09 mvs Exp $	*/
+/*	$OpenBSD: uipc_usrreq.c,v 1.219 2025/03/12 14:08:31 mvs Exp $	*/
 /*	$NetBSD: uipc_usrreq.c,v 1.18 1996/02/09 19:00:50 christos Exp $	*/
 
 /*
@@ -234,13 +234,13 @@ uipc_setaddr(const struct unpcb *unp, struct mbuf *nam)
  * and don't really want to reserve the sendspace.  Their recvspace should
  * be large enough for at least one max-size datagram plus address.
  */
-#define	PIPSIZ	8192
-u_int	unpst_sendspace = PIPSIZ;
-u_int	unpst_recvspace = PIPSIZ;
-u_int	unpsq_sendspace = PIPSIZ;
-u_int	unpsq_recvspace = PIPSIZ;
-u_int	unpdg_sendspace = 2*1024;	/* really max datagram size */
-u_int	unpdg_recvspace = 16*1024;
+#define	PIPSIZ	32768
+u_int	unpst_sendspace = PIPSIZ;	/* [a] */
+u_int	unpst_recvspace = PIPSIZ;	/* [a] */
+u_int	unpsq_sendspace = PIPSIZ;	/* [a] */
+u_int	unpsq_recvspace = PIPSIZ;	/* [a] */
+u_int	unpdg_sendspace = 8192;		/* [a] really max datagram size */
+u_int	unpdg_recvspace = PIPSIZ;	/* [a] */
 
 const struct sysctl_bounded_args unpstctl_vars[] = {
 	{ UNPCTL_RECVSPACE, &unpst_recvspace, 0, SB_MAX },
@@ -267,15 +267,21 @@ uipc_attach(struct socket *so, int proto, int wait)
 		switch (so->so_type) {
 
 		case SOCK_STREAM:
-			error = soreserve(so, unpst_sendspace, unpst_recvspace);
+			error = soreserve(so,
+			    atomic_load_int(&unpst_sendspace),
+			    atomic_load_int(&unpst_recvspace));
 			break;
 
 		case SOCK_SEQPACKET:
-			error = soreserve(so, unpsq_sendspace, unpsq_recvspace);
+			error = soreserve(so,
+			    atomic_load_int(&unpsq_sendspace),
+			    atomic_load_int(&unpsq_recvspace));
 			break;
 
 		case SOCK_DGRAM:
-			error = soreserve(so, unpdg_sendspace, unpdg_recvspace);
+			error = soreserve(so,
+			    atomic_load_int(&unpdg_sendspace),
+			    atomic_load_int(&unpdg_recvspace));
 			break;
 
 		default:
@@ -379,7 +385,7 @@ uipc_bind(struct socket *so, struct mbuf *nam, struct proc *p)
 		solock(unp->unp_socket);
 		goto out;
 	}
-	VATTR_NULL(&vattr);
+	vattr_null(&vattr);
 	vattr.va_type = VSOCK;
 	vattr.va_mode = ACCESSPERMS &~ p->p_fd->fd_cmask;
 	error = VOP_CREATE(nd.ni_dvp, &nd.ni_vp, &nd.ni_cnd, &vattr);
@@ -513,6 +519,14 @@ uipc_send(struct socket *so, struct mbuf *m, struct mbuf *nam,
 			goto out;
 	}
 
+	/*
+	 * We hold both solock() and `sb_mtx' mutex while modifying
+	 * SS_CANTSENDMORE flag. solock() is enough to check it.
+	 */
+	if (so->so_snd.sb_state & SS_CANTSENDMORE) {
+		error = EPIPE;
+		goto dispose;
+	}
 	if (unp->unp_conn == NULL) {
 		error = ENOTCONN;
 		goto dispose;
@@ -531,14 +545,8 @@ uipc_send(struct socket *so, struct mbuf *m, struct mbuf *nam,
 	 */
 	mtx_enter(&so2->so_rcv.sb_mtx);
 	mtx_enter(&so->so_snd.sb_mtx);
-	if (so->so_snd.sb_state & SS_CANTSENDMORE) {
-		mtx_leave(&so->so_snd.sb_mtx);
-		mtx_leave(&so2->so_rcv.sb_mtx);
-		error = EPIPE;
-		goto dispose;
-	}
 	if (control) {
-		if (sbappendcontrol(so2, &so2->so_rcv, m, control)) {
+		if (sbappendcontrol(&so2->so_rcv, m, control)) {
 			control = NULL;
 		} else {
 			mtx_leave(&so->so_snd.sb_mtx);
@@ -547,9 +555,9 @@ uipc_send(struct socket *so, struct mbuf *m, struct mbuf *nam,
 			goto dispose;
 		}
 	} else if (so->so_type == SOCK_SEQPACKET)
-		sbappendrecord(so2, &so2->so_rcv, m);
+		sbappendrecord(&so2->so_rcv, m);
 	else
-		sbappend(so2, &so2->so_rcv, m);
+		sbappend(&so2->so_rcv, m);
 	so->so_snd.sb_mbcnt = so2->so_rcv.sb_mbcnt;
 	so->so_snd.sb_cc = so2->so_rcv.sb_cc;
 	if (so2->so_rcv.sb_cc > 0)
@@ -617,7 +625,7 @@ uipc_dgram_send(struct socket *so, struct mbuf *m, struct mbuf *nam,
 		from = &sun_noname;
 
 	mtx_enter(&so2->so_rcv.sb_mtx);
-	if (sbappendaddr(so2, &so2->so_rcv, from, m, control)) {
+	if (sbappendaddr(&so2->so_rcv, from, m, control)) {
 		dowakeup = 1;
 		m = NULL;
 		control = NULL;
@@ -648,7 +656,7 @@ uipc_abort(struct socket *so)
 	struct unpcb *unp = sotounpcb(so);
 
 	unp_detach(unp);
-	sofree(so, 0);
+	sofree(so, 1);
 }
 
 int
@@ -761,25 +769,21 @@ unp_detach(struct unpcb *unp)
 
 	unp->unp_vnode = NULL;
 
-	/*
-	 * Enforce `i_lock' -> `solock()' lock order.
-	 */
-	sounlock(so);
-
 	rw_enter_write(&unp_gc_lock);
 	LIST_REMOVE(unp, unp_link);
 	rw_exit_write(&unp_gc_lock);
 
 	if (vp != NULL) {
+		/* Enforce `i_lock' -> solock() lock order. */
+		sounlock(so);
 		VOP_LOCK(vp, LK_EXCLUSIVE);
 		vp->v_socket = NULL;
 
 		KERNEL_LOCK();
 		vput(vp);
 		KERNEL_UNLOCK();
+		solock(so);
 	}
-
-	solock(so);
 
 	if (unp->unp_conn != NULL) {
 		/*
@@ -886,18 +890,17 @@ unp_connect(struct socket *so, struct mbuf *nam, struct proc *p)
 
 		if ((so2->so_options & SO_ACCEPTCONN) == 0 ||
 		    (so3 = sonewconn(so2, 0, M_WAIT)) == NULL) {
+			sounlock(so2);
 			error = ECONNREFUSED;
-		}
-
-		sounlock(so2);
-
-		if (error != 0)
 			goto put;
+		}
 
 		/*
 		 * Since `so2' is protected by vnode(9) lock, `so3'
 		 * can't be PRU_ABORT'ed here.
 		 */
+		sounlock(so2);
+		sounlock(so3);
 		solock_pair(so, so3);
 
 		unp2 = sotounpcb(so2);
@@ -921,22 +924,15 @@ unp_connect(struct socket *so, struct mbuf *nam, struct proc *p)
 		}
 
 		so2 = so3;
-	} else {
-		if (so2 != so)
-			solock_pair(so, so2);
-		else
-			solock(so);
-	}
+	} else
+		solock_pair(so, so2);
 
 	error = unp_connect2(so, so2);
-
-	sounlock(so);
 
 	/*
 	 * `so2' can't be PRU_ABORT'ed concurrently
 	 */
-	if (so2 != so)
-		sounlock(so2);
+	sounlock_pair(so, so2);
 put:
 	vput(vp);
 unlock:
@@ -1154,7 +1150,7 @@ restart:
 	 * Keep `fdp' locked to prevent concurrent close() of just
 	 * inserted descriptors. Such descriptors could have the only
 	 * `f_count' reference which is now shared between control
-	 * message and `fdp'. 
+	 * message and `fdp'.
 	 */
 
 	/*
@@ -1465,7 +1461,7 @@ unp_gc(void *arg __unused)
 				m = sb->sb_mb;
 				memset(&sb->sb_startzero, 0,
 				    (caddr_t)&sb->sb_endzero -
-				        (caddr_t)&sb->sb_startzero);
+				    (caddr_t)&sb->sb_startzero);
 				sb->sb_timeo_nsecs = INFSLP;
 				mtx_leave(&sb->sb_mtx);
 

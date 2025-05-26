@@ -1,4 +1,4 @@
-/*	$OpenBSD: vionet.c,v 1.14 2024/02/22 02:38:53 dv Exp $	*/
+/*	$OpenBSD: vionet.c,v 1.23 2025/05/12 17:17:42 dv Exp $	*/
 
 /*
  * Copyright (c) 2023 Dave Voutila <dv@openbsd.org>
@@ -16,7 +16,6 @@
  * ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
  * OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
  */
-#include <sys/socket.h>
 #include <sys/types.h>
 
 #include <dev/pci/virtio_pcireg.h>
@@ -242,7 +241,11 @@ vionet_main(int fd, int fd_vmm)
 	/* Configure our sync channel event handler. */
 	log_debug("%s: wiring in sync channel handler (fd=%d)", __func__,
 		dev.sync_fd);
-	imsg_init(&dev.sync_iev.ibuf, dev.sync_fd);
+	if (imsgbuf_init(&dev.sync_iev.ibuf, dev.sync_fd) == -1) {
+		log_warnx("imsgbuf_init");
+		goto fail;
+	}
+	imsgbuf_allow_fdpass(&dev.sync_iev.ibuf);
 	dev.sync_iev.handler = handle_sync_io;
 	dev.sync_iev.data = &dev;
 	dev.sync_iev.events = EV_READ;
@@ -298,7 +301,7 @@ fail:
 	msg.data = ret;
 	imsg_compose(&dev.sync_iev.ibuf, IMSG_DEVOP_MSG, 0, 0, -1, &msg,
 	    sizeof(msg));
-	imsg_flush(&dev.sync_iev.ibuf);
+	imsgbuf_flush(&dev.sync_iev.ibuf);
 
 	close_fd(dev.sync_fd);
 	close_fd(dev.async_fd);
@@ -805,10 +808,8 @@ vionet_tx(struct virtio_dev *dev)
 		}
 
 		/* Check if we've got a minimum viable amount of data. */
-		if (chain_len < VIONET_MIN_TXLEN) {
-			sz = chain_len;
+		if (chain_len < VIONET_MIN_TXLEN)
 			goto drop;
-		}
 
 		/*
 		 * Packet inspection for ethernet header (if using a "local"
@@ -832,16 +833,17 @@ vionet_tx(struct virtio_dev *dev)
 				log_warnx("%s: bad source address %s",
 				    __func__, ether_ntoa((struct ether_addr *)
 					eh->ether_shost));
-				sz = chain_len;
 				goto drop;
 			}
 		}
 		if (vionet->local) {
 			dhcpsz = dhcp_request(dev, iov->iov_base, iov->iov_len,
 			    &dhcppkt);
-			if (dhcpsz > 0)
+			if (dhcpsz > 0) {
 				log_debug("%s: detected dhcp request of %zu bytes",
-			    	    __func__, dhcpsz);
+				    __func__, dhcpsz);
+				goto drop;
+			}
 		}
 
 		/* Write our packet to the tap(4). */
@@ -850,10 +852,10 @@ vionet_tx(struct virtio_dev *dev)
 			log_warn("%s", __func__);
 			goto reset;
 		}
-		sz += sizeof(struct virtio_net_hdr);
+		chain_len += sizeof(struct virtio_net_hdr);
 drop:
 		used->ring[used->idx & VIONET_QUEUE_MASK].id = hdr_idx;
-		used->ring[used->idx & VIONET_QUEUE_MASK].len = sz;
+		used->ring[used->idx & VIONET_QUEUE_MASK].len = chain_len;
 		__sync_synchronize();
 		used->idx++;
 		idx++;
@@ -900,13 +902,14 @@ dev_dispatch_vm(int fd, short event, void *arg)
 	struct imsg	 	 imsg;
 	ssize_t			 n = 0;
 	int			 verbose;
+	uint32_t		 type;
 
 	if (dev == NULL)
 		fatalx("%s: missing vionet pointer", __func__);
 
 	if (event & EV_READ) {
-		if ((n = imsg_read(ibuf)) == -1 && errno != EAGAIN)
-			fatal("%s: imsg_read", __func__);
+		if ((n = imsgbuf_read(ibuf)) == -1)
+			fatal("%s: imsgbuf_read", __func__);
 		if (n == 0) {
 			/* this pipe is dead, so remove the event handler */
 			log_debug("%s: pipe dead (EV_READ)", __func__);
@@ -917,14 +920,15 @@ dev_dispatch_vm(int fd, short event, void *arg)
 	}
 
 	if (event & EV_WRITE) {
-		if ((n = msgbuf_write(&ibuf->w)) == -1 && errno != EAGAIN)
-			fatal("%s: msgbuf_write", __func__);
-		if (n == 0) {
-			/* this pipe is dead, so remove the event handler */
-			log_debug("%s: pipe dead (EV_WRITE)", __func__);
-			event_del(&iev->ev);
-			event_base_loopexit(ev_base_main, NULL);
-			return;
+		if (imsgbuf_write(ibuf) == -1) {
+			if (errno == EPIPE) {
+				/* this pipe is dead, remove the handler */
+				log_debug("%s: pipe dead (EV_WRITE)", __func__);
+				event_del(&iev->ev);
+				event_loopexit(NULL);
+				return;
+			}
+			fatal("%s: imsgbuf_write", __func__);
 		}
 	}
 
@@ -934,11 +938,10 @@ dev_dispatch_vm(int fd, short event, void *arg)
 		if (n == 0)
 			break;
 
-		switch (imsg.hdr.type) {
+		type = imsg_get_type(&imsg);
+		switch (type) {
 		case IMSG_DEVOP_HOSTMAC:
-			IMSG_SIZE_CHECK(&imsg, vionet->hostmac);
-			memcpy(vionet->hostmac, imsg.data,
-			    sizeof(vionet->hostmac));
+			vionet_hostmac_read(&imsg, vionet);
 			log_debug("%s: set hostmac", __func__);
 			break;
 		case IMSG_VMDOP_PAUSE_VM:
@@ -951,8 +954,8 @@ dev_dispatch_vm(int fd, short event, void *arg)
 				vm_pipe_send(&pipe_rx, VIRTIO_THREAD_START);
 			break;
 		case IMSG_CTL_VERBOSE:
-			IMSG_SIZE_CHECK(&imsg, &verbose);
-			memcpy(&verbose, imsg.data, sizeof(verbose));
+			if (imsg_get_data(&imsg, &verbose, sizeof(verbose)))
+				fatal("%s", __func__);
 			log_setverbose(verbose);
 			break;
 		}
@@ -977,8 +980,8 @@ handle_sync_io(int fd, short event, void *arg)
 	int8_t intr = INTR_STATE_NOOP;
 
 	if (event & EV_READ) {
-		if ((n = imsg_read(ibuf)) == -1 && errno != EAGAIN)
-			fatal("%s: imsg_read", __func__);
+		if ((n = imsgbuf_read(ibuf)) == -1)
+			fatal("%s: imsgbuf_read", __func__);
 		if (n == 0) {
 			/* this pipe is dead, so remove the event handler */
 			log_debug("%s: pipe dead (EV_READ)", __func__);
@@ -989,14 +992,15 @@ handle_sync_io(int fd, short event, void *arg)
 	}
 
 	if (event & EV_WRITE) {
-		if ((n = msgbuf_write(&ibuf->w)) == -1 && errno != EAGAIN)
-			fatal("%s: msgbuf_write", __func__);
-		if (n == 0) {
-			/* this pipe is dead, so remove the event handler */
-			log_debug("%s: pipe dead (EV_WRITE)", __func__);
-			event_del(&iev->ev);
-			event_base_loopexit(ev_base_main, NULL);
-			return;
+		if (imsgbuf_write(ibuf) == -1) {
+			if (errno == EPIPE) {
+				/* this pipe is dead, remove the handler */
+				log_debug("%s: pipe dead (EV_WRITE)", __func__);
+				event_del(&iev->ev);
+				event_loopexit(NULL);
+				return;
+			}
+			fatal("%s: imsgbuf_write", __func__);
 		}
 	}
 
@@ -1007,8 +1011,7 @@ handle_sync_io(int fd, short event, void *arg)
 			break;
 
 		/* Unpack our message. They ALL should be dev messeges! */
-		IMSG_SIZE_CHECK(&imsg, &msg);
-		memcpy(&msg, imsg.data, sizeof(msg));
+		viodev_msg_read(&imsg, &msg);
 		imsg_free(&imsg);
 
 		switch (msg.type) {

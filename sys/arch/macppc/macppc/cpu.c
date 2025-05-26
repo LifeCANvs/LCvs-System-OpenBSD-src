@@ -1,4 +1,4 @@
-/*	$OpenBSD: cpu.c,v 1.87 2023/10/24 13:20:10 claudio Exp $ */
+/*	$OpenBSD: cpu.c,v 1.90 2024/10/24 17:37:06 gkoehler Exp $ */
 
 /*
  * Copyright (c) 1997 Per Fogelstrom
@@ -48,6 +48,7 @@
 #include <powerpc/bat.h>
 #include <machine/cpu.h>
 #include <machine/trap.h>
+#include <machine/elf.h>
 #include <powerpc/hid.h>
 
 /* SCOM addresses (24-bit) */
@@ -198,8 +199,9 @@ cpuattach(struct device *parent, struct device *dev, void *aux)
 
 	ci = &cpu_info[reg[0]];
 	ci->ci_cpuid = reg[0];
-	ci->ci_intrdepth = -1;
 	ci->ci_dev = dev;
+
+	hwcap = PPC_FEATURE_32 | PPC_FEATURE_HAS_FPU | PPC_FEATURE_HAS_MMU;
 
 	pvr = ppc_mfpvr();
 	cpu = pvr >> 16;
@@ -278,6 +280,9 @@ cpuattach(struct device *parent, struct device *dev, void *aux)
 #ifndef ALTIVEC			/* altivec support absent from kernel */
 	ppc_altivec = 0;
 #endif
+	if (ppc_altivec)
+		hwcap |= PPC_FEATURE_HAS_ALTIVEC;
+
 	snprintf(cpu_model + strlen(cpu_model),
 	    sizeof(cpu_model) - strlen(cpu_model),
 	    " (Revision 0x%x)", pvr & 0xffff);

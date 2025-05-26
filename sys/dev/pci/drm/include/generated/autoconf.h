@@ -5,6 +5,8 @@
 #define CONFIG_DRM_KMS_HELPER			1
 #define CONFIG_BACKLIGHT_CLASS_DEVICE		1
 #define CONFIG_DRM_FBDEV_EMULATION		1
+#define CONFIG_DRM_CLIENT_SETUP			1
+#define CONFIG_FRAMEBUFFER_CONSOLE		1
 #define CONFIG_DRM_PANEL			1
 #define CONFIG_DRM_I915_CAPTURE_ERROR		1
 #define CONFIG_DRM_AMD_DC			1
@@ -35,6 +37,8 @@
 #include "acpi.h"
 #if NACPI > 0
 #define CONFIG_ACPI				1
+#define CONFIG_ACPI_SLEEP			1
+#define CONFIG_AMD_PMC				1
 #endif
 #endif
 
@@ -92,5 +96,6 @@
 #endif
 
 #if defined(SUSPEND) || defined(HIBERNATE)
-#define CONFIG_PM_SLEEP
+#define CONFIG_SUSPEND				1
+#define CONFIG_PM_SLEEP				1
 #endif

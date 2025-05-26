@@ -1,4 +1,4 @@
-/*	$OpenBSD: raw_ip6.c,v 1.184 2024/04/17 20:48:51 bluhm Exp $	*/
+/*	$OpenBSD: raw_ip6.c,v 1.191 2025/05/24 12:27:24 bluhm Exp $	*/
 /*	$KAME: raw_ip6.c,v 1.69 2001/03/04 15:55:44 itojun Exp $	*/
 
 /*
@@ -108,9 +108,6 @@ struct cpumem *rip6counters;
 const struct pr_usrreqs rip6_usrreqs = {
 	.pru_attach	= rip6_attach,
 	.pru_detach	= rip6_detach,
-	.pru_lock	= rip6_lock,
-	.pru_unlock	= rip6_unlock,
-	.pru_locked	= rip6_locked,
 	.pru_bind	= rip6_bind,
 	.pru_connect	= rip6_connect,
 	.pru_disconnect	= rip6_disconnect,
@@ -120,6 +117,9 @@ const struct pr_usrreqs rip6_usrreqs = {
 	.pru_sockaddr	= in6_sockaddr,
 	.pru_peeraddr	= in6_peeraddr,
 };
+
+void	rip6_sbappend(struct inpcb *, struct mbuf *, struct ip6_hdr *, int,
+	    struct sockaddr_in6 *);
 
 /*
  * Initialize raw connection block queue.
@@ -132,12 +132,12 @@ rip6_init(void)
 }
 
 int
-rip6_input(struct mbuf **mp, int *offp, int proto, int af)
+rip6_input(struct mbuf **mp, int *offp, int proto, int af, struct netstack *ns)
 {
 	struct mbuf *m = *mp;
 	struct ip6_hdr *ip6 = mtod(m, struct ip6_hdr *);
-	struct inpcb *inp;
-	SIMPLEQ_HEAD(, inpcb) inpcblist;
+	struct inpcb_iterator iter = { .inp_table = NULL };
+	struct inpcb *inp, *last;
 	struct in6_addr *key;
 	struct sockaddr_in6 rip6src;
 	uint8_t type;
@@ -147,7 +147,7 @@ rip6_input(struct mbuf **mp, int *offp, int proto, int af)
 	if (proto == IPPROTO_ICMPV6) {
 		struct icmp6_hdr *icmp6;
 
-		IP6_EXTHDR_GET(icmp6, struct icmp6_hdr *, m, *offp,
+		IP6_EXTHDR_GET(icmp6, struct icmp6_hdr *, mp, *offp,
 		    sizeof(*icmp6));
 		if (icmp6 == NULL)
 			return IPPROTO_DONE;
@@ -180,10 +180,9 @@ rip6_input(struct mbuf **mp, int *offp, int proto, int af)
 		}
 	}
 #endif
-	SIMPLEQ_INIT(&inpcblist);
-	rw_enter_write(&rawin6pcbtable.inpt_notify);
 	mtx_enter(&rawin6pcbtable.inpt_mtx);
-	TAILQ_FOREACH(inp, &rawin6pcbtable.inpt_queue, inp_queue) {
+	last = inp = NULL;
+	while ((inp = in_pcb_iterator(&rawin6pcbtable, inp, &iter)) != NULL) {
 		KASSERT(ISSET(inp->inp_flags, INP_IPV6));
 
 		/*
@@ -229,16 +228,25 @@ rip6_input(struct mbuf **mp, int *offp, int proto, int af)
 			}
 		}
 
-		in_pcbref(inp);
-		SIMPLEQ_INSERT_TAIL(&inpcblist, inp, inp_notify);
+		if (last != NULL) {
+			struct mbuf *n;
+
+			mtx_leave(&rawin6pcbtable.inpt_mtx);
+
+			n = m_copym(m, 0, M_COPYALL, M_NOWAIT);
+			if (n != NULL)
+				rip6_sbappend(last, n, ip6, *offp, &rip6src);
+			in_pcbunref(last);
+
+			mtx_enter(&rawin6pcbtable.inpt_mtx);
+		}
+		last = in_pcbref(inp);
 	}
 	mtx_leave(&rawin6pcbtable.inpt_mtx);
 
-	if (SIMPLEQ_EMPTY(&inpcblist)) {
+	if (last == NULL) {
 		struct counters_ref ref;
 		uint64_t *counters;
-
-		rw_exit_write(&rawin6pcbtable.inpt_notify);
 
 		if (proto != IPPROTO_ICMPV6) {
 			rip6stat_inc(rip6s_nosock);
@@ -260,43 +268,36 @@ rip6_input(struct mbuf **mp, int *offp, int proto, int af)
 		return IPPROTO_DONE;
 	}
 
-	while ((inp = SIMPLEQ_FIRST(&inpcblist)) != NULL) {
-		struct mbuf *n, *opts = NULL;
-
-		SIMPLEQ_REMOVE_HEAD(&inpcblist, inp_notify);
-		if (SIMPLEQ_EMPTY(&inpcblist))
-			n = m;
-		else
-			n = m_copym(m, 0, M_COPYALL, M_NOWAIT);
-		if (n != NULL) {
-			struct socket *so = inp->inp_socket;
-			int ret = 0;
-
-			if (inp->inp_flags & IN6P_CONTROLOPTS)
-				ip6_savecontrol(inp, n, &opts);
-			/* strip intermediate headers */
-			m_adj(n, *offp);
-
-			mtx_enter(&so->so_rcv.sb_mtx);
-			if (!ISSET(inp->inp_socket->so_rcv.sb_state,
-			    SS_CANTRCVMORE)) {
-				ret = sbappendaddr(so, &so->so_rcv,
-				    sin6tosa(&rip6src), n, opts);
-			}
-			mtx_leave(&so->so_rcv.sb_mtx);
-
-			if (ret == 0) {
-				m_freem(n);
-				m_freem(opts);
-				rip6stat_inc(rip6s_fullsock);
-			} else
-				sorwakeup(so);
-		}
-		in_pcbunref(inp);
-	}
-	rw_exit_write(&rawin6pcbtable.inpt_notify);
+	rip6_sbappend(last, m, ip6, *offp, &rip6src);
+	in_pcbunref(last);
 
 	return IPPROTO_DONE;
+}
+
+void
+rip6_sbappend(struct inpcb *inp, struct mbuf *m, struct ip6_hdr *ip6, int hlen,
+    struct sockaddr_in6 *rip6src)
+{
+	struct socket *so = inp->inp_socket;
+	struct mbuf *opts = NULL;
+	int ret = 0;
+
+	if (inp->inp_flags & IN6P_CONTROLOPTS)
+		ip6_savecontrol(inp, m, &opts);
+	/* strip intermediate headers */
+	m_adj(m, hlen);
+
+	mtx_enter(&so->so_rcv.sb_mtx);
+	if (!ISSET(inp->inp_socket->so_rcv.sb_state, SS_CANTRCVMORE))
+		ret = sbappendaddr(&so->so_rcv, sin6tosa(rip6src), m, opts);
+	mtx_leave(&so->so_rcv.sb_mtx);
+
+	if (ret == 0) {
+		m_freem(m);
+		m_freem(opts);
+		rip6stat_inc(rip6s_fullsock);
+	} else
+		sorwakeup(so);
 }
 
 void
@@ -307,7 +308,7 @@ rip6_ctlinput(int cmd, struct sockaddr *sa, u_int rdomain, void *d)
 	struct sockaddr_in6 *sa6 = satosin6(sa);
 	const struct sockaddr_in6 *sa6_src = NULL;
 	void *cmdarg;
-	void (*notify)(struct inpcb *, int) = in_rtchange;
+	void (*notify)(struct inpcb *, int) = in_pcbrtchange;
 	int nxt;
 
 	if (sa->sa_family != AF_INET6 ||
@@ -317,7 +318,7 @@ rip6_ctlinput(int cmd, struct sockaddr *sa, u_int rdomain, void *d)
 	if ((unsigned)cmd >= PRC_NCMDS)
 		return;
 	if (PRC_IS_REDIRECT(cmd))
-		notify = in_rtchange, d = NULL;
+		notify = in_pcbrtchange, d = NULL;
 	else if (cmd == PRC_HOSTDEAD)
 		d = NULL;
 	else if (cmd == PRC_MSGSIZE)
@@ -605,7 +606,6 @@ rip6_attach(struct socket *so, int proto, int wait)
 
 	if ((error = soreserve(so, rip6_sendspace, rip6_recvspace)))
 		return error;
-	NET_ASSERT_LOCKED();
 	if ((error = in_pcballoc(so, &rawin6pcbtable, wait)))
 		return error;
 
@@ -642,32 +642,6 @@ rip6_detach(struct socket *so)
 	in_pcbdetach(inp);
 
 	return (0);
-}
-
-void
-rip6_lock(struct socket *so)
-{
-	struct inpcb *inp = sotoinpcb(so);
-
-	NET_ASSERT_LOCKED();
-	mtx_enter(&inp->inp_mtx);
-}
-
-void
-rip6_unlock(struct socket *so)
-{
-	struct inpcb *inp = sotoinpcb(so);
-
-	NET_ASSERT_LOCKED();
-	mtx_leave(&inp->inp_mtx);
-}
-
-int
-rip6_locked(struct socket *so)
-{
-	struct inpcb *inp = sotoinpcb(so);
-
-	return mtx_owned(&inp->inp_mtx);
 }
 
 int

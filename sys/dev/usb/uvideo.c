@@ -1,4 +1,4 @@
-/*	$OpenBSD: uvideo.c,v 1.220 2024/05/23 03:21:09 jsg Exp $ */
+/*	$OpenBSD: uvideo.c,v 1.258 2025/04/19 19:35:32 kirill Exp $ */
 
 /*
  * Copyright (c) 2008 Robert Nagy <robert@openbsd.org>
@@ -66,14 +66,13 @@ struct uvideo_softc {
 	struct uvideo_frame_buffer		 sc_frame_buffer;
 
 	struct uvideo_mmap			 sc_mmap[UVIDEO_MAX_BUFFERS];
+	struct uvideo_mmap			*sc_mmap_cur;
 	uint8_t					*sc_mmap_buffer;
 	size_t					 sc_mmap_buffer_size;
+	int					 sc_mmap_buffer_idx;
 	q_mmap					 sc_mmap_q;
 	int					 sc_mmap_count;
 	int					 sc_mmap_flag;
-
-	struct vnode				*sc_vp;
-	struct usb_task				 sc_task_write;
 
 	int					 sc_nframes;
 	struct usb_video_probe_commit		 sc_desc_probe;
@@ -101,7 +100,7 @@ struct uvideo_softc {
 	void					 (*sc_uplayer_intr)(void *);
 
 	const struct uvideo_devs		*sc_quirk;
-	usbd_status				(*sc_decode_stream_header)
+	void					(*sc_decode_stream_header)
 						    (struct uvideo_softc *,
 						    uint8_t *, int);
 };
@@ -131,6 +130,8 @@ usbd_status	uvideo_vs_parse_desc(struct uvideo_softc *,
 usbd_status	uvideo_vs_parse_desc_input_header(struct uvideo_softc *,
 		    const usb_descriptor_t *);
 usbd_status	uvideo_vs_parse_desc_format(struct uvideo_softc *);
+usbd_status	uvideo_vs_parse_desc_colorformat(struct uvideo_softc *,
+		    const usb_descriptor_t *);
 usbd_status	uvideo_vs_parse_desc_format_mjpeg(struct uvideo_softc *,
 		    const usb_descriptor_t *);
 usbd_status	uvideo_vs_parse_desc_format_uncompressed(struct uvideo_softc *,
@@ -138,6 +139,8 @@ usbd_status	uvideo_vs_parse_desc_format_uncompressed(struct uvideo_softc *,
 usbd_status	uvideo_vs_parse_desc_frame(struct uvideo_softc *);
 usbd_status	uvideo_vs_parse_desc_frame_sub(struct uvideo_softc *,
 		    const usb_descriptor_t *);
+uint32_t	uvideo_vc_parse_max_packet_size(struct uvideo_softc *,
+		    usb_endpoint_descriptor_t *);
 usbd_status	uvideo_vs_parse_desc_alt(struct uvideo_softc *, int, int, int);
 usbd_status	uvideo_vs_set_alt(struct uvideo_softc *,
 		    struct usbd_interface *, int);
@@ -164,11 +167,12 @@ void		uvideo_vs_start_isoc_ixfer(struct uvideo_softc *,
 		    struct uvideo_isoc_xfer *);
 void		uvideo_vs_cb(struct usbd_xfer *, void *,
 		    usbd_status);
-usbd_status	uvideo_vs_decode_stream_header(struct uvideo_softc *,
-		    uint8_t *, int); 
-usbd_status	uvideo_vs_decode_stream_header_isight(struct uvideo_softc *,
+void		uvideo_vs_decode_stream_header(struct uvideo_softc *,
 		    uint8_t *, int);
-int		uvideo_mmap_queue(struct uvideo_softc *, uint8_t *, int);
+void		uvideo_vs_decode_stream_header_isight(struct uvideo_softc *,
+		    uint8_t *, int);
+uint8_t *	uvideo_mmap_getbuf(struct uvideo_softc *);
+void		uvideo_mmap_queue(struct uvideo_softc *, int, int);
 void		uvideo_read(struct uvideo_softc *, uint8_t *, int);
 usbd_status	uvideo_usb_control(struct uvideo_softc *, uint8_t, uint8_t,
 		    uint16_t, uint8_t *, size_t);
@@ -177,6 +181,7 @@ usbd_status	uvideo_usb_control(struct uvideo_softc *, uint8_t, uint8_t,
 #include <sys/namei.h>
 #include <sys/proc.h>
 #include <sys/vnode.h>
+#include <sys/fcntl.h>
 
 void		uvideo_dump_desc_all(struct uvideo_softc *);
 void		uvideo_dump_desc_vc_header(struct uvideo_softc *,
@@ -188,6 +193,8 @@ void		uvideo_dump_desc_input(struct uvideo_softc *,
 void		uvideo_dump_desc_output(struct uvideo_softc *,
 		    const usb_descriptor_t *);
 void		uvideo_dump_desc_endpoint(struct uvideo_softc *,
+		    const usb_descriptor_t *);
+void		uvideo_dump_desc_endpoint_ss_comp(struct uvideo_softc *,
 		    const usb_descriptor_t *);
 void		uvideo_dump_desc_iface_assoc(struct uvideo_softc *,
 		    const usb_descriptor_t *);
@@ -210,8 +217,6 @@ void		uvideo_dump_desc_processing(struct uvideo_softc *,
 void		uvideo_dump_desc_extension(struct uvideo_softc *,
 		    const usb_descriptor_t *);
 void		uvideo_hexdump(void *, int, int);
-int		uvideo_debug_file_open(struct uvideo_softc *);
-void		uvideo_debug_file_write_frame(void *);
 #endif
 
 /*
@@ -293,10 +298,11 @@ const struct video_hw_if uvideo_hw_if = {
  * Devices which either fail to declare themselves as UICLASS_VIDEO,
  * or which need firmware uploads or other quirk handling later on.
  */
-#define UVIDEO_FLAG_ISIGHT_STREAM_HEADER	0x1
-#define UVIDEO_FLAG_REATTACH			0x2
-#define UVIDEO_FLAG_VENDOR_CLASS		0x4
-#define UVIDEO_FLAG_NOATTACH			0x8
+#define UVIDEO_FLAG_ISIGHT_STREAM_HEADER	0x01
+#define UVIDEO_FLAG_REATTACH			0x02
+#define UVIDEO_FLAG_VENDOR_CLASS		0x04
+#define UVIDEO_FLAG_NOATTACH			0x08
+#define UVIDEO_FLAG_FORMAT_INDEX_IN_BMHINT	0x10
 const struct uvideo_devs {
 	struct usb_devno	 uv_dev;
 	char			*ucode_name;
@@ -378,9 +384,74 @@ const struct uvideo_devs {
 	    NULL,
 	    UVIDEO_FLAG_NOATTACH
 	},
+	{   /* Has incorrect control response */
+	    { USB_VENDOR_ELGATO, USB_PRODUCT_ELGATO_HD60 },
+	    NULL,
+	    NULL,
+	    UVIDEO_FLAG_FORMAT_INDEX_IN_BMHINT
+	},
 };
 #define uvideo_lookup(v, p) \
 	((const struct uvideo_devs *)usb_lookup(uvideo_devs, v, p))
+
+const struct uvideo_map_fmts {
+	uint8_t		guidFormat[16];
+	uint32_t	pixelformat;
+} uvideo_map_fmts[] = {
+	{ UVIDEO_FORMAT_GUID_YUY2, V4L2_PIX_FMT_YUYV },
+	{ UVIDEO_FORMAT_GUID_YV12, V4L2_PIX_FMT_YVU420 },
+	{ UVIDEO_FORMAT_GUID_I420, V4L2_PIX_FMT_YUV420 },
+	{ UVIDEO_FORMAT_GUID_Y800, V4L2_PIX_FMT_GREY },
+	{ UVIDEO_FORMAT_GUID_Y8, V4L2_PIX_FMT_GREY },
+	{ UVIDEO_FORMAT_GUID_D3DFMT_L8, V4L2_PIX_FMT_GREY },
+	{ UVIDEO_FORMAT_GUID_KSMEDIA_L8_IR, V4L2_PIX_FMT_GREY },
+	{ UVIDEO_FORMAT_GUID_BY8, V4L2_PIX_FMT_SBGGR8 },
+	{ UVIDEO_FORMAT_GUID_BA81, V4L2_PIX_FMT_SBGGR8 },
+	{ UVIDEO_FORMAT_GUID_GBRG, V4L2_PIX_FMT_SGBRG8 },
+	{ UVIDEO_FORMAT_GUID_GRBG, V4L2_PIX_FMT_SGRBG8 },
+	{ UVIDEO_FORMAT_GUID_RGGB, V4L2_PIX_FMT_SRGGB8 },
+	{ UVIDEO_FORMAT_GUID_RGBP, V4L2_PIX_FMT_RGB565 },
+	{ UVIDEO_FORMAT_GUID_D3DFMT_R5G6B5, V4L2_PIX_FMT_RGB565 },
+	{ UVIDEO_FORMAT_GUID_BGR3, V4L2_PIX_FMT_BGR24 },
+	{ UVIDEO_FORMAT_GUID_BGR4, V4L2_PIX_FMT_XBGR32 },
+	{ UVIDEO_FORMAT_GUID_H265, V4L2_PIX_FMT_HEVC },
+	{ UVIDEO_FORMAT_GUID_RW10, V4L2_PIX_FMT_SRGGB10P },
+	{ UVIDEO_FORMAT_GUID_BG16, V4L2_PIX_FMT_SBGGR16 },
+	{ UVIDEO_FORMAT_GUID_GB16, V4L2_PIX_FMT_SGBRG16 },
+	{ UVIDEO_FORMAT_GUID_RG16, V4L2_PIX_FMT_SRGGB16 },
+	{ UVIDEO_FORMAT_GUID_GR16, V4L2_PIX_FMT_SGRBG16 },
+	{ UVIDEO_FORMAT_GUID_INVZ, V4L2_PIX_FMT_Z16 },
+	{ UVIDEO_FORMAT_GUID_INVI, V4L2_PIX_FMT_Y10 },
+};
+
+const enum v4l2_colorspace uvideo_color_primaries[] = {
+	V4L2_COLORSPACE_SRGB,		/* Unspecified */
+	V4L2_COLORSPACE_SRGB,
+	V4L2_COLORSPACE_470_SYSTEM_M,
+	V4L2_COLORSPACE_470_SYSTEM_BG,
+	V4L2_COLORSPACE_SMPTE170M,
+	V4L2_COLORSPACE_SMPTE240M,
+};
+
+const enum v4l2_xfer_func uvideo_xfer_characteristics[] = {
+	V4L2_XFER_FUNC_DEFAULT,		/* Unspecified */
+	V4L2_XFER_FUNC_709,
+	V4L2_XFER_FUNC_709,		/* Substitution for BT.470-2 M */
+	V4L2_XFER_FUNC_709,		/* Substitution for BT.470-2 B, G */
+	V4L2_XFER_FUNC_709,		/* Substitution for SMPTE 170M */
+	V4L2_XFER_FUNC_SMPTE240M,
+	V4L2_XFER_FUNC_NONE,
+	V4L2_XFER_FUNC_SRGB,
+};
+
+const enum v4l2_ycbcr_encoding uvideo_matrix_coefficients[] = {
+	V4L2_YCBCR_ENC_DEFAULT,		/* Unspecified */
+	V4L2_YCBCR_ENC_709,
+	V4L2_YCBCR_ENC_601,		/* Substitution for FCC */
+	V4L2_YCBCR_ENC_601,		/* Substitution for BT.470-2 B, G */
+	V4L2_YCBCR_ENC_601,
+	V4L2_YCBCR_ENC_SMPTE240M,
+};
 
 int
 uvideo_open(void *addr, int flags, int *size, uint8_t *buffer,
@@ -390,7 +461,7 @@ uvideo_open(void *addr, int flags, int *size, uint8_t *buffer,
 
 	DPRINTF(1, "%s: uvideo_open: sc=%p\n", DEVNAME(sc), sc);
 
-	if (usbd_is_dying(sc->sc_udev))
+	if (usbd_is_dying(sc->sc_udev) || sc->sc_vs_cur == NULL)
 		return (EIO);
 
 	/* pointers to upper video layer */
@@ -412,9 +483,9 @@ uvideo_close(void *addr)
 
 	DPRINTF(1, "%s: uvideo_close: sc=%p\n", DEVNAME(sc), sc);
 
-#ifdef UVIDEO_DUMP
-	usb_rem_task(sc->sc_udev, &sc->sc_task_write);
-#endif
+	if (sc->sc_vs_cur == NULL)
+		return (EIO);
+
 	/* close video stream pipe */
 	uvideo_vs_close(sc);
 
@@ -610,13 +681,10 @@ uvideo_detach(struct device *self, int flags)
 	struct uvideo_softc *sc = (struct uvideo_softc *)self;
 	int rv = 0;
 
-	/* Wait for outstanding requests to complete */
-	usbd_delay_ms(sc->sc_udev, UVIDEO_NFRAMES_MAX);
-
 	if (sc->sc_videodev != NULL)
 		rv = config_detach(sc->sc_videodev, flags);
 
-	uvideo_vs_free_frame(sc);
+	uvideo_close(sc);
 
 	return (rv);
 }
@@ -972,6 +1040,12 @@ uvideo_vs_parse_desc_format(struct uvideo_softc *sc)
 		}
 
 		switch (desc->bDescriptorSubtype) {
+		case UDESCSUB_VS_COLORFORMAT:
+			if (desc->bLength == 6) {
+				(void)uvideo_vs_parse_desc_colorformat(
+				    sc, desc);
+			}
+			break;
 		case UDESCSUB_VS_FORMAT_MJPEG:
 			if (desc->bLength == 11) {
 				(void)uvideo_vs_parse_desc_format_mjpeg(
@@ -997,6 +1071,42 @@ uvideo_vs_parse_desc_format(struct uvideo_softc *sc)
 	}
 	DPRINTF(1, "%s: number of total format descriptors=%d\n",
 	    DEVNAME(sc), sc->sc_fmtgrp_num);
+
+	return (USBD_NORMAL_COMPLETION);
+}
+
+usbd_status
+uvideo_vs_parse_desc_colorformat(struct uvideo_softc *sc,
+    const usb_descriptor_t *desc)
+{
+	int fmtidx;
+	struct usb_video_colorformat_desc *d;
+
+	d = (struct usb_video_colorformat_desc *)(uint8_t *)desc;
+
+	fmtidx = sc->sc_fmtgrp_idx - 1;
+	if (fmtidx < 0 || sc->sc_fmtgrp[fmtidx].has_colorformat)
+		return (USBD_INVAL);
+
+	if (d->bColorPrimaries < nitems(uvideo_color_primaries))
+		sc->sc_fmtgrp[fmtidx].colorspace =
+		    uvideo_color_primaries[d->bColorPrimaries];
+	else
+		sc->sc_fmtgrp[fmtidx].colorspace = V4L2_COLORSPACE_SRGB;
+
+	if (d->bTransferCharacteristics < nitems(uvideo_xfer_characteristics))
+		sc->sc_fmtgrp[fmtidx].xfer_func =
+		    uvideo_xfer_characteristics[d->bTransferCharacteristics];
+	else
+		sc->sc_fmtgrp[fmtidx].xfer_func = V4L2_XFER_FUNC_DEFAULT;
+
+	if (d->bMatrixCoefficients < nitems(uvideo_matrix_coefficients))
+		sc->sc_fmtgrp[fmtidx].ycbcr_enc =
+		    uvideo_matrix_coefficients[d->bMatrixCoefficients];
+	else
+		sc->sc_fmtgrp[fmtidx].ycbcr_enc = V4L2_YCBCR_ENC_DEFAULT;
+
+	sc->sc_fmtgrp[fmtidx].has_colorformat = 1;
 
 	return (USBD_NORMAL_COMPLETION);
 }
@@ -1047,8 +1157,7 @@ uvideo_vs_parse_desc_format_uncompressed(struct uvideo_softc *sc,
     const usb_descriptor_t *desc)
 {
 	struct usb_video_format_uncompressed_desc *d;
-	uint8_t guid_8bit_ir[16] = UVIDEO_FORMAT_GUID_KSMEDIA_L8_IR;
-	int i;
+	int i, j, nent;
 
 	d = (struct usb_video_format_uncompressed_desc *)(uint8_t *)desc;
 
@@ -1073,19 +1182,23 @@ uvideo_vs_parse_desc_format_uncompressed(struct uvideo_softc *sc,
 		sc->sc_fmtgrp[sc->sc_fmtgrp_idx].format_dfidx =
 		    d->bDefaultFrameIndex;
 	}
+
 	i = sc->sc_fmtgrp_idx;
-	if (!strcmp(sc->sc_fmtgrp[i].format->u.uc.guidFormat, "YUY2")) {
-		sc->sc_fmtgrp[i].pixelformat = V4L2_PIX_FMT_YUYV;
-	} else if (!strcmp(sc->sc_fmtgrp[i].format->u.uc.guidFormat, "NV12")) {
-		sc->sc_fmtgrp[i].pixelformat = V4L2_PIX_FMT_NV12;
-	} else if (!strcmp(sc->sc_fmtgrp[i].format->u.uc.guidFormat, "UYVY")) {
-		sc->sc_fmtgrp[i].pixelformat = V4L2_PIX_FMT_UYVY;
-	} else if (!memcmp(sc->sc_fmtgrp[i].format->u.uc.guidFormat,
-	    guid_8bit_ir, 16)) {
-		sc->sc_fmtgrp[i].pixelformat = V4L2_PIX_FMT_GREY;
-	} else {
-		sc->sc_fmtgrp[i].pixelformat = 0;
+
+	/* map GUID to pixel format if a matching entry is found */
+	for (j = 0, nent = nitems(uvideo_map_fmts); j < nent; j++) {
+		if (!memcmp(sc->sc_fmtgrp[i].format->u.uc.guidFormat,
+		    uvideo_map_fmts[j].guidFormat, 16)) {
+			sc->sc_fmtgrp[i].pixelformat =
+			    uvideo_map_fmts[j].pixelformat;
+			break;
+		}
 	}
+	/* default to using GUID start as the pixel format */
+	if (j == nent)
+		memcpy(&sc->sc_fmtgrp[i].pixelformat,
+		    sc->sc_fmtgrp[i].format->u.uc.guidFormat,
+		    sizeof(uint32_t));
 
 	if (sc->sc_fmtgrp_cur == NULL)
 		/* set UNCOMPRESSED format */
@@ -1194,6 +1307,46 @@ uvideo_vs_parse_desc_frame_sub(struct uvideo_softc *sc,
 	return (USBD_NORMAL_COMPLETION);
 }
 
+uint32_t
+uvideo_vc_parse_max_packet_size(struct uvideo_softc *sc,
+    usb_endpoint_descriptor_t *ed)
+{
+	uint32_t psize;
+	struct usbd_desc_iter iter;
+	const usb_descriptor_t *desc;
+	usb_endpoint_ss_comp_descriptor_t *esscd;
+
+	/*
+	 * USB 3.0 Section 9.6.7 states that wBytesPerInterval is only
+	 * valid for periodic endpoints (isochronous and interrupt).
+	 */
+	if (UE_GET_XFERTYPE(ed->bmAttributes) == UE_BULK)
+		goto skip_ss_comp;
+
+	usbd_desc_iter_init(sc->sc_udev, &iter);
+	while ((desc = usbd_desc_iter_next(&iter))) {
+		if (desc == (const usb_descriptor_t *)ed) {
+			desc = usbd_desc_iter_next(&iter);
+			break;
+		}
+	}
+
+	if (desc && sc->sc_udev->speed >= USB_SPEED_SUPER &&
+	    desc->bDescriptorType == UDESC_ENDPOINT_SS_COMP) {
+		esscd = (usb_endpoint_ss_comp_descriptor_t *)desc;
+		psize = UGETW(esscd->wBytesPerInterval);
+		DPRINTF(1, "%s: wBytesPerInterval=%d\n",
+		    DEVNAME(sc), psize);
+		return psize;
+	}
+
+skip_ss_comp:
+	psize = UGETW(ed->wMaxPacketSize);
+	psize = UE_GET_SIZE(psize) * (1 + UE_GET_TRANS(psize));
+
+	return psize;
+}
+
 usbd_status
 uvideo_vs_parse_desc_alt(struct uvideo_softc *sc, int vs_nr, int iface, int numalts)
 {
@@ -1203,6 +1356,8 @@ uvideo_vs_parse_desc_alt(struct uvideo_softc *sc, int vs_nr, int iface, int numa
 	usb_interface_descriptor_t *id;
 	usb_endpoint_descriptor_t *ed;
 	uint8_t ep_dir, ep_type;
+	int bulk_endpoint;
+	uint32_t psize;
 
 	vs = &sc->sc_vs_coll[vs_nr];
 
@@ -1217,6 +1372,9 @@ uvideo_vs_parse_desc_alt(struct uvideo_softc *sc, int vs_nr, int iface, int numa
 		}
 		desc = usbd_desc_iter_next(&iter);
 	}
+
+	vs->bulk_endpoint = 1;
+
 	while (desc) {
 		/* Crossed device function boundary. */
 		if (desc->bDescriptorType == UDESC_IFACE_ASSOC)
@@ -1247,20 +1405,30 @@ uvideo_vs_parse_desc_alt(struct uvideo_softc *sc, int vs_nr, int iface, int numa
 		ep_dir = UE_GET_DIR(ed->bEndpointAddress);
 		ep_type = UE_GET_XFERTYPE(ed->bmAttributes);
 		if (ep_dir == UE_DIR_IN && ep_type == UE_ISOCHRONOUS)
-			vs->bulk_endpoint = 0;
+			bulk_endpoint = 0;
 		else if (ep_dir == UE_DIR_IN && ep_type == UE_BULK)
-			vs->bulk_endpoint = 1;
+			bulk_endpoint = 1;
 		else
 			goto next;
 
+		/*
+		 * Section 2.4.3 does not prohibit the mix of bulk and
+		 * isochronous endpoints when the bulk endpoints are
+		 * used solely for still image transfer.
+		 */
+		if (bulk_endpoint && !vs->bulk_endpoint)
+			goto next;
+
+		psize = uvideo_vc_parse_max_packet_size(sc, ed);
 		/* save endpoint with largest bandwidth */
-		if (UGETW(ed->wMaxPacketSize) > vs->psize) {
+		if (psize > vs->psize) {
 			vs->ifaceh = &sc->sc_udev->ifaces[iface];
 			vs->endpoint = ed->bEndpointAddress;
 			vs->numalts = numalts;
 			vs->curalt = id->bAlternateSetting;
-			vs->psize = UGETW(ed->wMaxPacketSize);
+			vs->psize = psize;
 			vs->iface = iface;
+			vs->bulk_endpoint = bulk_endpoint;
 		}
 next:
 		desc = usbd_desc_iter_next(&iter);
@@ -1284,9 +1452,10 @@ uvideo_vs_set_alt(struct uvideo_softc *sc, struct usbd_interface *ifaceh,
 	const usb_descriptor_t *desc;
 	usb_interface_descriptor_t *id;
 	usb_endpoint_descriptor_t *ed;
-	int diff, best_diff = INT_MAX;
+	int diff, best_diff = INT_MAX, bulk_endpoint;
 	usbd_status error;
 	uint32_t psize;
+	uint8_t ep_type;
 
 	usbd_desc_iter_init(sc->sc_udev, &iter);
 	desc = usbd_desc_iter_next(&iter);
@@ -1318,9 +1487,17 @@ uvideo_vs_set_alt(struct uvideo_softc *sc, struct usbd_interface *ifaceh,
 			goto next;
 		ed = (usb_endpoint_descriptor_t *)(uint8_t *)desc;
 
+		ep_type = UE_GET_XFERTYPE(ed->bmAttributes);
+		if (ep_type == UE_ISOCHRONOUS)
+			bulk_endpoint = 0;
+		else if (ep_type == UE_BULK)
+			bulk_endpoint = 1;
+
+		if (bulk_endpoint && !sc->sc_vs_cur->bulk_endpoint)
+			goto next;
+
 		/* save endpoint with requested bandwidth */
-		psize = UGETW(ed->wMaxPacketSize);
-		psize = UE_GET_SIZE(psize) * (1 + UE_GET_TRANS(psize));
+		psize = uvideo_vc_parse_max_packet_size(sc, ed);
 		if (psize >= max_packet_size)
 			diff = psize - max_packet_size;
 		else
@@ -1556,7 +1733,7 @@ uvideo_vs_negotiation(struct uvideo_softc *sc, int commit)
 	 * Uncompressed formats have fixed bits per pixel, which means
 	 * the frame buffer size is fixed and can be calculated.  Because
 	 * some devices return incorrect values, always override the
-	 * the frame size with a calculated value.
+	 * frame size with a calculated value.
 	 */
 	if (frame->bDescriptorSubtype == UDESCSUB_VS_FRAME_UNCOMPRESSED) {
 		USETDW(pc->dwMaxVideoFrameSize,
@@ -1668,6 +1845,21 @@ uvideo_vs_get_probe(struct uvideo_softc *sc, uint8_t *probe_data,
 		    DEVNAME(sc), usbd_errstr(error));
 		return (USBD_INVAL);
 	}
+
+	if (sc->sc_quirk &&
+	    sc->sc_quirk->flags & UVIDEO_FLAG_FORMAT_INDEX_IN_BMHINT &&
+	    UGETW(pc->bmHint) > 255) {
+		/*
+		 * Some devices such as the Elgato Cam Link 4K or Elgato
+		 * Game Capture HD60 returns an invalid bmHint response,
+		 * which contains the bFormatIndex in the second byte.
+		 * But it should be always zero since it's a reserved
+		 * bit field.
+		 */
+		pc->bFormatIndex = UGETW(pc->bmHint) >> 8;
+		USETW(pc->bmHint, 1);
+	}
+
 	DPRINTF(1, "%s: GET probe request successfully\n", DEVNAME(sc));
 
 	DPRINTF(1, "bmHint=0x%02x\n", UGETW(pc->bmHint));
@@ -1741,6 +1933,8 @@ uvideo_vs_alloc_frame(struct uvideo_softc *sc)
 	fb->sample = 0;
 	fb->fid = 0;
 	fb->offset = 0;
+	fb->error = 0;
+	fb->mmap_q_full = 0;
 	fb->fmt_flags = sc->sc_fmtgrp_cur->frame_cur->bDescriptorSubtype ==
 	    UDESCSUB_VS_FRAME_UNCOMPRESSED ? 0 : V4L2_FMT_FLAG_COMPRESSED;
 
@@ -1881,6 +2075,10 @@ uvideo_vs_open(struct uvideo_softc *sc)
 			return (error);
 	}
 
+	/* 2.4.3 the bulk endpoint only supports the alternative setting of 0 */
+	if (sc->sc_vs_cur->bulk_endpoint)
+		goto skip_set_alt;
+
 	error = uvideo_vs_set_alt(sc, sc->sc_vs_cur->ifaceh,
 	    UGETDW(sc->sc_desc_probe.dwMaxPayloadTransferSize));
 	if (error != USBD_NORMAL_COMPLETION) {
@@ -1898,6 +2096,7 @@ uvideo_vs_open(struct uvideo_softc *sc)
 		return (USBD_INVAL);
 	}
 
+skip_set_alt:
 	DPRINTF(1, "%s: open pipe for bEndpointAddress=0x%02x\n",
 	    DEVNAME(sc), sc->sc_vs_cur->endpoint);
 	error = usbd_open_pipe(
@@ -1934,6 +2133,11 @@ uvideo_vs_close(struct uvideo_softc *sc)
 {
 	if (sc->sc_vs_cur->bulk_running == 1) {
 		sc->sc_vs_cur->bulk_running = 0;
+
+		/* Bulk thread may sleep in usbd_transfer, abort it */
+		if (sc->sc_vs_cur->pipeh)
+			usbd_abort_pipe(sc->sc_vs_cur->pipeh);
+
 		usbd_ref_wait(sc->sc_udev);
 	}
 
@@ -1942,15 +2146,31 @@ uvideo_vs_close(struct uvideo_softc *sc)
 		sc->sc_vs_cur->pipeh = NULL;
 	}
 
-	/*
-	 * Some devices need time to shutdown before we switch back to
-	 * the default interface (0).  Not doing so can leave the device
-	 * back in a undefined condition.
-	 */
-	usbd_delay_ms(sc->sc_udev, 100);
+	/* No need to mess with HW if the device is gone. */
+	if (usbd_is_dying(sc->sc_udev))
+		return;
 
-	/* switch back to default interface (turns off cam LED) */
-	(void)usbd_set_interface(sc->sc_vs_cur->ifaceh, 0);
+	if (sc->sc_vs_cur->bulk_endpoint) {
+		/*
+		 * UVC doesn't specify how to notify a bulk-based device
+		 * when the video stream is stopped. Both, Linux and
+		 * Windows send a CLEAR_FEATURE(HALT) request to the
+		 * video streaming bulk endpoint.
+		 */
+		if (usbd_clear_endpoint_feature(sc->sc_udev,
+		    sc->sc_vs_cur->endpoint, UF_ENDPOINT_HALT))
+			printf("%s: clear endpoints failed!\n", __func__);
+	} else {
+		/*
+		 * Some devices need time to shutdown before we switch back to
+		 * the default interface (0).  Not doing so can leave the device
+		 * back in a undefined condition.
+		 */
+		usbd_delay_ms(sc->sc_udev, 100);
+
+		/* switch back to default interface (turns off cam LED) */
+		(void)usbd_set_interface(sc->sc_vs_cur->ifaceh, 0);
+	}
 }
 
 usbd_status
@@ -1975,12 +2195,7 @@ uvideo_vs_init(struct uvideo_softc *sc)
 	error = uvideo_vs_alloc_frame(sc);
 	if (error != USBD_NORMAL_COMPLETION)
 		return (USBD_INVAL);
-#ifdef UVIDEO_DUMP
-	if (uvideo_debug_file_open(sc) != 0)
-		return (USBD_INVAL);
-	usb_init_task(&sc->sc_task_write, uvideo_debug_file_write_frame, sc,
-	    USB_TASK_TYPE_GENERIC);
-#endif
+
 	return (USBD_NORMAL_COMPLETION);
 }
 
@@ -2028,10 +2243,12 @@ uvideo_vs_start_bulk_thread(void *arg)
 			break;
 		}
 
+		usbd_get_xfer_status(sc->sc_vs_cur->bxfer.xfer,
+		    NULL, NULL, &size, NULL);
+
 		DPRINTF(2, "%s: *** buffer len = %d\n", DEVNAME(sc), size);
 
-		(void)sc->sc_decode_stream_header(sc,
-		    sc->sc_vs_cur->bxfer.buf, size);
+		sc->sc_decode_stream_header(sc, sc->sc_vs_cur->bxfer.buf, size);
 	}
 	usbd_ref_decr(sc->sc_udev);
 
@@ -2055,9 +2272,6 @@ uvideo_vs_start_isoc_ixfer(struct uvideo_softc *sc,
 	usbd_status error;
 
 	DPRINTF(2, "%s: %s\n", DEVNAME(sc), __func__);
-
-	if (usbd_is_dying(sc->sc_udev))
-		return;
 
 	for (i = 0; i < sc->sc_nframes; i++)
 		ixfer->size[i] = sc->sc_vs_cur->psize;
@@ -2086,7 +2300,6 @@ uvideo_vs_cb(struct usbd_xfer *xfer, void *priv,
 	struct uvideo_softc *sc = ixfer->sc;
 	int len, i, frame_size;
 	uint8_t *frame;
-	usbd_status error;
 
 	DPRINTF(2, "%s: %s\n", DEVNAME(sc), __func__);
 
@@ -2109,43 +2322,33 @@ uvideo_vs_cb(struct usbd_xfer *xfer, void *priv,
 			/* frame is empty */
 			continue;
 
-		error = sc->sc_decode_stream_header(sc, frame, frame_size);
-		if (error == USBD_CANCELLED)
-			break;
+		sc->sc_decode_stream_header(sc, frame, frame_size);
 	}
 
 skip:	/* setup new transfer */
 	uvideo_vs_start_isoc_ixfer(sc, ixfer);
 }
 
-usbd_status
+void
 uvideo_vs_decode_stream_header(struct uvideo_softc *sc, uint8_t *frame,
     int frame_size)
 {
 	struct uvideo_frame_buffer *fb = &sc->sc_frame_buffer;
 	struct usb_video_stream_header *sh;
 	int sample_len;
+	uint8_t *buf;
 
 	if (frame_size < UVIDEO_SH_MIN_LEN)
 		/* frame too small to contain a valid stream header */
-		return (USBD_INVAL);
+		return;
 
 	sh = (struct usb_video_stream_header *)frame;
 
 	DPRINTF(2, "%s: stream header len = %d\n", DEVNAME(sc), sh->bLength);
 
-	if (sh->bLength > UVIDEO_SH_MAX_LEN || sh->bLength < UVIDEO_SH_MIN_LEN)
+	if (sh->bLength > frame_size || sh->bLength < UVIDEO_SH_MIN_LEN)
 		/* invalid header size */
-		return (USBD_INVAL);
-	if (sh->bLength == frame_size && !(sh->bFlags & UVIDEO_SH_FLAG_EOF)) {
-		/* stream header without payload and no EOF */
-		return (USBD_INVAL);
-	}
-	if (sh->bFlags & UVIDEO_SH_FLAG_ERR) {
-		/* stream error, skip xfer */
-		DPRINTF(1, "%s: %s: stream error!\n", DEVNAME(sc), __func__);
-		return (USBD_CANCELLED);
-	}
+		return;
 
 	DPRINTF(2, "%s: frame_size = %d\n", DEVNAME(sc), frame_size);
 
@@ -2164,6 +2367,8 @@ uvideo_vs_decode_stream_header(struct uvideo_softc *sc, uint8_t *frame,
 		fb->sample = 1;
 		fb->fid = sh->bFlags & UVIDEO_SH_FLAG_FID;
 		fb->offset = 0;
+		fb->error = 0;
+		fb->mmap_q_full = 0;
 	} else {
 		/* continues sample for a frame, check consistency */
 		if (fb->fid != (sh->bFlags & UVIDEO_SH_FLAG_FID)) {
@@ -2172,13 +2377,36 @@ uvideo_vs_decode_stream_header(struct uvideo_softc *sc, uint8_t *frame,
 			fb->sample = 1;
 			fb->fid = sh->bFlags & UVIDEO_SH_FLAG_FID;
 			fb->offset = 0;
+			fb->error = 0;
+			fb->mmap_q_full = 0;
 		}
 	}
 
+	if (sh->bFlags & UVIDEO_SH_FLAG_ERR) {
+		/* stream error, skip xfer */
+		DPRINTF(1, "%s: %s: stream error!\n", DEVNAME(sc), __func__);
+		fb->error = 1;
+	}
+
+	if (sc->sc_mmap_flag) {
+		if (!fb->mmap_q_full) {
+			buf = uvideo_mmap_getbuf(sc);
+			if (buf == NULL)
+				fb->mmap_q_full = 1;
+		}
+	} else
+		buf = sc->sc_frame_buffer.buf;
+
 	/* save sample */
 	sample_len = frame_size - sh->bLength;
-	if ((fb->offset + sample_len) <= fb->buf_size) {
-		bcopy(frame + sh->bLength, fb->buf + fb->offset, sample_len);
+	if (sample_len > fb->buf_size - fb->offset) {
+		DPRINTF(1, "%s: %s: frame too large, marked as error\n",
+		    DEVNAME(sc), __func__);
+		sample_len = fb->buf_size - fb->offset;
+		fb->error = 1;
+	}
+	if (!fb->mmap_q_full && sample_len > 0) {
+		bcopy(frame + sh->bLength, buf + fb->offset, sample_len);
 		fb->offset += sample_len;
 	}
 
@@ -2187,34 +2415,30 @@ uvideo_vs_decode_stream_header(struct uvideo_softc *sc, uint8_t *frame,
 		DPRINTF(2, "%s: %s: EOF (frame size = %d bytes)\n",
 		    DEVNAME(sc), __func__, fb->offset);
 
-		if (fb->offset > fb->buf_size) {
-			DPRINTF(1, "%s: %s: frame too large, skipped!\n",
-			    DEVNAME(sc), __func__);
-		} else if (fb->offset < fb->buf_size &&
+		if (fb->offset < fb->buf_size &&
 		    !(fb->fmt_flags & V4L2_FMT_FLAG_COMPRESSED)) {
-			DPRINTF(1, "%s: %s: frame too small, skipped!\n",
+			DPRINTF(1, "%s: %s: frame too small, marked as error\n",
+			    DEVNAME(sc), __func__);
+			fb->error = 1;
+		}
+
+		if (sc->sc_mmap_flag) {
+			/* mmap */
+			if (!fb->mmap_q_full)
+				uvideo_mmap_queue(sc, fb->offset, fb->error);
+		} else if (fb->error) {
+			DPRINTF(1, "%s: %s: error frame, skipped!\n",
 			    DEVNAME(sc), __func__);
 		} else {
-#ifdef UVIDEO_DUMP
-			/* do the file write in process context */
-			usb_rem_task(sc->sc_udev, &sc->sc_task_write);
-			usb_add_task(sc->sc_udev, &sc->sc_task_write);
-#endif
-			if (sc->sc_mmap_flag) {
-				/* mmap */
-				if (uvideo_mmap_queue(sc, fb->buf, fb->offset))
-					return (USBD_NOMEM);
-			} else {
-				/* read */
-				uvideo_read(sc, fb->buf, fb->offset);
-			}
+			/* read */
+			uvideo_read(sc, fb->buf, fb->offset);
 		}
 
 		fb->sample = 0;
 		fb->fid = 0;
+		fb->error = 0;
+		fb->mmap_q_full = 0;
 	}
-
-	return (USBD_NORMAL_COMPLETION);
 }
 
 /*
@@ -2233,12 +2457,13 @@ uvideo_vs_decode_stream_header(struct uvideo_softc *sc, uint8_t *frame,
  * Sometimes the stream header is prefixed by a unknown byte.  Therefore
  * we check for the magic value on two offsets.
  */
-usbd_status
+void
 uvideo_vs_decode_stream_header_isight(struct uvideo_softc *sc, uint8_t *frame,
     int frame_size)
 {
 	struct uvideo_frame_buffer *fb = &sc->sc_frame_buffer;
 	int sample_len, header = 0;
+	uint8_t *buf;
 	uint8_t magic[] = {
 	    0x11, 0x22, 0x33, 0x44,
 	    0xde, 0xad, 0xbe, 0xef, 0xde, 0xad, 0xfa, 0xce };
@@ -2250,63 +2475,107 @@ uvideo_vs_decode_stream_header_isight(struct uvideo_softc *sc, uint8_t *frame,
 
 	if (header && fb->fid == 0) {
 		fb->fid = 1;
-		return (USBD_NORMAL_COMPLETION);
+		return;
 	}
 
 	if (header) {
 		if (sc->sc_mmap_flag) {
 			/* mmap */
-			if (uvideo_mmap_queue(sc, fb->buf, fb->offset))
-				return (USBD_NOMEM);
+			if (!fb->mmap_q_full)
+				uvideo_mmap_queue(sc, fb->offset, 0);
 		} else {
 			/* read */
 			uvideo_read(sc, fb->buf, fb->offset);
 		}
 		fb->offset = 0;
+		fb->mmap_q_full = 0;
 	} else {
+		if (sc->sc_mmap_flag) {
+			if (!fb->mmap_q_full) {
+				buf = uvideo_mmap_getbuf(sc);
+				if (buf == NULL)
+					fb->mmap_q_full = 1;
+			}
+		} else
+			buf = sc->sc_frame_buffer.buf;
+
 		/* save sample */
 		sample_len = frame_size;
-		if ((fb->offset + sample_len) <= fb->buf_size) {
-			bcopy(frame, fb->buf + fb->offset, sample_len);
+		if (!fb->mmap_q_full &&
+		    (fb->offset + sample_len) <= fb->buf_size) {
+			bcopy(frame, buf + fb->offset, sample_len);
 			fb->offset += sample_len;
 		}
 	}
-
-	return (USBD_NORMAL_COMPLETION);
 }
 
-int
-uvideo_mmap_queue(struct uvideo_softc *sc, uint8_t *buf, int len)
+uint8_t *
+uvideo_mmap_getbuf(struct uvideo_softc *sc)
 {
-	int i;
+	int i, idx = sc->sc_mmap_buffer_idx;
+
+	/*
+	 * Section 2.4.3.2 explicitly allows multiple frames per one
+	 * transfer and multiple transfers per one frame.
+	 */
+	if (sc->sc_mmap_cur != NULL)
+		return sc->sc_mmap_cur->buf;
 
 	if (sc->sc_mmap_count == 0 || sc->sc_mmap_buffer == NULL)
 		panic("%s: mmap buffers not allocated", __func__);
 
 	/* find a buffer which is ready for queueing */
 	for (i = 0; i < sc->sc_mmap_count; i++) {
-		if (sc->sc_mmap[i].v4l2_buf.flags & V4L2_BUF_FLAG_QUEUED)
+		if (sc->sc_mmap[sc->sc_mmap_buffer_idx].v4l2_buf.flags &
+		    V4L2_BUF_FLAG_QUEUED) {
+			idx = sc->sc_mmap_buffer_idx;
+			if (++sc->sc_mmap_buffer_idx == sc->sc_mmap_count)
+				sc->sc_mmap_buffer_idx = 0;
 			break;
-	}
-	if (i == sc->sc_mmap_count) {
-		DPRINTF(1, "%s: %s: mmap queue is full!",
-		    DEVNAME(sc), __func__);
-		return ENOMEM;
+		}
+		if (++sc->sc_mmap_buffer_idx == sc->sc_mmap_count)
+			sc->sc_mmap_buffer_idx = 0;
 	}
 
-	/* copy frame to mmap buffer and report length */
-	bcopy(buf, sc->sc_mmap[i].buf, len);
-	sc->sc_mmap[i].v4l2_buf.bytesused = len;
+	if (i == sc->sc_mmap_count) {
+		DPRINTF(1, "%s: %s: mmap queue is full!\n",
+		    DEVNAME(sc), __func__);
+		return NULL;
+	}
+
+	sc->sc_mmap_cur = &sc->sc_mmap[idx];
+
+	return sc->sc_mmap_cur->buf;
+}
+
+void
+uvideo_mmap_queue(struct uvideo_softc *sc, int len, int err)
+{
+	if (sc->sc_mmap_cur == NULL)
+		panic("uvideo_mmap_queue: NULL pointer!");
+
+	/* report frame length */
+	sc->sc_mmap_cur->v4l2_buf.bytesused = len;
 
 	/* timestamp it */
-	getmicrotime(&sc->sc_mmap[i].v4l2_buf.timestamp);
+	getmicrouptime(&sc->sc_mmap_cur->v4l2_buf.timestamp);
+	sc->sc_mmap_cur->v4l2_buf.flags &= ~V4L2_BUF_FLAG_TIMESTAMP_MASK;
+	sc->sc_mmap_cur->v4l2_buf.flags |= V4L2_BUF_FLAG_TIMESTAMP_MONOTONIC;
+	sc->sc_mmap_cur->v4l2_buf.flags &= ~V4L2_BUF_FLAG_TSTAMP_SRC_MASK;
+	sc->sc_mmap_cur->v4l2_buf.flags |= V4L2_BUF_FLAG_TSTAMP_SRC_EOF;
+	sc->sc_mmap_cur->v4l2_buf.flags &= ~V4L2_BUF_FLAG_TIMECODE;
+
+	/* forward error bit */
+	sc->sc_mmap_cur->v4l2_buf.flags &= ~V4L2_BUF_FLAG_ERROR;
+	if (err)
+		sc->sc_mmap_cur->v4l2_buf.flags |= V4L2_BUF_FLAG_ERROR;
 
 	/* queue it */
-	sc->sc_mmap[i].v4l2_buf.flags |= V4L2_BUF_FLAG_DONE;
-	sc->sc_mmap[i].v4l2_buf.flags &= ~V4L2_BUF_FLAG_QUEUED;
-	SIMPLEQ_INSERT_TAIL(&sc->sc_mmap_q, &sc->sc_mmap[i], q_frames);
-	DPRINTF(2, "%s: %s: frame queued on index %d\n",
-	    DEVNAME(sc), __func__, i);
+	sc->sc_mmap_cur->v4l2_buf.flags |= V4L2_BUF_FLAG_DONE;
+	sc->sc_mmap_cur->v4l2_buf.flags &= ~V4L2_BUF_FLAG_QUEUED;
+	SIMPLEQ_INSERT_TAIL(&sc->sc_mmap_q, sc->sc_mmap_cur, q_frames);
+	sc->sc_mmap_cur = NULL;
+	DPRINTF(2, "%s: %s: frame queued\n", DEVNAME(sc), __func__);
 
 	wakeup(sc);
 
@@ -2315,8 +2584,6 @@ uvideo_mmap_queue(struct uvideo_softc *sc, uint8_t *buf, int len)
 	 * ready to dequeue.
 	 */
 	sc->sc_uplayer_intr(sc->sc_uplayer_arg);
-
-	return 0;
 }
 
 void
@@ -2440,6 +2707,12 @@ uvideo_dump_desc_all(struct uvideo_softc *sc)
 				printf("|\n");
 				uvideo_dump_desc_colorformat(sc, desc);
 				break;
+			default:
+				printf("bDescriptorSubtype=0x%02x",
+				    desc->bDescriptorSubtype);
+				printf(" (unknown)\n");
+				break;
+
 			}
 
 			break;
@@ -2474,6 +2747,11 @@ uvideo_dump_desc_all(struct uvideo_softc *sc)
 			printf("|\n");
 			uvideo_dump_desc_endpoint(sc, desc);
 			break;
+		case UDESC_ENDPOINT_SS_COMP:
+			printf(" (UDESC_ENDPOINT_SS_COMP)\n");
+			printf("|\n");
+			uvideo_dump_desc_endpoint_ss_comp(sc, desc);
+			break;
 		case UDESC_INTERFACE:
 			printf(" (UDESC_INTERFACE)\n");
 			printf("|\n");
@@ -2500,9 +2778,13 @@ void
 uvideo_dump_desc_vc_header(struct uvideo_softc *sc,
     const usb_descriptor_t *desc)
 {
+	int i;
+	uByte *baInterfaceNr;
 	struct usb_video_header_desc *d;
 
 	d = (struct usb_video_header_desc *)(uint8_t *)desc;
+
+	baInterfaceNr = (uByte *)(d + 1);
 
 	printf("bLength=%d\n", d->bLength);
 	printf("bDescriptorType=0x%02x\n", d->bDescriptorType);
@@ -2511,6 +2793,8 @@ uvideo_dump_desc_vc_header(struct uvideo_softc *sc,
 	printf("wTotalLength=%d\n", UGETW(d->wTotalLength));
 	printf("dwClockFrequency=%d\n", UGETDW(d->dwClockFrequency));
 	printf("bInCollection=0x%02x\n", d->bInCollection);
+	for (i = 0; i < d->bInCollection; i++)
+		printf("baInterfaceNr[%d]=0x%02x\n", i, baInterfaceNr[i]);
 }
 
 void
@@ -2603,6 +2887,21 @@ uvideo_dump_desc_endpoint(struct uvideo_softc *sc,
 		printf(" (UE_INTERRUPT)\n");
 	printf("wMaxPacketSize=%d\n", UGETW(d->wMaxPacketSize));
 	printf("bInterval=0x%02x\n", d->bInterval);
+}
+
+void
+uvideo_dump_desc_endpoint_ss_comp(struct uvideo_softc *sc,
+    const usb_descriptor_t *desc)
+{
+	usb_endpoint_ss_comp_descriptor_t *d;
+
+	d = (usb_endpoint_ss_comp_descriptor_t *)(uint8_t *)desc;
+
+	printf("bLength=%d\n", d->bLength);
+	printf("bDescriptorType=0x%02x\n", d->bDescriptorType);
+	printf("bMaxBurst=0x%02x\n", d->bMaxBurst);
+	printf("bmAttributes=0x%02x\n", d->bmAttributes);
+	printf("wBytesPerInterval=%d\n", UGETW(d->wBytesPerInterval));
 }
 
 void
@@ -2844,55 +3143,6 @@ uvideo_hexdump(void *buf, int len, int quiet)
 	}
 	printf("\n");
 }
-
-int
-uvideo_debug_file_open(struct uvideo_softc *sc)
-{
-	struct proc *p = curproc;
-	struct nameidata nd;
-	char name[] = "/tmp/uvideo.mjpeg";
-	int error;
-
-	NDINIT(&nd, 0, 0, UIO_SYSSPACE, name, p);
-	error = vn_open(&nd, O_CREAT | FWRITE | O_NOFOLLOW, S_IRUSR | S_IWUSR);
-	if (error) {
-		DPRINTF(1, "%s: %s: can't create debug file %s!\n",
-		    DEVNAME(sc), __func__, name);
-		return (error);
-	}
-
-	sc->sc_vp = nd.ni_vp;
-	VOP_UNLOCK(sc->sc_vp);
-	if (nd.ni_vp->v_type != VREG) {
-		vn_close(nd.ni_vp, FWRITE, p->p_ucred, p);
-		return (EIO);
-	}
-
-	DPRINTF(1, "%s: %s: created debug file %s\n",
-	    DEVNAME(sc), __func__, name);
-
-	return (0);
-}
-
-void
-uvideo_debug_file_write_frame(void *arg)
-{
-	struct uvideo_softc *sc = arg;
-	struct uvideo_frame_buffer *sb = &sc->sc_frame_buffer;
-	struct proc *p = curproc;
-	int error;
-
-	if (sc->sc_vp == NULL) {
-		printf("%s: %s: no file open!\n", DEVNAME(sc), __func__);
-		return;
-	}
-
-	error = vn_rdwr(UIO_WRITE, sc->sc_vp, sb->buf, sb->offset, (off_t)0,
-	    UIO_SYSSPACE, IO_APPEND|IO_UNIT, p->p_ucred, NULL, p);
-
-	if (error)
-		DPRINTF(1, "vn_rdwr error!\n");
-}
 #endif
 
 /*
@@ -2904,9 +3154,9 @@ uvideo_querycap(void *v, struct v4l2_capability *caps)
 	struct uvideo_softc *sc = v;
 
 	bzero(caps, sizeof(*caps));
-	strlcpy(caps->driver, DEVNAME(sc), sizeof(caps->driver));
+	strlcpy(caps->driver, "uvideo", sizeof(caps->driver));
 	strlcpy(caps->card, sc->sc_udev->product, sizeof(caps->card));
-	strlcpy(caps->bus_info, "usb", sizeof(caps->bus_info));
+	strlcpy(caps->bus_info, DEVNAME(sc), sizeof(caps->bus_info));
 
 	caps->version = 1;
 	caps->device_caps = V4L2_CAP_VIDEO_CAPTURE
@@ -2942,26 +3192,10 @@ uvideo_enum_fmt(void *v, struct v4l2_fmtdesc *fmtdesc)
 		break;
 	case UDESCSUB_VS_FORMAT_UNCOMPRESSED:
 		fmtdesc->flags = 0;
-		if (sc->sc_fmtgrp[idx].pixelformat ==
-		    V4L2_PIX_FMT_YUYV) {
-			(void)strlcpy(fmtdesc->description, "YUYV",
-			    sizeof(fmtdesc->description));
-			fmtdesc->pixelformat = V4L2_PIX_FMT_YUYV;
-		} else if (sc->sc_fmtgrp[idx].pixelformat ==
-		    V4L2_PIX_FMT_NV12) {
-			(void)strlcpy(fmtdesc->description, "NV12",
-			    sizeof(fmtdesc->description));
-			fmtdesc->pixelformat = V4L2_PIX_FMT_NV12;
-		} else if (sc->sc_fmtgrp[idx].pixelformat ==
-		    V4L2_PIX_FMT_UYVY) {
-			(void)strlcpy(fmtdesc->description, "UYVY",
-			    sizeof(fmtdesc->description));
-			fmtdesc->pixelformat = V4L2_PIX_FMT_UYVY;
-		} else {
-			(void)strlcpy(fmtdesc->description, "Unknown UC Format",
-			    sizeof(fmtdesc->description));
-			fmtdesc->pixelformat = 0;
-		}
+		fmtdesc->pixelformat = sc->sc_fmtgrp[idx].pixelformat;
+		(void)strlcpy(fmtdesc->description,
+		    (char *) &fmtdesc->pixelformat,
+		    sizeof(fmtdesc->description));
 		bzero(fmtdesc->reserved, sizeof(fmtdesc->reserved));
 		break;
 	default:
@@ -3145,6 +3379,17 @@ uvideo_g_fmt(void *v, struct v4l2_format *fmt)
 	fmt->fmt.pix.height = UGETW(sc->sc_fmtgrp_cur->frame_cur->wHeight);
 	fmt->fmt.pix.sizeimage = UGETDW(sc->sc_desc_probe.dwMaxVideoFrameSize);
 
+	if (sc->sc_fmtgrp_cur->has_colorformat) {
+		fmt->fmt.pix.colorspace = sc->sc_fmtgrp_cur->colorspace;
+		fmt->fmt.pix.xfer_func = sc->sc_fmtgrp_cur->xfer_func;
+		fmt->fmt.pix.ycbcr_enc = sc->sc_fmtgrp_cur->ycbcr_enc;
+
+		DPRINTF(1, "%s: %s: use color format"
+		    " colorspace=%d, xfer_func=%d, ycbcr_enc=%d\n",
+		    DEVNAME(sc), __func__, fmt->fmt.pix.colorspace,
+		    fmt->fmt.pix.xfer_func, fmt->fmt.pix.ycbcr_enc);
+	}
+
 	DPRINTF(1, "%s: %s: current width=%d, height=%d\n",
 	    DEVNAME(sc), __func__, fmt->fmt.pix.width, fmt->fmt.pix.height);
 
@@ -3258,13 +3503,13 @@ uvideo_reqbufs(void *v, struct v4l2_requestbuffers *rb)
 
 	/* allocate the total mmap buffer */	
 	buf_size = UGETDW(sc->sc_desc_probe.dwMaxVideoFrameSize);
-	if (buf_size >= SIZE_MAX / UVIDEO_MAX_BUFFERS) {
+	buf_size_total = sc->sc_mmap_count * buf_size;
+	buf_size_total = round_page(buf_size_total); /* page align buffer */
+	if (buf_size_total > MALLOC_MAX) {
 		printf("%s: video frame size too large!\n", DEVNAME(sc));
 		sc->sc_mmap_count = 0;
 		return (EINVAL);
 	}
-	buf_size_total = sc->sc_mmap_count * buf_size;
-	buf_size_total = round_page(buf_size_total); /* page align buffer */
 	sc->sc_mmap_buffer = malloc(buf_size_total, M_USBDEV, M_NOWAIT);
 	if (sc->sc_mmap_buffer == NULL) {
 		printf("%s: can't allocate mmap buffer!\n", DEVNAME(sc));
@@ -3295,8 +3540,13 @@ uvideo_reqbufs(void *v, struct v4l2_requestbuffers *rb)
 		    sc->sc_mmap[i].v4l2_buf.length);
 	}
 
+	sc->sc_mmap_buffer_idx = 0;
+	sc->sc_mmap_cur = NULL;
+
 	/* tell how many buffers we have really allocated */
 	rb->count = sc->sc_mmap_count;
+
+	rb->capabilities = V4L2_BUF_CAP_SUPPORTS_MMAP;
 
 	return (0);
 }
@@ -3809,7 +4059,7 @@ uvideo_ucode_loader_ricoh(struct uvideo_softc *sc)
 
 /*
  * The iSight first generation device will first attach as
- * 0x8300 non-UVC.  After the firmware gots uploaded, the device
+ * 0x8300 non-UVC.  After the firmware is uploaded, the device
  * will reset and come back as 0x8501 UVC compatible.
  */
 usbd_status

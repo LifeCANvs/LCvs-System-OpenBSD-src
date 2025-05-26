@@ -1,4 +1,4 @@
-/*	$OpenBSD: protosw.h,v 1.66 2024/04/14 20:46:27 bluhm Exp $	*/
+/*	$OpenBSD: protosw.h,v 1.72 2025/03/02 21:28:32 bluhm Exp $	*/
 /*	$NetBSD: protosw.h,v 1.10 1996/04/09 20:55:32 cgd Exp $	*/
 
 /*-
@@ -63,13 +63,11 @@ struct domain;
 struct proc;
 struct stat;
 struct ifnet;
+struct netstack;
 
 struct pr_usrreqs {
 	int	(*pru_attach)(struct socket *, int, int);
 	int	(*pru_detach)(struct socket *);
-	void	(*pru_lock)(struct socket *);
-	void	(*pru_unlock)(struct socket *);
-	int	(*pru_locked)(struct socket *so);
 	int	(*pru_bind)(struct socket *, struct mbuf *, struct proc *);
 	int	(*pru_listen)(struct socket *);
 	int	(*pru_connect)(struct socket *, struct mbuf *);
@@ -99,7 +97,7 @@ struct protosw {
 
 /* protocol-protocol hooks */
 					/* input to protocol (from below) */
-	int	(*pr_input)(struct mbuf **, int *, int, int);
+	int	(*pr_input)(struct mbuf **, int *, int, int, struct netstack *);
 					/* control input (from below) */
 	void	(*pr_ctlinput)(int, struct sockaddr *, u_int, void *);
 					/* control output (from above) */
@@ -133,6 +131,7 @@ struct protosw {
 					   socket */
 #define PR_SPLICE	0x0040		/* socket splicing is possible */
 #define PR_MPINPUT	0x0080		/* input runs with shared netlock */
+#define PR_MPSYSCTL	0x0200		/* mp-safe sysctl(2) handler */
 
 /*
  * The arguments to usrreq are:
@@ -255,10 +254,7 @@ char	*prcorequests[] = {
 
 #include <sys/mbuf.h>
 #include <sys/socketvar.h>
-#include <sys/systm.h>
 
-struct ifnet;
-struct sockaddr;
 const struct protosw *pffindproto(int, int, int);
 const struct protosw *pffindtype(int, int);
 const struct domain *pffinddomain(int);
@@ -282,28 +278,6 @@ static inline int
 pru_detach(struct socket *so)
 {
 	return (*so->so_proto->pr_usrreqs->pru_detach)(so);
-}
-
-static inline void
-pru_lock(struct socket *so)
-{
-	if (so->so_proto->pr_usrreqs->pru_lock)
-		(*so->so_proto->pr_usrreqs->pru_lock)(so);
-}
-
-static inline void
-pru_unlock(struct socket *so)
-{
-	if (so->so_proto->pr_usrreqs->pru_unlock)
-		(*so->so_proto->pr_usrreqs->pru_unlock)(so);
-}
-
-static inline int
-pru_locked(struct socket *so)
-{
-	if (so->so_proto->pr_usrreqs->pru_locked)
-		return (*so->so_proto->pr_usrreqs->pru_locked)(so);
-	return (0);
 }
 
 static inline int

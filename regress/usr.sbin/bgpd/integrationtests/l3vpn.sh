@@ -1,5 +1,5 @@
 #!/bin/ksh
-#	$OpenBSD: l3vpn.sh,v 1.4 2023/02/15 14:19:08 claudio Exp $
+#	$OpenBSD: l3vpn.sh,v 1.8 2025/04/29 18:35:51 claudio Exp $
 
 set -e
 
@@ -22,7 +22,6 @@ PAIR2IP6=2001:db8:57::2
 error_notify() {
 	set -x
 	echo cleanup
-	pfctl -q -t bgpd_integ_test -T kill
 	pkill -T ${RDOMAIN1} bgpd || true
 	pkill -T ${RDOMAIN2} bgpd || true
 	sleep 1
@@ -99,24 +98,25 @@ echo Check initial networks
 route -T ${RDOMAIN1} exec bgpctl show
 route -T ${RDOMAIN1} exec bgpctl show rib
 route -T ${RDOMAIN1} exec bgpctl show fib table 13
-route -T ${RDOMAIN3} show
-route -T ${RDOMAIN3} get 192.168.44/24 > /dev/null
-route -T ${RDOMAIN4} get 192.168.42/24 > /dev/null
-route -T ${RDOMAIN3} get -inet6 2001:db8:42:44::/64 > /dev/null
-route -T ${RDOMAIN4} get -inet6 2001:db8:42:42::/64 > /dev/null
+route -T ${RDOMAIN3} -n show
+route -T ${RDOMAIN3} -n get 192.168.44/24 > /dev/null
+route -T ${RDOMAIN4} -n get 192.168.42/24 > /dev/null
+route -T ${RDOMAIN3} -n get -inet6 2001:db8:42:44::/64 > /dev/null
+route -T ${RDOMAIN4} -n get -inet6 2001:db8:42:42::/64 > /dev/null
 
 echo Add new network
 route -T ${RDOMAIN2} exec bgpctl network add 192.168.45.0/24 rd 4200000002:14
 route -T ${RDOMAIN2} exec bgpctl network add 2001:db8:42:45::/64 rd 4200000002:14
 sleep 1
-route -T ${RDOMAIN3} get 192.168.45/24 > /dev/null
-route -T ${RDOMAIN3} get -inet6 2001:db8:42:45::/64 > /dev/null
+route -T ${RDOMAIN3} -n get 192.168.45/24 > /dev/null
+route -T ${RDOMAIN3} -n get -inet6 2001:db8:42:45::/64 > /dev/null
 
 echo Remove new network
 route -T ${RDOMAIN2} exec bgpctl network del 192.168.45.0/24 rd 4200000002:14
 route -T ${RDOMAIN2} exec bgpctl network del 2001:db8:42:45::/64 rd 4200000002:14
 sleep 1
-! route -T ${RDOMAIN3} get 192.168.45/24 > /dev/null
-! route -T ${RDOMAIN3} get -inet6 2001:db8:42:45::/64 > /dev/null
+route -T ${RDOMAIN1} exec bgpctl show rib
+! route -T ${RDOMAIN3} -n get 192.168.45/24 > /dev/null
+! route -T ${RDOMAIN3} -n get -inet6 2001:db8:42:45::/64 > /dev/null
 
 exit 0

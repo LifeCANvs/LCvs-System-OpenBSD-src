@@ -1,4 +1,4 @@
-/*	$OpenBSD: mem.c,v 1.35 2021/03/24 14:26:39 bluhm Exp $ */
+/*	$OpenBSD: mem.c,v 1.39 2024/12/30 02:46:00 guenther Exp $ */
 /*
  * Copyright (c) 1988 University of Utah.
  * Copyright (c) 1982, 1986, 1990, 1993
@@ -51,6 +51,7 @@
 #include <sys/ioccom.h>
 #include <sys/malloc.h>
 #include <sys/memrange.h>
+#include <sys/atomic.h>
 
 #include <machine/cpu.h>
 
@@ -84,7 +85,8 @@ mmopen(dev_t dev, int flag, int mode, struct proc *p)
 	switch (minor(dev)) {
 	case 0:
 	case 1:
-		if (securelevel <= 0 || allowkmem)
+		if ((int)atomic_load_int(&securelevel) <= 0 ||
+		    atomic_load_int(&allowkmem))
 			break;
 		return (EPERM);
 	case 2:
@@ -239,7 +241,6 @@ int
 mmioctl(dev_t dev, u_long cmd, caddr_t data, int flags, struct proc *p)
 {
 	switch (cmd) {
-	case FIONBIO:
 	case FIOASYNC:
 		/* handled by fd layer */
 		return 0;
@@ -252,7 +253,7 @@ mmioctl(dev_t dev, u_long cmd, caddr_t data, int flags, struct proc *p)
 		return mem_ioctl(dev, cmd, data, flags, p);
 	}
 #endif
-	return (ENODEV);
+	return (ENOTTY);
 }
 
 #ifdef MTRR

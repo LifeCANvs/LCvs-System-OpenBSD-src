@@ -1,4 +1,4 @@
-/*	$OpenBSD: acpivar.h,v 1.127 2024/05/13 19:56:37 kettenis Exp $	*/
+/*	$OpenBSD: acpivar.h,v 1.135 2025/05/24 14:51:52 tedu Exp $	*/
 /*
  * Copyright (c) 2005 Thorsten Lockert <tholo@sigmasoft.com>
  *
@@ -45,6 +45,7 @@ extern int acpi_debug;
 
 extern int acpi_hasprocfvs;
 extern int acpi_haspci;
+extern int acpi_legacy_free;
 
 struct acpiec_softc;
 struct acpipwrres_softc;
@@ -153,12 +154,6 @@ typedef SIMPLEQ_HEAD(, acpi_wakeq) acpi_wakeqhead_t;
 #define ACPI_SST_SLEEPING	3
 #define ACPI_SST_SLEEP_CONTEXT	4
 
-struct acpi_parsestate {
-	uint8_t			*start;
-	uint8_t			*end;
-	uint8_t			*pos;
-};
-
 struct acpi_reg_map {
 	bus_space_handle_t	ioh;
 	int			addr;
@@ -253,6 +248,7 @@ struct acpi_softc {
 		int slp_typb;
 	}			sc_sleeptype[6];
 	int			sc_lastgpe;
+	int			sc_wakegpe;
 
 	struct gpe_block	*gpe_table;
 
@@ -269,6 +265,8 @@ struct acpi_softc {
 	struct aml_node		*sc_sst;
 	struct aml_node		*sc_wak;
 	int			sc_state;
+	int			sc_wakeup;
+	int			sc_wakeups;
 	time_t			sc_resume_time;
 	struct acpiec_softc	*sc_ec;		/* XXX assume single EC */
 
@@ -287,6 +285,10 @@ struct acpi_softc {
 	int			sc_flags;
 
 	int			sc_skip_processor;
+
+	void			(*sc_pmc_suspend)(void *);
+	void			(*sc_pmc_resume)(void *);
+	void			*sc_pmc_cookie;
 };
 
 extern struct acpi_softc *acpi_softc;
@@ -298,22 +300,6 @@ extern struct acpi_softc *acpi_softc;
 #define GPE_NONE	0x00
 #define GPE_LEVEL	0x01
 #define GPE_EDGE	0x02
-
-struct acpi_table {
-	int	offset;
-	size_t	size;
-	void	*table;
-};
-
-struct acpi_dev_rank {
-	struct device	*dev;
-	int		rank;
-	TAILQ_ENTRY(acpi_dev_rank) link;
-};
-
-#define	ACPI_IOC_GETFACS	_IOR('A', 0, struct acpi_facs)
-#define	ACPI_IOC_GETTABLE	_IOWR('A', 1, struct acpi_table)
-#define ACPI_IOC_SETSLEEPSTATE	_IOW('A', 2, int)
 
 #if defined(_KERNEL)
 
@@ -358,6 +344,7 @@ int	acpi_set_gpehandler(struct acpi_softc *, int,
 
 void	acpiec_read(struct acpiec_softc *, uint8_t, int, uint8_t *);
 void	acpiec_write(struct acpiec_softc *, uint8_t, int, uint8_t *);
+int	acpiec_gpehandler(struct acpi_softc *, int, void *);
 
 #if NACPIPWRRES > 0
 int	acpipwrres_ref_incr(struct acpipwrres_softc *, struct aml_node *);

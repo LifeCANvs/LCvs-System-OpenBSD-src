@@ -1,4 +1,4 @@
-/* $OpenBSD: bn_convert.c,v 1.21 2024/04/17 21:55:43 tb Exp $ */
+/* $OpenBSD: bn_convert.c,v 1.24 2025/05/10 05:54:38 tb Exp $ */
 /* Copyright (C) 1995-1998 Eric Young (eay@cryptsoft.com)
  * All rights reserved.
  *
@@ -65,91 +65,77 @@
 
 #include <openssl/bio.h>
 #include <openssl/buffer.h>
-#include <openssl/err.h>
 
 #include "bn_local.h"
 #include "bytestring.h"
+#include "crypto_internal.h"
+#include "err_local.h"
 
 static int bn_dec2bn_cbs(BIGNUM **bnp, CBS *cbs);
 static int bn_hex2bn_cbs(BIGNUM **bnp, CBS *cbs);
 
 static const char hex_digits[] = "0123456789ABCDEF";
 
-typedef enum {
-	big,
-	little,
-} endianness_t;
-
-/* ignore negative */
 static int
-bn2binpad(const BIGNUM *a, unsigned char *to, int tolen, endianness_t endianness)
+bn_bn2binpad_internal(const BIGNUM *bn, uint8_t *out, int out_len,
+    int little_endian)
 {
-	int n;
-	size_t i, lasti, j, atop, mask;
-	BN_ULONG l;
+	uint8_t mask, v;
+	BN_ULONG w;
+	int i, j;
+	int b, n;
 
-	/*
-	 * In case |a| is fixed-top, BN_num_bytes can return bogus length,
-	 * but it's assumed that fixed-top inputs ought to be "nominated"
-	 * even for padded output, so it works out...
-	 */
-	n = BN_num_bytes(a);
-	if (tolen == -1)
-		tolen = n;
-	else if (tolen < n) {	/* uncommon/unlike case */
-		BIGNUM temp = *a;
+	n = BN_num_bytes(bn);
 
-		bn_correct_top(&temp);
+	if (out_len == -1)
+		out_len = n;
+	if (out_len < n)
+		return -1;
 
-		n = BN_num_bytes(&temp);
-		if (tolen < n)
-			return -1;
+	if (bn->dmax == 0) {
+		explicit_bzero(out, out_len);
+		return out_len;
 	}
 
-	/* Swipe through whole available data and don't give away padded zero. */
-	atop = a->dmax * BN_BYTES;
-	if (atop == 0) {
-		explicit_bzero(to, tolen);
-		return tolen;
+	mask = 0;
+	b = BN_BITS2;
+	j = 0;
+
+	for (i = out_len - 1; i >= 0; i--) {
+		if (b == BN_BITS2) {
+			mask = crypto_ct_lt_mask(j, bn->top);
+			w = bn->d[j++ % bn->dmax];
+			b = 0;
+		}
+		out[i] = (w >> b) & mask;
+		b += 8;
 	}
 
-	lasti = atop - 1;
-	atop = a->top * BN_BYTES;
-
-	if (endianness == big)
-		to += tolen; /* start from the end of the buffer */
-
-	for (i = 0, j = 0; j < (size_t)tolen; j++) {
-		unsigned char val;
-
-		l = a->d[i / BN_BYTES];
-		mask = 0 - ((j - atop) >> (8 * sizeof(i) - 1));
-		val = (unsigned char)(l >> (8 * (i % BN_BYTES)) & mask);
-
-		if (endianness == big)
-			*--to = val;
-		else
-			*to++ = val;
-
-		i += (i - lasti) >> (8 * sizeof(i) - 1); /* stay on last limb */
+	if (little_endian) {
+		for (i = 0, j = out_len - 1; i < out_len / 2; i++, j--) {
+			v = out[i];
+			out[i] = out[j];
+			out[j] = v;
+		}
 	}
 
-	return tolen;
+	return out_len;
 }
 
 int
-BN_bn2bin(const BIGNUM *a, unsigned char *to)
+BN_bn2bin(const BIGNUM *bn, unsigned char *to)
 {
-	return bn2binpad(a, to, -1, big);
+	return bn_bn2binpad_internal(bn, to, -1, 0);
 }
 LCRYPTO_ALIAS(BN_bn2bin);
 
 int
-BN_bn2binpad(const BIGNUM *a, unsigned char *to, int tolen)
+BN_bn2binpad(const BIGNUM *bn, unsigned char *to, int to_len)
 {
-	if (tolen < 0)
+	if (to_len < 0)
 		return -1;
-	return bn2binpad(a, to, tolen, big);
+
+	return bn_bn2binpad_internal(bn, to, to_len, 0);
 }
 LCRYPTO_ALIAS(BN_bn2binpad);
 
@@ -225,12 +211,12 @@ BN_bin2bn(const unsigned char *d, int len, BIGNUM *bn)
 LCRYPTO_ALIAS(BN_bin2bn);
 
 int
-BN_bn2lebinpad(const BIGNUM *a, unsigned char *to, int tolen)
+BN_bn2lebinpad(const BIGNUM *bn, unsigned char *to, int to_len)
 {
-	if (tolen < 0)
+	if (to_len < 0)
 		return -1;
 
-	return bn2binpad(a, to, tolen, little);
+	return bn_bn2binpad_internal(bn, to, to_len, 1);
 }
 LCRYPTO_ALIAS(BN_bn2lebinpad);
 
@@ -690,32 +676,43 @@ BN_hex2bn(BIGNUM **bnp, const char *s)
 LCRYPTO_ALIAS(BN_hex2bn);
 
 int
-BN_bn2mpi(const BIGNUM *a, unsigned char *d)
+BN_bn2mpi(const BIGNUM *bn, unsigned char *d)
 {
-	int bits;
-	int num = 0;
-	int ext = 0;
-	long l;
+	uint8_t *out_bin;
+	size_t out_len, out_bin_len;
+	int bits, bytes;
+	int extend;
+	CBB cbb, cbb_bin;
 
-	bits = BN_num_bits(a);
-	num = (bits + 7) / 8;
-	if (bits > 0) {
-		ext = ((bits & 0x07) == 0);
-	}
+	bits = BN_num_bits(bn);
+	bytes = (bits + 7) / 8;
+	extend = (bits != 0) && (bits % 8 == 0);
+	out_bin_len = extend + bytes;
+	out_len = 4 + out_bin_len;
+
 	if (d == NULL)
-		return (num + 4 + ext);
+		return out_len;
 
-	l = num + ext;
-	d[0] = (unsigned char)(l >> 24) & 0xff;
-	d[1] = (unsigned char)(l >> 16) & 0xff;
-	d[2] = (unsigned char)(l >> 8) & 0xff;
-	d[3] = (unsigned char)(l) & 0xff;
-	if (ext)
-		d[4] = 0;
-	num = BN_bn2bin(a, &(d[4 + ext]));
-	if (a->neg)
+	if (!CBB_init_fixed(&cbb, d, out_len))
+		goto err;
+	if (!CBB_add_u32_length_prefixed(&cbb, &cbb_bin))
+		goto err;
+	if (!CBB_add_space(&cbb_bin, &out_bin, out_bin_len))
+		goto err;
+	if (BN_bn2binpad(bn, out_bin, out_bin_len) != out_bin_len)
+		goto err;
+	if (!CBB_finish(&cbb, NULL, NULL))
+		goto err;
+
+	if (bn->neg)
 		d[4] |= 0x80;
-	return (num + 4 + ext);
+
+	return out_len;
+
+ err:
+	CBB_cleanup(&cbb);
+
+	return -1;
 }
 LCRYPTO_ALIAS(BN_bn2mpi);
 

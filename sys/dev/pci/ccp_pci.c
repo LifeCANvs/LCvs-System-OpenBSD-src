@@ -1,4 +1,4 @@
-/*	$OpenBSD: ccp_pci.c,v 1.9 2024/05/24 06:02:53 jsg Exp $ */
+/*	$OpenBSD: ccp_pci.c,v 1.14 2024/10/24 18:52:59 bluhm Exp $ */
 
 /*
  * Copyright (c) 2018 David Gwynne <dlg@openbsd.org>
@@ -27,6 +27,9 @@
 #include <dev/pci/pcivar.h>
 
 #include <dev/ic/ccpvar.h>
+#include <dev/ic/pspvar.h>
+
+#include "psp.h"
 
 #define CCP_PCI_BAR	0x18
 
@@ -61,6 +64,9 @@ ccp_pci_attach(struct device *parent, struct device *self, void *aux)
 	struct ccp_softc *sc = (struct ccp_softc *)self;
 	struct pci_attach_args *pa = aux;
 	pcireg_t memtype;
+#if NPSP > 0
+	int psp_matched;
+#endif
 
 	memtype = pci_mapreg_type(pa->pa_pc, pa->pa_tag, CCP_PCI_BAR);
 	if (PCI_MAPREG_TYPE(memtype) != PCI_MAPREG_TYPE_MEM) {
@@ -74,5 +80,16 @@ ccp_pci_attach(struct device *parent, struct device *self, void *aux)
 		return;
 	}
 
+#if NPSP > 0
+	psp_matched = psp_pci_match(sc, aux);
+	if (psp_matched)
+		psp_pci_intr_map(sc, pa);
+#endif
+
 	ccp_attach(sc);
+
+#if NPSP > 0
+	if (psp_matched)
+		psp_pci_attach(sc, pa);
+#endif
 }

@@ -1,4 +1,4 @@
-/*	$OpenBSD: file.c,v 1.26 2022/12/26 19:16:03 jmc Exp $	*/
+/*	$OpenBSD: file.c,v 1.28 2024/12/20 07:35:56 ratchov Exp $	*/
 /*
  * Copyright (c) 2008-2012 Alexandre Ratchov <alex@caoua.org>
  *
@@ -63,7 +63,7 @@
 void timo_update(unsigned int);
 void timo_init(void);
 void timo_done(void);
-void file_process(struct file *, struct pollfd *);
+int file_process(struct file *, struct pollfd *);
 
 struct timespec file_ts;
 struct file *file_list;
@@ -99,11 +99,11 @@ timo_add(struct timo *o, unsigned int delta)
 
 #ifdef DEBUG
 	if (o->set) {
-		log_puts("timo_add: already set\n");
+		logx(0, "timo_add: already set");
 		panic();
 	}
 	if (delta == 0) {
-		log_puts("timo_add: zero timeout is evil\n");
+		logx(0, "timo_add: zero timeout is evil");
 		panic();
 	}
 #endif
@@ -136,8 +136,7 @@ timo_del(struct timo *o)
 		}
 	}
 #ifdef DEBUG
-	if (log_level >= 4)
-		log_puts("timo_del: not found\n");
+	logx(4, "timo_del: not found");
 #endif
 }
 
@@ -194,29 +193,12 @@ timo_done(void)
 {
 #ifdef DEBUG
 	if (timo_queue != NULL) {
-		log_puts("timo_done: timo_queue not empty!\n");
+		logx(0, "timo_done: timo_queue not empty!");
 		panic();
 	}
 #endif
 	timo_queue = (struct timo *)0xdeadbeef;
 }
-
-#ifdef DEBUG
-void
-file_log(struct file *f)
-{
-	static char *states[] = { "ini", "zom" };
-
-	log_puts(f->ops->name);
-	if (log_level >= 3) {
-		log_puts("(");
-		log_puts(f->name);
-		log_puts("|");
-		log_puts(states[f->state]);
-		log_puts(")");
-	}
-}
-#endif
 
 struct file *
 file_new(struct fileops *ops, void *arg, char *name, unsigned int nfds)
@@ -225,10 +207,7 @@ file_new(struct fileops *ops, void *arg, char *name, unsigned int nfds)
 
 	if (file_nfds + nfds > MAXFDS) {
 #ifdef DEBUG
-		if (log_level >= 1) {
-			log_puts(name);
-			log_puts(": too many polled files\n");
-		}
+		logx(1, "%s: too many polled files", name);
 #endif
 		return NULL;
 	}
@@ -242,10 +221,7 @@ file_new(struct fileops *ops, void *arg, char *name, unsigned int nfds)
 	f->next = file_list;
 	file_list = f;
 #ifdef DEBUG
-	if (log_level >= 3) {
-		file_log(f);
-		log_puts(": created\n");
-	}
+	logx(3, "%s: created", f->name);
 #endif
 	file_nfds += f->max_nfds;
 	return f;
@@ -256,24 +232,21 @@ file_del(struct file *f)
 {
 #ifdef DEBUG
 	if (f->state == FILE_ZOMB) {
-		log_puts("bad state in file_del()\n");
+		logx(0, "%s: %s: bad state in file_del", __func__, f->name);
 		panic();
 	}
 #endif
 	file_nfds -= f->max_nfds;
 	f->state = FILE_ZOMB;
 #ifdef DEBUG
-	if (log_level >= 3) {
-		file_log(f);
-		log_puts(": destroyed\n");
-	}
+	logx(3, "%s: destroyed", f->name);
 #endif
 }
 
-void
+int
 file_process(struct file *f, struct pollfd *pfd)
 {
-	int revents;
+	int rc, revents;
 #ifdef DEBUG
 	struct timespec ts0, ts1;
 	long us;
@@ -283,28 +256,54 @@ file_process(struct file *f, struct pollfd *pfd)
 	if (log_level >= 3)
 		clock_gettime(CLOCK_UPTIME, &ts0);
 #endif
+	rc = 0;
 	revents = (f->state != FILE_ZOMB) ?
 	    f->ops->revents(f->arg, pfd) : 0;
-	if ((revents & POLLHUP) && (f->state != FILE_ZOMB))
+	if ((revents & POLLHUP) && (f->state != FILE_ZOMB)) {
 		f->ops->hup(f->arg);
-	if ((revents & POLLIN) && (f->state != FILE_ZOMB))
+		rc = 1;
+	}
+	if ((revents & POLLIN) && (f->state != FILE_ZOMB)) {
 		f->ops->in(f->arg);
-	if ((revents & POLLOUT) && (f->state != FILE_ZOMB))
+		rc = 1;
+	}
+	if ((revents & POLLOUT) && (f->state != FILE_ZOMB)) {
 		f->ops->out(f->arg);
+		rc = 1;
+	}
 #ifdef DEBUG
 	if (log_level >= 3) {
 		clock_gettime(CLOCK_UPTIME, &ts1);
 		us = 1000000L * (ts1.tv_sec - ts0.tv_sec);
 		us += (ts1.tv_nsec - ts0.tv_nsec) / 1000;
-		if (log_level >= 4 || us >= 5000) {
-			file_log(f);
-			log_puts(": processed in ");
-			log_putu(us);
-			log_puts("us\n");
-		}
+		if (us >= 5000)
+			logx(4, "%s: processed in %luus", f->name, us);
 	}
 #endif
+	return rc;
 }
+
+#ifdef DEBUG
+size_t
+filelist_fmt(char *buf, size_t size, struct pollfd *pfd, int ret)
+{
+	struct file *f;
+	char *p = buf, *end = buf + size;
+	const char *sep = "";
+	int i;
+
+	for (f = file_list; f != NULL; f = f->next) {
+		p += snprintf(p, p < end ? end - p : 0, "%s%s:", sep, f->name);
+		for (i = 0; i < f->nfds; i++) {
+			p += snprintf(p, p < end ? end - p : 0, " 0x%x",
+			    ret ? pfd->revents : pfd->events);
+			pfd++;
+		}
+		sep = ", ";
+	}
+	return p - buf;
+}
+#endif
 
 int
 file_poll(void)
@@ -314,7 +313,7 @@ file_poll(void)
 	struct timespec ts;
 #ifdef DEBUG
 	struct timespec sleepts;
-	int i;
+	char str[128];
 #endif
 	long long delta_nsec;
 	int nfds, res, timo;
@@ -333,8 +332,7 @@ file_poll(void)
 
 	if (file_list == NULL && timo_queue == NULL) {
 #ifdef DEBUG
-		if (log_level >= 3)
-			log_puts("nothing to do...\n");
+		logx(3, "nothing to do...");
 #endif
 		return 0;
 	}
@@ -350,31 +348,25 @@ file_poll(void)
 		nfds += f->nfds;
 	}
 #ifdef DEBUG
-	if (log_level >= 4) {
-		log_puts("poll:");
-		pfd = pfds;
-		for (f = file_list; f != NULL; f = f->next) {
-			log_puts(" ");
-			log_puts(f->ops->name);
-			log_puts(":");
-			for (i = 0; i < f->nfds; i++) {
-				log_puts(" ");
-				log_putx(pfd->events);
-				pfd++;
-			}
-		}
-		log_puts("\n");
-	}
+	logx(4, "poll [%s]", (filelist_fmt(str, sizeof(str), pfds, 0), str));
 #endif
 
 	/*
 	 * process files that do not rely on poll
 	 */
+	res = 0;
 	for (f = file_list; f != NULL; f = f->next) {
 		if (f->nfds > 0)
 			continue;
-		file_process(f, NULL);
+		res |= file_process(f, NULL);
 	}
+	/*
+	 * The processing may have changed the poll(2) conditions of
+	 * other files, so restart the loop to force their poll(2) event
+	 * masks to be reevaluated.
+	 */
+	if (res)
+		return 1;
 
 	/*
 	 * Sleep. Calculate the number of milliseconds poll(2) must
@@ -397,7 +389,7 @@ file_poll(void)
 	res = poll(pfds, nfds, timo);
 	if (res == -1) {
 		if (errno != EINTR) {
-			log_puts("poll failed");
+			logx(0, "poll failed");
 			panic();
 		}
 		return 1;
@@ -416,10 +408,8 @@ file_poll(void)
 		delta_nsec += ts.tv_nsec - file_ts.tv_nsec;
 		if (delta_nsec >= 0 && delta_nsec < 60000000000LL)
 			timo_update(delta_nsec / 1000);
-		else {
-			if (log_level >= 2)
-				log_puts("out-of-bounds clock delta\n");
-		}
+		else
+			logx(2, "out-of-bounds clock delta");
 	}
 	file_ts = ts;
 
@@ -442,7 +432,7 @@ filelist_init(void)
 	sigset_t set;
 
 	if (clock_gettime(CLOCK_UPTIME, &file_ts) == -1) {
-		log_puts("filelist_init: CLOCK_UPTIME unsupported\n");
+		logx(0, "filelist_init: CLOCK_UPTIME unsupported");
 		panic();
 	}
 	sigemptyset(&set);
@@ -460,10 +450,8 @@ filelist_done(void)
 	struct file *f;
 
 	if (file_list != NULL) {
-		for (f = file_list; f != NULL; f = f->next) {
-			file_log(f);
-			log_puts(" not closed\n");
-		}
+		for (f = file_list; f != NULL; f = f->next)
+			logx(0, "%s: not closed", f->name);
 		panic();
 	}
 	log_sync = 1;

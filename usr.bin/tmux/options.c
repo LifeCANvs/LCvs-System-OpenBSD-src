@@ -1,4 +1,4 @@
-/* $OpenBSD: options.c,v 1.69 2022/06/17 07:28:05 nicm Exp $ */
+/* $OpenBSD: options.c,v 1.76 2025/03/24 20:01:03 nicm Exp $ */
 
 /*
  * Copyright (c) 2008 Nicholas Marriott <nicholas.marriott@gmail.com>
@@ -260,6 +260,7 @@ options_default(struct options *oo, const struct options_table_entry *oe)
 	struct options_entry	*o;
 	union options_value	*ov;
 	u_int			 i;
+	struct cmd_parse_result	*pr;
 
 	o = options_empty(oo, oe);
 	ov = &o->value;
@@ -277,6 +278,17 @@ options_default(struct options *oo, const struct options_table_entry *oe)
 	switch (oe->type) {
 	case OPTIONS_TABLE_STRING:
 		ov->string = xstrdup(oe->default_str);
+		break;
+	case OPTIONS_TABLE_COMMAND:
+		pr = cmd_parse_from_string(oe->default_str, NULL);
+		switch (pr->status) {
+		case CMD_PARSE_ERROR:
+			free(pr->error);
+			break;
+		case CMD_PARSE_SUCCESS:
+			ov->cmdlist = pr->cmdlist;
+			break;
+		}
 		break;
 	default:
 		ov->number = oe->default_num;
@@ -578,10 +590,28 @@ char *
 options_to_string(struct options_entry *o, int idx, int numeric)
 {
 	struct options_array_item	*a;
+	char				*result = NULL;
+	char				*last = NULL;
+	char				*next;
 
 	if (OPTIONS_IS_ARRAY(o)) {
-		if (idx == -1)
-			return (xstrdup(""));
+		if (idx == -1) {
+			RB_FOREACH(a, options_array, &o->value.array) {
+				next = options_value_to_string(o, &a->value,
+				    numeric);
+				if (last == NULL)
+					result = next;
+				else {
+					xasprintf(&result, "%s %s", last, next);
+					free(last);
+					free(next);
+				}
+				last = result;
+			}
+			if (result == NULL)
+				return (xstrdup(""));
+			return (result);
+		}
 		a = options_array_item(o, idx);
 		if (a == NULL)
 			return (xstrdup(""));
@@ -719,6 +749,19 @@ options_get_number(struct options *oo, const char *name)
 	return (o->value.number);
 }
 
+const struct cmd_list *
+options_get_command(struct options *oo, const char *name)
+{
+	struct options_entry	*o;
+
+	o = options_get(oo, name);
+	if (o == NULL)
+		fatalx("missing option %s", name);
+	if (!OPTIONS_IS_COMMAND(o))
+		fatalx("option %s is not a command", name);
+	return (o->value.cmdlist);
+}
+
 struct options_entry *
 options_set_string(struct options *oo, const char *name, int append,
     const char *fmt, ...)
@@ -777,6 +820,30 @@ options_set_number(struct options *oo, const char *name, long long value)
 	if (!OPTIONS_IS_NUMBER(o))
 		fatalx("option %s is not a number", name);
 	o->value.number = value;
+	return (o);
+}
+
+struct options_entry *
+options_set_command(struct options *oo, const char *name,
+    struct cmd_list *value)
+{
+	struct options_entry	*o;
+
+	if (*name == '@')
+		fatalx("user option %s must be a string", name);
+
+	o = options_get_only(oo, name);
+	if (o == NULL) {
+		o = options_default(oo, options_parent_table_entry(oo, name));
+		if (o == NULL)
+			return (NULL);
+	}
+
+	if (!OPTIONS_IS_COMMAND(o))
+		fatalx("option %s is not a command", name);
+	if (o->value.cmdlist != NULL)
+		cmd_list_free(o->value.cmdlist);
+	o->value.cmdlist = value;
 	return (o);
 }
 
@@ -1036,6 +1103,7 @@ options_from_string(struct options *oo, const struct options_table_entry *oe,
 	const char		*errstr, *new;
 	char			*old;
 	key_code		 key;
+	struct cmd_parse_result	*pr;
 
 	if (oe != NULL) {
 		if (value == NULL &&
@@ -1094,6 +1162,15 @@ options_from_string(struct options *oo, const struct options_table_entry *oe,
 	case OPTIONS_TABLE_CHOICE:
 		return (options_from_string_choice(oe, oo, name, value, cause));
 	case OPTIONS_TABLE_COMMAND:
+		pr = cmd_parse_from_string(value, NULL);
+		switch (pr->status) {
+		case CMD_PARSE_ERROR:
+			*cause = pr->error;
+			return (-1);
+		case CMD_PARSE_SUCCESS:
+			options_set_command(oo, name, pr->cmdlist);
+			return (0);
+		}
 		break;
 	}
 	return (-1);
@@ -1147,16 +1224,30 @@ options_push_changes(const char *name)
 	if (strcmp(name, "window-style") == 0 ||
 	    strcmp(name, "window-active-style") == 0) {
 		RB_FOREACH(wp, window_pane_tree, &all_window_panes)
-			wp->flags |= PANE_STYLECHANGED;
+			wp->flags |= (PANE_STYLECHANGED|PANE_THEMECHANGED);
 	}
 	if (strcmp(name, "pane-colours") == 0) {
 		RB_FOREACH(wp, window_pane_tree, &all_window_panes)
 			colour_palette_from_option(&wp->palette, wp->options);
 	}
-	if (strcmp(name, "pane-border-status") == 0) {
+	if (strcmp(name, "pane-border-status") == 0 ||
+	    strcmp(name, "pane-scrollbars") == 0 ||
+	    strcmp(name, "pane-scrollbars-position") == 0) {
 		RB_FOREACH(w, windows, &windows)
 			layout_fix_panes(w, NULL);
 	}
+	if (strcmp(name, "pane-scrollbars-style") == 0) {
+		RB_FOREACH(wp, window_pane_tree, &all_window_panes) {
+			style_set_scrollbar_style_from_option(
+			    &wp->scrollbar_style, wp->options);
+		}
+		RB_FOREACH(w, windows, &windows)
+			layout_fix_panes(w, NULL);
+	}
+	if (strcmp(name, "codepoint-widths") == 0)
+		utf8_update_width_cache();
+	if (strcmp(name, "input-buffer-size") == 0)
+		input_set_buffer_size(options_get_number(global_options, name));
 	RB_FOREACH(s, sessions, &sessions)
 		status_update_cache(s);
 

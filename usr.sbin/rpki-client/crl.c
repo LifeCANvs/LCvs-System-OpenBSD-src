@@ -1,5 +1,6 @@
-/*	$OpenBSD: crl.c,v 1.37 2024/06/05 13:36:28 tb Exp $ */
+/*	$OpenBSD: crl.c,v 1.44 2025/02/28 13:46:09 tb Exp $ */
 /*
+ * Copyright (c) 2024 Theo Buehler <tb@openbsd.org>
  * Copyright (c) 2019 Kristaps Dzonsons <kristaps@bsd.lv>
  *
  * Permission to use, copy, modify, and distribute this software for any
@@ -25,30 +26,37 @@
 #include "extern.h"
 
 /*
- * Check that the CRL number extension is present and that it is non-critical.
+ * Check CRL Number is present, non-critical and in [0, 2^159-1].
  * Otherwise ignore it per draft-spaghetti-sidrops-rpki-crl-numbers.
  */
 static int
-crl_has_crl_number(const char *fn, const X509_CRL *x509_crl)
+crl_check_crl_number(const char *fn, const X509_CRL *x509_crl)
 {
-	const X509_EXTENSION	*ext;
-	int			 idx;
+	ASN1_INTEGER		*aint = NULL;
+	int			 crit;
+	int			 ret = 0;
 
-	if ((idx = X509_CRL_get_ext_by_NID(x509_crl, NID_crl_number, -1)) < 0) {
-		warnx("%s: RFC 6487, section 5: missing CRL number", fn);
-		return 0;
+	aint = X509_CRL_get_ext_d2i(x509_crl, NID_crl_number, &crit, NULL);
+	if (aint == NULL) {
+		if (crit != -1)
+			warnx("%s: RFC 6487, section 5: "
+			    "failed to parse CRL number", fn);
+		else
+			warnx("%s: RFC 6487, section 5: missing CRL number",
+			    fn);
+		goto out;
 	}
-	if ((ext = X509_CRL_get_ext(x509_crl, idx)) == NULL) {
-		warnx("%s: RFC 6487, section 5: failed to get CRL number", fn);
-		return 0;
-	}
-	if (X509_EXTENSION_get_critical(ext) != 0) {
+	if (crit != 0) {
 		warnx("%s: RFC 6487, section 5: CRL number not non-critical",
 		    fn);
-		return 0;
+		goto out;
 	}
 
-	return 1;
+	ret = x509_valid_seqnum(fn, "CRL number", aint);
+
+ out:
+	ASN1_INTEGER_free(aint);
+	return ret;
 }
 
 /*
@@ -131,6 +139,7 @@ crl_check_revoked(const char *fn, X509_CRL *x509_crl)
 		 * XXX - as of May 2024, ~15% of RPKI CRLs fail this check due
 		 * to a bug in rpki-rs/Krill. So silently accept this for now.
 		 * https://github.com/NLnetLabs/krill/issues/1197
+		 * https://github.com/NLnetLabs/rpki-rs/pull/295
 		 */
 		if (verbose > 1)
 			warnx("%s: RFC 5280, section 5.1.2.6: revoked "
@@ -165,9 +174,7 @@ crl_parse(const char *fn, const unsigned char *der, size_t len)
 {
 	const unsigned char	*oder;
 	struct crl		*crl;
-	const X509_ALGOR	*palg;
 	const X509_NAME		*name;
-	const ASN1_OBJECT	*cobj;
 	const ASN1_TIME		*at;
 	int			 count, nid, rc = 0;
 
@@ -200,13 +207,10 @@ crl_parse(const char *fn, const unsigned char *der, size_t len)
 	if (!x509_valid_name(fn, "issuer", name))
 		goto out;
 
-	X509_CRL_get0_signature(crl->x509_crl, NULL, &palg);
-	if (palg == NULL) {
-		warnx("%s: X509_CRL_get0_signature", fn);
+	if ((nid = X509_CRL_get_signature_nid(crl->x509_crl)) == NID_undef) {
+		warnx("%s: unknown signature type", fn);
 		goto out;
 	}
-	X509_ALGOR_get0(&cobj, NULL, NULL, palg);
-	nid = OBJ_obj2nid(cobj);
 	if (experimental && nid == NID_ecdsa_with_SHA256) {
 		if (verbose)
 			warnx("%s: P-256 support is experimental", fn);
@@ -225,7 +229,7 @@ crl_parse(const char *fn, const unsigned char *der, size_t len)
 		    "%d != 2", fn, count);
 		goto out;
 	}
-	if (!crl_has_crl_number(fn, crl->x509_crl))
+	if (!crl_check_crl_number(fn, crl->x509_crl))
 		goto out;
 	if ((crl->aki = crl_get_aki(fn, crl->x509_crl)) == NULL)
 		goto out;
@@ -292,13 +296,14 @@ crlcmp(struct crl *a, struct crl *b)
 RB_GENERATE_STATIC(crl_tree, crl, entry, crlcmp);
 
 /*
- * Find a CRL based on the auth SKI value.
+ * Find a CRL based on the auth SKI value and manifest path.
  */
 struct crl *
 crl_get(struct crl_tree *crlt, const struct auth *a)
 {
 	struct crl	find;
 
+	/* XXX - this should be removed, but filemode relies on it. */
 	if (a == NULL)
 		return NULL;
 

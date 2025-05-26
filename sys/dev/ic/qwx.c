@@ -1,4 +1,4 @@
-/*	$OpenBSD: qwx.c,v 1.62 2024/05/29 07:24:26 stsp Exp $	*/
+/*	$OpenBSD: qwx.c,v 1.75 2025/04/26 19:59:46 stsp Exp $	*/
 
 /*
  * Copyright 2023 Stefan Sperling <stsp@openbsd.org>
@@ -158,6 +158,9 @@ int qwx_wmi_vdev_install_key(struct qwx_softc *,
 int qwx_dp_peer_rx_pn_replay_config(struct qwx_softc *, struct qwx_vif *,
     struct ieee80211_node *, struct ieee80211_key *, int);
 void qwx_setkey_clear(struct qwx_softc *);
+void qwx_vif_free_all(struct qwx_softc *);
+void qwx_dp_stop_shadow_timers(struct qwx_softc *);
+void qwx_ce_stop_shadow_timers(struct qwx_softc *);
 
 int qwx_scan(struct qwx_softc *);
 void qwx_scan_abort(struct qwx_softc *);
@@ -172,7 +175,8 @@ qwx_node_alloc(struct ieee80211com *ic)
 	struct qwx_node *nq;
 
 	nq = malloc(sizeof(struct qwx_node), M_DEVBUF, M_NOWAIT | M_ZERO);
-	nq->peer.peer_id = HAL_INVALID_PEERID;
+	if (nq != NULL)
+		nq->peer.peer_id = HAL_INVALID_PEERID;
 	return (struct ieee80211_node *)nq;
 }
 
@@ -320,6 +324,8 @@ qwx_stop(struct ifnet *ifp)
 	rw_assert_wrlock(&sc->ioctl_rwl);
 
 	timeout_del(&sc->mon_reap_timer);
+	qwx_dp_stop_shadow_timers(sc);
+	qwx_ce_stop_shadow_timers(sc);
 
 	/* Disallow new tasks. */
 	set_bit(ATH11K_FLAG_CRASH_FLUSH, sc->sc_flags);
@@ -332,21 +338,39 @@ qwx_stop(struct ifnet *ifp)
 
 	qwx_setkey_clear(sc);
 
-	clear_bit(ATH11K_FLAG_CRASH_FLUSH, sc->sc_flags);
-
 	ifp->if_timer = sc->sc_tx_timer = 0;
 
 	ifp->if_flags &= ~IFF_RUNNING;
 	ifq_clr_oactive(&ifp->if_snd);
 
-	sc->sc_newstate(ic, IEEE80211_S_INIT, -1);
-	sc->ns_nstate = IEEE80211_S_INIT;
+	clear_bit(ATH11K_FLAG_CRASH_FLUSH, sc->sc_flags);
+
+	/*
+	 * Manually run the newstate task's code for switching to INIT state.
+	 * This reconfigures firmware state to stop scanning, or disassociate
+	 * from our current AP, and/or stop the VIF, etc.
+	 */
+	if (ic->ic_state != IEEE80211_S_INIT) {
+		sc->ns_nstate = IEEE80211_S_INIT;
+		sc->ns_arg = -1; /* do not send management frames */
+		refcnt_init(&sc->task_refs);
+		refcnt_take(&sc->task_refs);
+		qwx_newstate_task(sc);
+		if (ic->ic_state != IEEE80211_S_INIT) { /* task code failed */
+			task_del(systq, &sc->init_task);
+			sc->sc_newstate(ic, IEEE80211_S_INIT, -1);
+		}
+		refcnt_finalize(&sc->task_refs, "qwxstop");
+	}
+
 	sc->scan.state = ATH11K_SCAN_IDLE;
 	sc->vdev_id_11d_scan = QWX_11D_INVALID_VDEV_ID;
 	sc->pdevs_active = 0;
 
 	/* power off hardware */
 	qwx_core_deinit(sc);
+
+	qwx_vif_free_all(sc);
 
 	splx(s);
 }
@@ -822,6 +846,10 @@ qwx_newstate(struct ieee80211com *ic, enum ieee80211_state nstate, int arg)
 	struct ifnet *ifp = &ic->ic_if;
 	struct qwx_softc *sc = ifp->if_softc;
 
+	/* We may get triggered by received frames during qwx_stop(). */
+	if (!(ifp->if_flags & IFF_RUNNING))
+		return 0;
+
 	/*
 	 * Prevent attempts to transition towards the same state, unless
 	 * we are scanning in which case a SCAN -> SCAN transition
@@ -895,6 +923,9 @@ qwx_newstate_task(void *arg)
 			}
 			/* FALLTHROUGH */
 		case IEEE80211_S_SCAN:
+			if (nstate < IEEE80211_S_SCAN)
+				qwx_scan_abort(sc);
+			break;
 		case IEEE80211_S_INIT:
 			break;
 		}
@@ -950,7 +981,8 @@ out:
 			task_add(systq, &sc->init_task);
 		else
 			sc->sc_newstate(ic, nstate, sc->ns_arg);
-	}
+	} else if (err == 0)
+		sc->sc_newstate(ic, nstate, sc->ns_arg);
 	refcnt_rele_wake(&sc->task_refs);
 	splx(s);
 }
@@ -3998,6 +4030,97 @@ static const struct ath11k_hw_params ath11k_hw_params[] = {
 		.smp2p_wow_exit = true,
 #endif
 	},
+	{
+		.name = "qca2066 hw2.1",
+		.hw_rev = ATH11K_HW_QCA2066_HW21,
+		.fw = {
+			.dir = "qca2066-hw2.1",
+			.board_size = 256 * 1024,
+			.cal_offset = 128 * 1024,
+		},
+		.max_radios = 3,
+		.bdf_addr = 0x4B0C0000,
+		.hw_ops = &wcn6855_ops,
+		.ring_mask = &ath11k_hw_ring_mask_qca6390,
+		.internal_sleep_clock = true,
+		.regs = &wcn6855_regs,
+		.qmi_service_ins_id = ATH11K_QMI_WLFW_SERVICE_INS_ID_V01_QCA6390,
+		.host_ce_config = qwx_host_ce_config_qca6390,
+		.ce_count = QWX_CE_COUNT_QCA6390,
+		.target_ce_config = ath11k_target_ce_config_wlan_qca6390,
+		.target_ce_count = 9,
+		.svc_to_ce_map = ath11k_target_service_to_ce_map_wlan_qca6390,
+		.svc_to_ce_map_len = 14,
+		.single_pdev_only = true,
+		.rxdma1_enable = false,
+		.num_rxmda_per_pdev = 2,
+		.rx_mac_buf_ring = true,
+		.vdev_start_delay = true,
+		.htt_peer_map_v2 = false,
+#if notyet
+		.spectral = {
+			.fft_sz = 0,
+			.fft_pad_sz = 0,
+			.summary_pad_sz = 0,
+			.fft_hdr_len = 0,
+			.max_fft_bins = 0,
+			.fragment_160mhz = false,
+		},
+
+		.interface_modes = BIT(NL80211_IFTYPE_STATION) |
+					BIT(NL80211_IFTYPE_AP),
+		.supports_monitor = false,
+		.full_monitor_mode = false,
+#endif
+		.supports_shadow_regs = true,
+		.idle_ps = true,
+		.supports_sta_ps = true,
+		.cold_boot_calib = false,
+		.cbcal_restart_fw = false,
+		.fw_mem_mode = 0,
+		.num_vdevs = 16 + 1,
+		.num_peers = 512,
+		.supports_suspend = true,
+		.hal_desc_sz = sizeof(struct hal_rx_desc_wcn6855),
+		.supports_regdb = true,
+		.fix_l1ss = false,
+		.credit_flow = true,
+		.max_tx_ring = DP_TCL_NUM_RING_MAX_QCA6390,
+		.hal_params = &ath11k_hw_hal_params_qca6390,
+#if notyet
+		.supports_dynamic_smps_6ghz = false,
+		.alloc_cacheable_memory = false,
+		.supports_rssi_stats = true,
+#endif
+		.fw_wmi_diag_event = true,
+		.current_cc_support = true,
+		.dbr_debug_support = false,
+		.global_reset = true,
+#ifdef notyet
+		.bios_sar_capa = &ath11k_hw_sar_capa_wcn6855,
+#endif
+		.m3_fw_support = true,
+		.fixed_bdf_addr = false,
+		.fixed_mem_region = false,
+		.static_window_map = false,
+		.hybrid_bus_type = false,
+		.fixed_fw_mem = false,
+#if notyet
+		.support_off_channel_tx = true,
+		.supports_multi_bssid = true,
+
+		.sram_dump = {
+			.start = 0x01400000,
+			.end = 0x0177ffff,
+		},
+
+		.tcl_ring_retry = true,
+#endif
+		.tx_ring_size = DP_TCL_DATA_RING_SIZE,
+#ifdef notyet
+		.smp2p_wow_exit = false,
+#endif
+	},
 };
 
 const struct ath11k_hw_regs ipq8074_regs = {
@@ -6687,7 +6810,7 @@ qwx_qmi_decode_msg(struct qwx_softc *sc, void *output, size_t output_len,
 
 			/* Related EIs must have the same type. */
 			if (ei->tlv_type != elem_type) {
-				printf("%s: unexepected element type 0x%x; "
+				printf("%s: unexpected element type 0x%x; "
 				    "expected 0x%x\n", __func__,
 				    ei->tlv_type, elem_type);
 				return -1;
@@ -7467,7 +7590,7 @@ qwx_qrtr_recv_msg(struct qwx_softc *sc, struct mbuf *m)
 		qwx_qrtr_resume_tx(sc);
 }
 
-// Not needed because we don't implenent QMI as a network service.
+// Not needed because we don't implement QMI as a network service.
 #define qwx_qmi_init_service(sc)	(0)
 #define qwx_qmi_deinit_service(sc)	(0)
 
@@ -8235,6 +8358,33 @@ qwx_qmi_mem_seg_send(struct qwx_softc *sc)
 }
 
 int
+qwx_loadfirmware(struct qwx_softc *sc, int type, const char *filename,
+    u_char **data, size_t *len)
+{
+	char path[PATH_MAX];
+	int ret;
+
+	if (!sc->fw_img[type].data) {
+		ret = snprintf(path, sizeof(path), "%s-%s-%s",
+		    ATH11K_FW_DIR, sc->hw_params.fw.dir, filename);
+		if (ret < 0 || ret >= sizeof(path))
+			return ENOSPC;
+
+		ret = loadfirmware(path, &sc->fw_img[type].data,
+		    &sc->fw_img[type].size);
+		if (ret) {
+			printf("%s: could not read %s (error %d)\n",
+			    sc->sc_dev.dv_xname, path, ret);
+			return ret;
+		}
+	}
+
+	*data = sc->fw_img[type].data;
+	*len = sc->fw_img[type].size;
+	return 0;
+}
+
+int
 qwx_core_check_smbios(struct qwx_softc *sc)
 {
 	return 0; /* TODO */
@@ -8322,9 +8472,15 @@ qwx_qmi_request_device_info(struct qwx_softc *sc)
 	return -1;
 }
 
+enum ath11k_bdf_name_type {
+	ATH11K_BDF_NAME_FULL,
+	ATH11K_BDF_NAME_BUS_NAME,
+	ATH11K_BDF_NAME_CHIP_ID
+};
+
 int
 _qwx_core_create_board_name(struct qwx_softc *sc, char *name,
-    size_t name_len, int with_variant, int bus_type_mode)
+    size_t name_len, int with_variant, enum ath11k_bdf_name_type name_type)
 {
 	/* strlen(',variant=') + strlen(ab->qmi.target.bdf_ext) */
 	char variant[9 + ATH11K_QMI_BDF_EXT_STR_LENGTH] = { 0 };
@@ -8335,9 +8491,8 @@ _qwx_core_create_board_name(struct qwx_softc *sc, char *name,
 
 	switch (sc->id.bdf_search) {
 	case ATH11K_BDF_SEARCH_BUS_AND_BOARD:
-		if (bus_type_mode)
-			snprintf(name, name_len, "bus=%s", sc->sc_bus_str);
-		else
+		switch (name_type) {
+		case ATH11K_BDF_NAME_FULL:
 			snprintf(name, name_len,
 			    "bus=%s,vendor=%04x,device=%04x,"
 			    "subsystem-vendor=%04x,subsystem-device=%04x,"
@@ -8346,6 +8501,15 @@ _qwx_core_create_board_name(struct qwx_softc *sc, char *name,
 			    sc->id.subsystem_vendor, sc->id.subsystem_device,
 			    sc->qmi_target.chip_id, sc->qmi_target.board_id,
 			    variant);
+			break;
+		case ATH11K_BDF_NAME_BUS_NAME:
+			snprintf(name, name_len, "bus=%s", sc->sc_bus_str);
+			break;
+		case ATH11K_BDF_NAME_CHIP_ID:
+			snprintf(name, name_len, "bus=%s,qmi-chip-id=%d",
+			    sc->sc_bus_str, sc->qmi_target.chip_id);
+			break;
+		}
 		break;
 	default:
 		snprintf(name, name_len,
@@ -8363,21 +8527,32 @@ _qwx_core_create_board_name(struct qwx_softc *sc, char *name,
 int
 qwx_core_create_board_name(struct qwx_softc *sc, char *name, size_t name_len)
 {
-	return _qwx_core_create_board_name(sc, name, name_len, 1, 0);
+	return _qwx_core_create_board_name(sc, name, name_len, 1,
+	    ATH11K_BDF_NAME_FULL);
 }
 
 int
 qwx_core_create_fallback_board_name(struct qwx_softc *sc, char *name,
     size_t name_len)
 {
-	return _qwx_core_create_board_name(sc, name, name_len, 0, 0);
+	return _qwx_core_create_board_name(sc, name, name_len, 0,
+	    ATH11K_BDF_NAME_FULL);
 }
 
 int
 qwx_core_create_bus_type_board_name(struct qwx_softc *sc, char *name,
     size_t name_len)
 {
-	return _qwx_core_create_board_name(sc, name, name_len, 0, 1);
+	return _qwx_core_create_board_name(sc, name, name_len, 0,
+	    ATH11K_BDF_NAME_BUS_NAME);
+}
+
+int
+qwx_core_create_chip_id_board_name(struct qwx_softc *sc, char *name,
+    size_t name_len)
+{
+	return _qwx_core_create_board_name(sc, name, name_len, 0,
+	    ATH11K_BDF_NAME_CHIP_ID);
 }
 
 struct ath11k_fw_ie {
@@ -8570,7 +8745,7 @@ next:
 
 out:
 	if (!*boardfw || !*boardfw_len) {
-		printf("%s: failed to fetch %s for %s from %s\n",
+		DPRINTF("%s: failed to fetch %s for %s from %s\n",
 		    __func__, qwx_bd_ie_type_str(ie_id_match),
 		    boardname, filename);
 		return ENOENT;
@@ -8580,17 +8755,81 @@ out:
 }
 
 int
-qwx_core_fetch_bdf(struct qwx_softc *sc, u_char **data, size_t *len,
-    const u_char **boardfw, size_t *boardfw_len, const char *filename)
+qwx_core_fetch_bdf(struct qwx_softc *sc, const u_char **boardfw,
+    size_t *boardfw_len)
 {
-	char path[PATH_MAX];
-	char boardname[200];
+	char boardname[200], fallback_boardname[200], chip_id_boardname[200];
+	u_char *data;
+	size_t len;
 	int ret;
 
-	ret = snprintf(path, sizeof(path), "%s-%s-%s",
-	    ATH11K_FW_DIR, sc->hw_params.fw.dir, filename);
-	if (ret < 0 || ret >= sizeof(path))
-		return ENOSPC;
+	ret = qwx_loadfirmware(sc, QWX_FW_BOARD, ATH11K_BOARD_API2_FILE,
+	    &data, &len);
+	if (ret) {
+		printf("%s: could not read %s (error %d)\n",
+		    sc->sc_dev.dv_xname, ATH11K_BOARD_API2_FILE, ret);
+		return ret;
+	}
+
+	ret = qwx_core_create_board_name(sc, boardname, sizeof(boardname));
+	if (ret) {
+		printf("%s: ailed to create board name: %d\n",
+		    sc->sc_dev.dv_xname, ret);
+		return ret;
+	}
+
+	ret = qwx_core_fetch_board_data_api_n(sc, boardfw, boardfw_len, data,
+	    len, boardname, ATH11K_BD_IE_BOARD, ATH11K_BD_IE_BOARD_NAME,
+	    ATH11K_BD_IE_BOARD_DATA);
+	if (!ret)
+		return 0;
+
+	ret = qwx_core_create_fallback_board_name(sc, fallback_boardname,
+	    sizeof(fallback_boardname));
+	if (ret) {
+		printf("%s: failed to create fallback board name: %d\n",
+		    sc->sc_dev.dv_xname, ret);
+		return ret;
+	}
+
+	ret = qwx_core_fetch_board_data_api_n(sc, boardfw, boardfw_len, data,
+	    len, fallback_boardname, ATH11K_BD_IE_BOARD,
+	    ATH11K_BD_IE_BOARD_NAME, ATH11K_BD_IE_BOARD_DATA);
+	if (!ret)
+		return 0;
+
+	ret = qwx_core_create_chip_id_board_name(sc, chip_id_boardname,
+	    sizeof(chip_id_boardname));
+	if (ret) {
+		printf("%s: failed to create chip id board name: %d\n",
+		    sc->sc_dev.dv_xname, ret);
+		return ret;
+	}
+
+	ret = qwx_core_fetch_board_data_api_n(sc, boardfw, boardfw_len, data,
+	    len, chip_id_boardname, ATH11K_BD_IE_BOARD,
+	    ATH11K_BD_IE_BOARD_NAME, ATH11K_BD_IE_BOARD_DATA);
+	if (!ret)
+		return 0;
+
+	DPRINTF("%s: failed to fetch board data for %s from %s\n",
+	    sc->sc_dev.dv_xname, boardname, path);
+	return ret;
+}
+
+int
+qwx_core_fetch_regdb(struct qwx_softc *sc, const u_char **boardfw,
+    size_t *boardfw_len)
+{
+	char boardname[200], default_boardname[200];
+	u_char *data;
+	size_t len;
+	int ret;
+
+	ret = qwx_loadfirmware(sc, QWX_FW_BOARD, ATH11K_BOARD_API2_FILE,
+	    &data, &len);
+	if (ret)
+		return ret;
 
 	ret = qwx_core_create_board_name(sc, boardname, sizeof(boardname));
 	if (ret) {
@@ -8599,23 +8838,29 @@ qwx_core_fetch_bdf(struct qwx_softc *sc, u_char **data, size_t *len,
 		return ret;
 	}
 
-	ret = loadfirmware(path, data, len);
+	ret = qwx_core_fetch_board_data_api_n(sc, boardfw, boardfw_len, data,
+	    len, boardname, ATH11K_BD_IE_REGDB, ATH11K_BD_IE_REGDB_NAME,
+	    ATH11K_BD_IE_REGDB_DATA);
+	if (!ret)
+		return 0;
+
+	ret = qwx_core_create_bus_type_board_name(sc, default_boardname,
+	    sizeof(default_boardname));
 	if (ret) {
-		printf("%s: could not read %s (error %d)\n",
-		    sc->sc_dev.dv_xname, path, ret);
+		DPRINTF("%s: failed to create board name: %d",
+		    sc->sc_dev.dv_xname, ret);
 		return ret;
 	}
 
 	ret = qwx_core_fetch_board_data_api_n(sc, boardfw, boardfw_len,
-	    *data, *len, boardname, ATH11K_BD_IE_BOARD,
-	    ATH11K_BD_IE_BOARD_NAME, ATH11K_BD_IE_BOARD_DATA);
-	if (ret) {
-		DPRINTF("%s: failed to fetch board data for %s from %s\n",
-		    sc->sc_dev.dv_xname, boardname, path);
-		return ret;
-	}
+	    data, len, default_boardname, ATH11K_BD_IE_REGDB,
+	    ATH11K_BD_IE_REGDB_NAME, ATH11K_BD_IE_REGDB_DATA);
+	if (!ret)
+		return 0;
 
-	return 0;
+	DPRINTF("%s: failed to fetch regdb data for %s from %s\n",
+	    sc->sc_dev.dv_xname, boardname, path);
+	return ret;
 }
 
 int
@@ -8743,35 +8988,23 @@ err_free_req:
 int
 qwx_qmi_load_bdf_qmi(struct qwx_softc *sc, int regdb)
 {
-	u_char *data = NULL;
 	const u_char *boardfw;
-	size_t len = 0, boardfw_len;
+	size_t boardfw_len;
 	uint32_t fw_size;
 	int ret = 0, bdf_type;
-#ifdef notyet
-	const uint8_t *tmp;
-	uint32_t file_type;
-#endif
-	int fw_idx = regdb ? QWX_FW_REGDB : QWX_FW_BOARD;
 
-	if (sc->fw_img[fw_idx].data) {
-		boardfw = sc->fw_img[fw_idx].data;
-		boardfw_len = sc->fw_img[fw_idx].size;
+	if (regdb) {
+		ret = qwx_core_fetch_regdb(sc, &boardfw, &boardfw_len);
 	} else {
-		ret = qwx_core_fetch_bdf(sc, &data, &len,
-		    &boardfw, &boardfw_len,
-		    regdb ? ATH11K_REGDB_FILE : ATH11K_BOARD_API2_FILE);
+		ret = qwx_core_fetch_bdf(sc, &boardfw, &boardfw_len);
 		if (ret)
-			return ret;
-
-		sc->fw_img[fw_idx].data = malloc(boardfw_len, M_DEVBUF,
-		    M_NOWAIT);
-		if (sc->fw_img[fw_idx].data) {
-			memcpy(sc->fw_img[fw_idx].data, boardfw, boardfw_len);
-			sc->fw_img[fw_idx].size = boardfw_len;
-		}
+			printf("%s: qmi failed to fetch board file: %d\n",
+			    sc->sc_dev.dv_xname, ret);
 	}
 
+	if (ret)
+		goto out;
+		
 	if (regdb)
 		bdf_type = ATH11K_QMI_BDF_TYPE_REGDB;
 	else if (boardfw_len >= QWX_SELFMAG &&
@@ -8842,7 +9075,6 @@ out_qmi_cal:
 		release_firmware(fw_entry);
 #endif
 out:
-	free(data, M_DEVBUF, len);
 	if (ret == 0)
 		DPRINTF("%s: BDF download sequence completed\n", __func__);
 
@@ -8886,28 +9118,11 @@ qwx_qmi_m3_load(struct qwx_softc *sc)
 {
 	u_char *data;
 	size_t len;
-	char path[PATH_MAX];
 	int ret;
 
-	if (sc->fw_img[QWX_FW_M3].data) {
-		data = sc->fw_img[QWX_FW_M3].data;
-		len = sc->fw_img[QWX_FW_M3].size;
-	} else {
-		ret = snprintf(path, sizeof(path), "%s-%s-%s",
-		    ATH11K_FW_DIR, sc->hw_params.fw.dir, ATH11K_M3_FILE);
-		if (ret < 0 || ret >= sizeof(path))
-			return ENOSPC;
-
-		ret = loadfirmware(path, &data, &len);
-		if (ret) {
-			printf("%s: could not read %s (error %d)\n",
-			    sc->sc_dev.dv_xname, path, ret);
-			return ret;
-		}
-
-		sc->fw_img[QWX_FW_M3].data = data;
-		sc->fw_img[QWX_FW_M3].size = len;
-	}
+	ret = qwx_loadfirmware(sc, QWX_FW_M3, ATH11K_M3_FILE, &data, &len);
+	if (ret)
+		return ret;
 
 	if (sc->m3_mem == NULL || QWX_DMA_LEN(sc->m3_mem) < len) {
 		if (sc->m3_mem)
@@ -12765,7 +12980,6 @@ qwx_wmi_event_scan_start_failed(struct qwx_softc *sc)
 		    qwx_scan_state_str(sc->scan.state), sc->scan.state);
 		break;
 	case ATH11K_SCAN_STARTING:
-		wakeup(&sc->scan.state);
 		qwx_mac_scan_finish(sc);
 		break;
 	}
@@ -14257,7 +14471,7 @@ qwx_dp_htt_htc_tx_complete(struct qwx_softc *sc, struct mbuf *m)
 static inline void
 qwx_dp_get_mac_addr(uint32_t addr_l32, uint16_t addr_h16, uint8_t *addr)
 {
-#if 0 /* Not needed on OpenBSD? We do swapping in sofware... */
+#if 0 /* Not needed on OpenBSD? We do swapping in software... */
 	if (IS_ENABLED(CONFIG_CPU_BIG_ENDIAN)) {
 		addr_l32 = swab32(addr_l32);
 		addr_h16 = swab16(addr_h16);
@@ -15267,6 +15481,16 @@ config_refill_ring:
 }
 
 void
+qwx_dp_mon_link_free(struct qwx_softc *sc)
+{
+	struct qwx_pdev_dp *dp = &sc->pdev_dp;
+	struct qwx_mon_data *pmon = &dp->mon_data;
+
+	qwx_dp_link_desc_cleanup(sc, pmon->link_desc_banks,
+	    HAL_RXDMA_MONITOR_DESC, &dp->rxdma_mon_desc_ring);
+}
+
+void
 qwx_dp_pdev_free(struct qwx_softc *sc)
 {
 	int i;
@@ -15275,6 +15499,8 @@ qwx_dp_pdev_free(struct qwx_softc *sc)
 
 	for (i = 0; i < sc->num_radios; i++)
 		qwx_dp_rx_pdev_free(sc, i);
+	
+	qwx_dp_mon_link_free(sc);
 }
 
 int
@@ -15871,7 +16097,7 @@ qwx_dp_process_rx_err_buf(struct qwx_softc *sc, uint32_t *ring_desc,
 }
 
 int
-qwx_dp_process_rx_err(struct qwx_softc *sc)
+qwx_dp_process_rx_err(struct qwx_softc *sc, int purge)
 {
 	struct ieee80211com *ic = &sc->sc_ic;
 	struct ifnet *ifp = &ic->ic_if;
@@ -15890,7 +16116,7 @@ qwx_dp_process_rx_err(struct qwx_softc *sc)
 	uint64_t paddr;
 	uint32_t *desc;
 	int is_frag;
-	uint8_t drop = 0;
+	uint8_t drop = purge ? 1 : 0;
 
 	tot_n_bufs_reaped = 0;
 
@@ -15962,14 +16188,17 @@ qwx_dp_process_rx_err(struct qwx_softc *sc)
 #ifdef notyet
 	spin_unlock_bh(&srng->lock);
 #endif
-	for (i = 0; i < sc->num_radios; i++) {
-		if (!n_bufs_reaped[i])
-			continue;
+	if (!purge) {
+		for (i = 0; i < sc->num_radios; i++) {
+			if (!n_bufs_reaped[i])
+				continue;
 
-		rx_ring = &sc->pdev_dp.rx_refill_buf_ring;
+			rx_ring = &sc->pdev_dp.rx_refill_buf_ring;
 
-		qwx_dp_rxbufs_replenish(sc, i, rx_ring, n_bufs_reaped[i],
-		    sc->hw_params.hal_params->rx_buf_rbm);
+			qwx_dp_rxbufs_replenish(sc, i, rx_ring,
+			    n_bufs_reaped[i],
+			    sc->hw_params.hal_params->rx_buf_rbm);
+		}
 	}
 
 	ifp->if_ierrors += tot_n_bufs_reaped;
@@ -16119,7 +16348,7 @@ qwx_dp_rx_wbm_err(struct qwx_softc *sc, struct qwx_rx_msdu *msdu,
 }
 
 int
-qwx_dp_rx_process_wbm_err(struct qwx_softc *sc)
+qwx_dp_rx_process_wbm_err(struct qwx_softc *sc, int purge)
 {
 	struct ieee80211com *ic = &sc->sc_ic;
 	struct ifnet *ifp = &ic->ic_if;
@@ -16194,6 +16423,18 @@ qwx_dp_rx_process_wbm_err(struct qwx_softc *sc)
 #endif
 	if (!total_num_buffs_reaped)
 		goto done;
+
+	if (purge) {
+		for (i = 0; i < sc->num_radios; i++) {
+			while ((msdu = TAILQ_FIRST(msdu_list))) {
+				TAILQ_REMOVE(msdu_list, msdu, entry);
+				m_freem(msdu->m);
+				msdu->m = NULL;
+			}
+		}
+
+		goto done;
+	}
 
 	for (i = 0; i < sc->num_radios; i++) {
 		if (!num_buffs_reaped[i])
@@ -16707,7 +16948,7 @@ qwx_dp_rx_process_received_packets(struct qwx_softc *sc,
 }
 
 int
-qwx_dp_process_rx(struct qwx_softc *sc, int ring_id)
+qwx_dp_process_rx(struct qwx_softc *sc, int ring_id, int purge)
 {
 	struct qwx_dp *dp = &sc->dp;
 	struct qwx_pdev_dp *pdev_dp = &sc->pdev_dp;
@@ -16819,6 +17060,16 @@ try_again:
 		if (!num_buffs_reaped[i])
 			continue;
 
+		if (purge) {
+			while ((msdu = TAILQ_FIRST(&msdu_list[i]))) {
+				TAILQ_REMOVE(msdu_list, msdu, entry);
+				m_freem(msdu->m);
+				msdu->m = NULL;
+			}
+
+			continue;
+		}
+
 		qwx_dp_rx_process_received_packets(sc, &msdu_list[i], i);
 
 		rx_ring = &sc->pdev_dp.rx_refill_buf_ring;
@@ -16886,7 +17137,7 @@ fail_free_mbuf:
 
 int
 qwx_dp_rx_reap_mon_status_ring(struct qwx_softc *sc, int mac_id,
-    struct mbuf_list *ml)
+    struct mbuf_list *ml, int purge)
 {
 	const struct ath11k_hw_hal_params *hal_params;
 	struct qwx_pdev_dp *dp;
@@ -16967,6 +17218,15 @@ qwx_dp_rx_reap_mon_status_ring(struct qwx_softc *sc, int mac_id,
 			pmon->buf_state = DP_MON_STATUS_REPLINISH;
 		}
 move_next:
+		if (purge) {
+			hal_params = sc->hw_params.hal_params;
+			qwx_hal_rx_buf_addr_info_set(rx_mon_status_desc, 0, 0,
+			    hal_params->rx_buf_rbm);
+			qwx_hal_srng_src_get_next_entry(sc, srng);
+			num_buffs_reaped++;
+			continue;
+		}
+
 		m = qwx_dp_rx_alloc_mon_status_buf(sc, rx_ring, &buf_idx);
 		if (!m) {
 			hal_params = sc->hw_params.hal_params;
@@ -17022,7 +17282,7 @@ qwx_dp_rx_process_mon_status(struct qwx_softc *sc, int mac_id)
 #endif
 	struct hal_rx_mon_ppdu_info *ppdu_info = &pmon->mon_ppdu_info;
 
-	num_buffs_reaped = qwx_dp_rx_reap_mon_status_ring(sc, mac_id, &ml);
+	num_buffs_reaped = qwx_dp_rx_reap_mon_status_ring(sc, mac_id, &ml, 0);
 	if (!num_buffs_reaped)
 		goto exit;
 
@@ -17123,7 +17383,7 @@ qwx_dp_service_mon_ring(void *arg)
 }
 
 int
-qwx_dp_process_rxdma_err(struct qwx_softc *sc, int mac_id)
+qwx_dp_process_rxdma_err(struct qwx_softc *sc, int mac_id, int purge)
 {
 	struct ieee80211com *ic = &sc->sc_ic;
 	struct ifnet *ifp = &ic->ic_if;
@@ -17195,7 +17455,7 @@ qwx_dp_process_rxdma_err(struct qwx_softc *sc, int mac_id)
 #ifdef notyet
 	spin_unlock_bh(&srng->lock);
 #endif
-	if (num_buf_freed)
+	if (num_buf_freed && !purge)
 		qwx_dp_rxbufs_replenish(sc, mac_id, rx_ring, num_buf_freed,
 		    sc->hw_params.hal_params->rx_buf_rbm);
 
@@ -17418,7 +17678,7 @@ qwx_hal_reo_update_rx_reo_queue_status(struct qwx_softc *ab, uint32_t *reo_desc,
 }
 
 int
-qwx_dp_process_reo_status(struct qwx_softc *sc)
+qwx_dp_process_reo_status(struct qwx_softc *sc, int purge)
 {
 	struct qwx_dp *dp = &sc->dp;
 	struct hal_srng *srng;
@@ -17436,7 +17696,10 @@ qwx_dp_process_reo_status(struct qwx_softc *sc)
 	qwx_hal_srng_access_begin(sc, srng);
 
 	while ((reo_desc = qwx_hal_srng_dst_get_next_entry(sc, srng))) {
-		ret = 1;
+		ret++;
+
+		if (purge)
+			continue;
 
 		tag = FIELD_GET(HAL_SRNG_TLV_HDR_TAG, *reo_desc);
 		switch (tag) {
@@ -17518,16 +17781,16 @@ qwx_dp_service_srng(struct qwx_softc *sc, int grp_id)
 	}
 
 	if (sc->hw_params.ring_mask->rx_err[grp_id] &&
-	    qwx_dp_process_rx_err(sc))
+	    qwx_dp_process_rx_err(sc, 0))
 		ret = 1;
 
 	if (sc->hw_params.ring_mask->rx_wbm_rel[grp_id] &&
-	    qwx_dp_rx_process_wbm_err(sc))
+	    qwx_dp_rx_process_wbm_err(sc, 0))
 		ret = 1;
 
 	if (sc->hw_params.ring_mask->rx[grp_id]) {
 		i = fls(sc->hw_params.ring_mask->rx[grp_id]) - 1;
-		if (qwx_dp_process_rx(sc, i))
+		if (qwx_dp_process_rx(sc, i, 0))
 			ret = 1;
 	}
 
@@ -17545,7 +17808,7 @@ qwx_dp_service_srng(struct qwx_softc *sc, int grp_id)
 	}
 
 	if (sc->hw_params.ring_mask->reo_status[grp_id] &&
-	    qwx_dp_process_reo_status(sc))
+	    qwx_dp_process_reo_status(sc, 0))
 		ret = 1;
 
 	for (i = 0; i < sc->num_radios; i++) {
@@ -17554,7 +17817,7 @@ qwx_dp_service_srng(struct qwx_softc *sc, int grp_id)
 
 			if (sc->hw_params.ring_mask->rxdma2host[grp_id] &
 			   (1 << (id))) {
-				if (qwx_dp_process_rxdma_err(sc, id))
+				if (qwx_dp_process_rxdma_err(sc, id, 0))
 					ret = 1;
 			}
 
@@ -19673,11 +19936,53 @@ err_wmi_detach:
 }
 
 void
+qwx_flush_rx_rings(struct qwx_softc *sc)
+{
+	struct mbuf_list ml = MBUF_LIST_INITIALIZER();
+	int i, j, n;
+
+	do {
+		n = qwx_dp_process_rx_err(sc, 1);
+	} while (n > 0);
+
+	do {
+		n = qwx_dp_rx_process_wbm_err(sc, 1);
+	} while (n > 0);
+
+	do {
+		n = qwx_dp_process_reo_status(sc, 1);
+	} while (n > 0);
+
+	for (i = 0; i < DP_REO_DST_RING_MAX; i++) {
+		do {
+			n = qwx_dp_process_rx(sc, i, 1);
+		} while (n > 0);
+	}
+
+	for (i = 0; i < sc->num_radios; i++) {
+		for (j = 0; j < sc->hw_params.num_rxmda_per_pdev; j++) {
+			int mac_id = i * sc->hw_params.num_rxmda_per_pdev + j;
+
+			do {
+				n = qwx_dp_process_rxdma_err(sc, mac_id, 1);
+			} while (n > 0);
+			do {
+				n = qwx_dp_rx_reap_mon_status_ring(sc,
+				    mac_id, &ml, 1);
+				ml_purge(&ml);
+			} while (n > 0);
+		}
+	}
+}
+
+void
 qwx_core_stop(struct qwx_softc *sc)
 {
 	if (!test_bit(ATH11K_FLAG_CRASH_FLUSH, sc->sc_flags))
 		qwx_qmi_firmware_stop(sc);
 	
+	qwx_flush_rx_rings(sc);
+
 	sc->ops.stop(sc);
 	qwx_wmi_detach(sc);
 	qwx_dp_pdev_reo_cleanup(sc);
@@ -19836,10 +20141,7 @@ qwx_core_qmi_firmware_ready(struct qwx_softc *sc)
 		goto err_core_stop;
 	}
 
-#if 0 /* TODO: Is this in the right spot for OpenBSD? */
 	sc->ops.irq_enable(sc);
-#endif
-
 #if 0
 	mutex_unlock(&ab->core_lock);
 #endif
@@ -20789,7 +21091,7 @@ qwx_hal_srng_setup(struct qwx_softc *sc, enum hal_ring_type type,
 	memset(srng->ring_base_vaddr, 0,
 	    (srng->entry_size * srng->num_entries) << 2);
 
-#if 0 /* Not needed on OpenBSD? We do swapping in sofware... */
+#if 0 /* Not needed on OpenBSD? We do swapping in software... */
 	/* TODO: Add comments on these swap configurations */
 	if (IS_ENABLED(CONFIG_CPU_BIG_ENDIAN))
 		srng->flags |= HAL_SRNG_FLAGS_MSI_SWAP | HAL_SRNG_FLAGS_DATA_TLV_SWAP |
@@ -22181,13 +22483,30 @@ qwx_reg_update_chan_list(struct qwx_softc *sc, uint8_t pdev_id)
 	int num_channels = 0;
 	size_t params_size;
 	int ret;
+	int scan_2ghz = 1, scan_5ghz = 1;
 #if 0
 	if (ar->state == ATH11K_STATE_RESTARTING)
 		return 0;
 #endif
+	/*
+	 * Scan an appropriate subset of channels if we are running
+	 * in a fixed, user-specified phy mode.
+	 */
+	if (IFM_MODE(ic->ic_media.ifm_cur->ifm_media) != IFM_AUTO) {
+		if (ic->ic_curmode == IEEE80211_MODE_11A ||
+		    ic->ic_curmode == IEEE80211_MODE_11AC)
+			scan_2ghz = 0;
+		if (ic->ic_curmode == IEEE80211_MODE_11B ||
+		    ic->ic_curmode == IEEE80211_MODE_11G)
+			scan_5ghz = 0;
+	}
+
 	lastc = &ic->ic_channels[IEEE80211_CHAN_MAX];
 	for (channel = &ic->ic_channels[1]; channel <= lastc; channel++) {
 		if (channel->ic_flags == 0)
+			continue;
+		if ((!scan_2ghz && IEEE80211_IS_CHAN_2GHZ(channel)) ||
+		    (!scan_5ghz && IEEE80211_IS_CHAN_5GHZ(channel)))
 			continue;
 		num_channels++;
 	}
@@ -22213,6 +22532,9 @@ qwx_reg_update_chan_list(struct qwx_softc *sc, uint8_t pdev_id)
 	lastc = &ic->ic_channels[IEEE80211_CHAN_MAX];
 	for (channel = &ic->ic_channels[1]; channel <= lastc; channel++) {
 		if (channel->ic_flags == 0)
+			continue;
+		if ((!scan_2ghz && IEEE80211_IS_CHAN_2GHZ(channel)) ||
+		    (!scan_5ghz && IEEE80211_IS_CHAN_5GHZ(channel)))
 			continue;
 #ifdef notyet
 		/* TODO: Set to true/false based on some condition? */
@@ -22251,7 +22573,7 @@ qwx_reg_update_chan_list(struct qwx_softc *sc, uint8_t pdev_id)
 		    ch->antennamax, ch->phy_mode);
 
 		ch++;
-		/* TODO: use quarrter/half rate, cfreq12, dfs_cfreq2
+		/* TODO: use quarter/half rate, cfreq12, dfs_cfreq2
 		 * set_agile, reg_class_idx
 		 */
 	}
@@ -22818,6 +23140,18 @@ qwx_vif_free(struct qwx_softc *sc, struct qwx_vif *arvif)
 	free(arvif, M_DEVBUF, sizeof(*arvif));
 }
 
+void
+qwx_vif_free_all(struct qwx_softc *sc)
+{
+	struct qwx_vif *arvif;
+
+	while (!TAILQ_EMPTY(&sc->vif_list)) {
+		arvif = TAILQ_FIRST(&sc->vif_list);
+		TAILQ_REMOVE(&sc->vif_list, arvif, entry);
+		qwx_vif_free(sc, arvif);
+	}
+}
+
 struct qwx_vif *
 qwx_vif_alloc(struct qwx_softc *sc)
 {
@@ -23150,7 +23484,8 @@ qwx_init_task(void *arg)
 	int s = splnet();
 	rw_enter_write(&sc->ioctl_rwl);
 
-	qwx_stop(ifp);
+	if (ifp->if_flags & IFF_RUNNING)
+		qwx_stop(ifp);
 
 	if ((ifp->if_flags & (IFF_UP | IFF_RUNNING)) == IFF_UP)
 		qwx_init(ifp);
@@ -23241,9 +23576,8 @@ qwx_mac_scan_finish(struct qwx_softc *sc)
 		timeout_del(&sc->scan.timeout);
 		if (!sc->scan.is_roc)
 			ieee80211_end_scan(ifp);
-#if 0
-		complete_all(&ar->scan.completed);
-#endif
+
+		wakeup(&sc->scan.state);
 		break;
 	}
 }
@@ -24829,6 +25163,7 @@ qwx_scan(struct qwx_softc *sc)
 	struct ieee80211_channel *chan, *lastc;
 	int ret = 0, num_channels, i;
 	uint32_t scan_timeout;
+	int scan_2ghz = 1, scan_5ghz = 1;
 
 	if (arvif == NULL) {
 		printf("%s: no vdev found\n", sc->sc_dev.dv_xname);
@@ -24896,10 +25231,26 @@ qwx_scan(struct qwx_softc *sc)
 	} else
 		arg->scan_flags |= WMI_SCAN_FLAG_PASSIVE;
 
+	/*
+	 * Scan an appropriate subset of channels if we are running
+	 * in a fixed, user-specified phy mode.
+	 */
+	if (IFM_MODE(ic->ic_media.ifm_cur->ifm_media) != IFM_AUTO) {
+		if (ic->ic_curmode == IEEE80211_MODE_11A ||
+		    ic->ic_curmode == IEEE80211_MODE_11AC)
+			scan_2ghz = 0;
+		if (ic->ic_curmode == IEEE80211_MODE_11B ||
+		    ic->ic_curmode == IEEE80211_MODE_11G)
+			scan_5ghz = 0;
+	}
+
 	lastc = &ic->ic_channels[IEEE80211_CHAN_MAX];
 	num_channels = 0;
 	for (chan = &ic->ic_channels[1]; chan <= lastc; chan++) {
 		if (chan->ic_flags == 0)
+			continue;
+		if ((!scan_2ghz && IEEE80211_IS_CHAN_2GHZ(chan)) ||
+		    (!scan_5ghz && IEEE80211_IS_CHAN_5GHZ(chan)))
 			continue;
 		num_channels++;
 	}
@@ -24916,6 +25267,9 @@ qwx_scan(struct qwx_softc *sc)
 		i = 0;
 		for (chan = &ic->ic_channels[1]; chan <= lastc; chan++) {
 			if (chan->ic_flags == 0)
+				continue;
+			if ((!scan_2ghz && IEEE80211_IS_CHAN_2GHZ(chan)) ||
+			    (!scan_5ghz && IEEE80211_IS_CHAN_5GHZ(chan)))
 				continue;
 			if (isset(sc->wmi.svc_map,
 			    WMI_TLV_SERVICE_SCAN_CONFIG_PER_CHANNEL)) {
@@ -24970,7 +25324,7 @@ qwx_scan(struct qwx_softc *sc)
 		 * The current mode might have been fixed during association.
 		 * Ensure all channels get scanned.
 		 */
-		if (IFM_SUBTYPE(ic->ic_media.ifm_cur->ifm_media) == IFM_AUTO)
+		if (IFM_MODE(ic->ic_media.ifm_cur->ifm_media) == IFM_AUTO)
 			ieee80211_setmode(ic, IEEE80211_MODE_AUTO);
 	}
 #if 0
@@ -25388,9 +25742,6 @@ qwx_run(struct qwx_softc *sc)
 		   sc->sc_dev.dv_xname, ret);
 		return ret;
 	}
-
-	/* Enable "ext" IRQs for datapath. */
-	sc->ops.irq_enable(sc);
 
 	return 0;
 }

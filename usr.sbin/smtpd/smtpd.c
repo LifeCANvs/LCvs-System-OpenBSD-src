@@ -1,4 +1,4 @@
-/*	$OpenBSD: smtpd.c,v 1.351 2024/05/07 12:10:06 op Exp $	*/
+/*	$OpenBSD: smtpd.c,v 1.355 2025/04/25 06:46:19 claudio Exp $	*/
 
 /*
  * Copyright (c) 2008 Gilles Chehade <gilles@poolp.org>
@@ -162,6 +162,8 @@ parent_imsg(struct mproc *p, struct imsg *imsg)
 	case IMSG_LKA_OPEN_FORWARD:
 		CHECK_IMSG_DATA_SIZE(imsg, sizeof *fwreq);
 		fwreq = imsg->data;
+		fwreq->directory[sizeof(fwreq->directory) - 1] = '\0';
+		fwreq->user[sizeof(fwreq->user) - 1] = '\0';
 		fd = parent_forward_open(fwreq->user, fwreq->directory,
 		    fwreq->uid, fwreq->gid);
 		fwreq->status = 0;
@@ -706,8 +708,8 @@ main(int argc, char *argv[])
 			    0, -1, env->sc_queue_key, strlen(env->sc_queue_key)
 			    + 1) == -1)
 				fatal("imsg_compose");
-			if (imsg_flush(&p_queue->imsgbuf) == -1)
-				fatal("imsg_flush");
+			if (imsgbuf_flush(&p_queue->imsgbuf) == -1)
+				fatal("imsgbuf_flush");
 		}
 
 		setup_done(p_ca);
@@ -857,14 +859,14 @@ setup_peers(struct mproc *a, struct mproc *b)
 	if (imsg_compose(&a->imsgbuf, IMSG_SETUP_PEER, b->proc, b->pid, sp[0],
 	    NULL, 0) == -1)
 		fatal("imsg_compose");
-	if (imsg_flush(&a->imsgbuf) == -1)
-		fatal("imsg_flush");
+	if (imsgbuf_flush(&a->imsgbuf) == -1)
+		fatal("imsgbuf_flush");
 
 	if (imsg_compose(&b->imsgbuf, IMSG_SETUP_PEER, a->proc, a->pid, sp[1],
 	    NULL, 0) == -1)
 		fatal("imsg_compose");
-	if (imsg_flush(&b->imsgbuf) == -1)
-		fatal("imsg_flush");
+	if (imsgbuf_flush(&b->imsgbuf) == -1)
+		fatal("imsgbuf_flush");
 }
 
 static void
@@ -874,8 +876,8 @@ setup_done(struct mproc *p)
 
 	if (imsg_compose(&p->imsgbuf, IMSG_SETUP_DONE, 0, 0, -1, NULL, 0) == -1)
 		fatal("imsg_compose");
-	if (imsg_flush(&p->imsgbuf) == -1)
-		fatal("imsg_flush");
+	if (imsgbuf_flush(&p->imsgbuf) == -1)
+		fatal("imsgbuf_flush");
 
 	if (imsg_wait(&p->imsgbuf, &imsg, 10000) == -1)
 		fatal("imsg_wait");
@@ -932,8 +934,8 @@ setup_proc(void)
 	if (imsg_compose(ibuf, IMSG_SETUP_DONE, 0, 0, -1, NULL, 0) == -1)
 		fatal("imsg_compose");
 
-	if (imsg_flush(ibuf) == -1)
-		fatal("imsg_flush");
+	if (imsgbuf_flush(ibuf) == -1)
+		fatal("imsgbuf_flush");
 
 	log_debug("setup_proc: %s done", proc_title(smtpd_process));
 }
@@ -1013,7 +1015,7 @@ imsg_wait(struct imsgbuf *ibuf, struct imsg *imsg, int timeout)
 			return -1;
 		}
 
-		if (((n = imsg_read(ibuf)) == -1 && errno != EAGAIN) || n == 0)
+		if (imsgbuf_read(ibuf) != 1)
 			return -1;
 	}
 }
@@ -1803,7 +1805,7 @@ parent_forward_open(char *username, char *directory, uid_t uid, gid_t gid)
 	}
 
 	if (!secure_file(fd, pathname, directory, uid, 1)) {
-		log_warnx("warn: smtpd: %s: unsecure file", pathname);
+		log_warnx("warn: smtpd: %s: insecure file", pathname);
 		close(fd);
 		return -1;
 	}

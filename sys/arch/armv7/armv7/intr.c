@@ -1,4 +1,4 @@
-/* $OpenBSD: intr.c,v 1.21 2022/07/27 20:26:17 kettenis Exp $ */
+/* $OpenBSD: intr.c,v 1.25 2025/05/10 10:11:02 visa Exp $ */
 /*
  * Copyright (c) 2011 Dale Rahn <drahn@openbsd.org>
  *
@@ -19,13 +19,15 @@
 #include <sys/systm.h>
 #include <sys/malloc.h>
 
+#include <uvm/uvm_extern.h>
+
 #include <arm/cpufunc.h>
 #include <machine/cpu.h>
 #include <machine/intr.h>
 
 #include <dev/ofw/openfirm.h>
 
-uint32_t arm_intr_get_parent(int);
+int arm_intr_get_parent(int);
 uint32_t arm_intr_map_msi(int, uint64_t *);
 
 void *arm_intr_prereg_establish_fdt(void *, int *, int, struct cpu_info *,
@@ -62,6 +64,7 @@ void (*arm_intr_dispatch)(void *) = arm_dflt_intr;
 void
 arm_intr(void *frame)
 {
+	uvmexp.intrs++;
 	/* XXX - change this to have irq_dispatch use function pointer */
 	(*arm_intr_dispatch)(frame);
 }
@@ -72,16 +75,21 @@ arm_dflt_intr(void *frame)
 }
 
 
-void *arm_intr_establish(int irqno, int level, int (*func)(void *),
+void *
+arm_intr_establish(int irqno, int level, int (*func)(void *),
     void *cookie, char *name)
 {
 	return arm_intr_func.intr_establish(irqno, level, NULL, func, cookie, name);
 }
-void arm_intr_disestablish(void *cookie)
+
+void
+arm_intr_disestablish(void *cookie)
 {
 	arm_intr_func.intr_disestablish(cookie);
 }
-const char *arm_intr_string(void *cookie)
+
+const char *
+arm_intr_string(void *cookie)
 {
 	return arm_intr_func.intr_string(cookie);
 }
@@ -89,17 +97,21 @@ const char *arm_intr_string(void *cookie)
 /*
  * Find the interrupt parent by walking up the tree.
  */
-uint32_t
+int
 arm_intr_get_parent(int node)
 {
-	uint32_t phandle = 0;
+	uint32_t phandle;
 
-	while (node && !phandle) {
+	while (node) {
 		phandle = OF_getpropint(node, "interrupt-parent", 0);
+		if (phandle)
+			return OF_getnodebyphandle(phandle);
 		node = OF_parent(node);
+		if (OF_getpropbool(node, "interrupt-controller"))
+			return node;
 	}
 
-	return phandle;
+	return 0;
 }
 
 uint32_t
@@ -275,8 +287,6 @@ arm_intr_register_fdt(struct interrupt_controller *ic)
 
 	ic->ic_cells = OF_getpropint(ic->ic_node, "#interrupt-cells", 0);
 	ic->ic_phandle = OF_getpropint(ic->ic_node, "phandle", 0);
-	if (ic->ic_phandle == 0)
-		return;
 	KASSERT(ic->ic_cells <= MAX_INTERRUPT_CELLS);
 
 	LIST_INSERT_HEAD(&interrupt_controllers, ic, ic_list);
@@ -330,7 +340,8 @@ arm_intr_establish_fdt_idx_cpu(int node, int idx, int level, struct cpu_info *ci
     int (*func)(void *), void *cookie, char *name)
 {
 	struct interrupt_controller *ic;
-	int i, len, ncells, extended = 1;
+	int i, len, ncells, parent;
+	int extended = 1;
 	uint32_t *cell, *cells, phandle;
 	struct arm_intr_handle *ih;
 	void *val = NULL;
@@ -345,9 +356,9 @@ arm_intr_establish_fdt_idx_cpu(int node, int idx, int level, struct cpu_info *ci
 
 	/* Old style. */
 	if (!extended) {
-		phandle = arm_intr_get_parent(node);
+		parent = arm_intr_get_parent(node);
 		LIST_FOREACH(ic, &interrupt_controllers, ic_list) {
-			if (ic->ic_phandle == phandle)
+			if (ic->ic_node == parent)
 				break;
 		}
 
@@ -558,12 +569,12 @@ arm_intr_parent_establish_fdt(void *cookie, int *cell, int level,
 {
 	struct interrupt_controller *ic = cookie;
 	struct arm_intr_handle *ih;
-	uint32_t phandle;
+	int parent;
 	void *val;
 
-	phandle = arm_intr_get_parent(ic->ic_node);
+	parent = arm_intr_get_parent(ic->ic_node);
 	LIST_FOREACH(ic, &interrupt_controllers, ic_list) {
-		if (ic->ic_phandle == phandle)
+		if (ic->ic_node == parent)
 			break;
 	}
 	if (ic == NULL)
@@ -657,13 +668,15 @@ arm_dflt_setipl(int newcpl)
 	ci->ci_cpl = newcpl;
 }
 
-void *arm_dflt_intr_establish(int irqno, int level, struct cpu_info *ci,
+void *
+arm_dflt_intr_establish(int irqno, int level, struct cpu_info *ci,
     int (*func)(void *), void *cookie, char *name)
 {
 	panic("arm_dflt_intr_establish called");
 }
 
-void arm_dflt_intr_disestablish(void *cookie)
+void
+arm_dflt_intr_disestablish(void *cookie)
 {
 	panic("arm_dflt_intr_disestablish called");
 }
@@ -710,10 +723,9 @@ arm_do_pending_intr(int pcpl)
 	}
 
 	do {
-		DO_SOFTINT(SI_SOFTTTY, IPL_SOFTTTY);
-		DO_SOFTINT(SI_SOFTNET, IPL_SOFTNET);
-		DO_SOFTINT(SI_SOFTCLOCK, IPL_SOFTCLOCK);
-		DO_SOFTINT(SI_SOFT, IPL_SOFT);
+		DO_SOFTINT(SOFTINTR_TTY, IPL_SOFTTTY);
+		DO_SOFTINT(SOFTINTR_NET, IPL_SOFTNET);
+		DO_SOFTINT(SOFTINTR_CLOCK, IPL_SOFTCLOCK);
 	} while (ci->ci_ipending & arm_smask[pcpl]);
 
 	/* Don't use splx... we are here already! */
@@ -721,7 +733,8 @@ arm_do_pending_intr(int pcpl)
 	restore_interrupts(oldirqstate);
 }
 
-void arm_set_intr_handler(int (*raise)(int), int (*lower)(int),
+void
+arm_set_intr_handler(int (*raise)(int), int (*lower)(int),
     void (*x)(int), void (*setipl)(int),
 	void *(*intr_establish)(int irqno, int level, struct cpu_info *ci,
 	    int (*func)(void *), void *cookie, char *name),
@@ -751,14 +764,12 @@ arm_init_smask(void)
 
 	for (i = IPL_NONE; i <= IPL_HIGH; i++)  {
 		arm_smask[i] = 0;
-		if (i < IPL_SOFT)
-			arm_smask[i] |= SI_TO_IRQBIT(SI_SOFT);
 		if (i < IPL_SOFTCLOCK)
-			arm_smask[i] |= SI_TO_IRQBIT(SI_SOFTCLOCK);
+			arm_smask[i] |= SI_TO_IRQBIT(SOFTINTR_CLOCK);
 		if (i < IPL_SOFTNET)
-			arm_smask[i] |= SI_TO_IRQBIT(SI_SOFTNET);
+			arm_smask[i] |= SI_TO_IRQBIT(SOFTINTR_NET);
 		if (i < IPL_SOFTTTY)
-			arm_smask[i] |= SI_TO_IRQBIT(SI_SOFTTTY);
+			arm_smask[i] |= SI_TO_IRQBIT(SOFTINTR_TTY);
 	}
 }
 

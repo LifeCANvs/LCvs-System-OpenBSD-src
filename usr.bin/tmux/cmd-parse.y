@@ -1,4 +1,4 @@
-/* $OpenBSD: cmd-parse.y,v 1.50 2023/03/15 08:15:39 nicm Exp $ */
+/* $OpenBSD: cmd-parse.y,v 1.53 2025/01/13 08:58:34 nicm Exp $ */
 
 /*
  * Copyright (c) 2019 Nicholas Marriott <nicholas.marriott@gmail.com>
@@ -223,9 +223,16 @@ assignment	: EQUALS
 		{
 			struct cmd_parse_state	*ps = &parse_state;
 			int			 flags = ps->input->flags;
+			int			 flag = 1;
+			struct cmd_parse_scope	*scope;
 
-			if ((~flags & CMD_PARSE_PARSEONLY) &&
-			    (ps->scope == NULL || ps->scope->flag))
+			if (ps->scope != NULL) {
+				flag = ps->scope->flag;
+				TAILQ_FOREACH(scope, &ps->stack, entry)
+					flag = flag && scope->flag;
+			}
+
+			if ((~flags & CMD_PARSE_PARSEONLY) && flag)
 				environ_put(global_environ, $1, 0);
 			free($1);
 		}
@@ -234,9 +241,16 @@ hidden_assignment : HIDDEN EQUALS
 		{
 			struct cmd_parse_state	*ps = &parse_state;
 			int			 flags = ps->input->flags;
+			int			 flag = 1;
+			struct cmd_parse_scope	*scope;
 
-			if ((~flags & CMD_PARSE_PARSEONLY) &&
-			    (ps->scope == NULL || ps->scope->flag))
+			if (ps->scope != NULL) {
+				flag = ps->scope->flag;
+				TAILQ_FOREACH(scope, &ps->stack, entry)
+					flag = flag && scope->flag;
+			}
+
+			if ((~flags & CMD_PARSE_PARSEONLY) && flag)
 				environ_put(global_environ, $2, ENVIRON_HIDDEN);
 			free($2);
 		}
@@ -1273,6 +1287,16 @@ yylex(void)
 			continue;
 		}
 
+		if (ch == '\r') {
+			/*
+			 * Treat \r\n as \n.
+			 */
+			ch = yylex_getc();
+			if (ch != '\n') {
+				yylex_ungetc(ch);
+				ch = '\r';
+			}
+		}
 		if (ch == '\n') {
 			/*
 			 * End of line. Update the line number.
@@ -1603,6 +1627,7 @@ yylex_token_tilde(char **buf, size_t *len)
 static char *
 yylex_token(int ch)
 {
+	struct cmd_parse_state	*ps = &parse_state;
 	char			*buf;
 	size_t			 len;
 	enum { START,
@@ -1619,9 +1644,19 @@ yylex_token(int ch)
 			log_debug("%s: end at EOF", __func__);
 			break;
 		}
-		if (state == NONE && ch == '\n') {
-			log_debug("%s: end at EOL", __func__);
-			break;
+		if (state == NONE && ch == '\r') {
+			ch = yylex_getc();
+			if (ch != '\n') {
+				yylex_ungetc(ch);
+				ch = '\r';
+			}
+		}
+		if (ch == '\n') {
+			if (state == NONE) {
+				log_debug("%s: end at EOL", __func__);
+				break;
+			}
+			ps->input->line++;
 		}
 
 		/* Whitespace or ; or } ends a token unless inside quotes. */

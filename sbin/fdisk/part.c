@@ -1,4 +1,4 @@
-/*	$OpenBSD: part.c,v 1.164 2023/06/19 23:11:57 krw Exp $	*/
+/*	$OpenBSD: part.c,v 1.166 2025/05/23 00:20:02 krw Exp $	*/
 
 /*
  * Copyright (c) 1997 Tobias Weingartner
@@ -627,20 +627,20 @@ struct menu_item {
 
 const struct menu_item menu_items[] = {
 	{ 0x00,	0x00,	"Unused",	UNUSED_GUID },
-	{ 0x01,	0x01,	"DOS FAT-12",	MICROSOFT_BASIC_DATA_GUID },
+	{ 0x01,	0x01,	"FAT12",	MICROSOFT_BASIC_DATA_GUID },
 	{ 0x02,	0x02,	"XENIX /",	NULL },
 	{ 0x03,	0x03,	"XENIX /usr",	NULL },
-	{ 0x04,	0x04,	"DOS FAT-16",	MICROSOFT_BASIC_DATA_GUID },
+	{ 0x04,	0x04,	"FAT16",	MICROSOFT_BASIC_DATA_GUID },
 	{ 0x05,	0x05,	"Extended DOS",	NULL },
-	{ 0x06,	0x06,	"DOS > 32MB",	MICROSOFT_BASIC_DATA_GUID },
+	{ 0x06,	0x06,	"FAT16B",	MICROSOFT_BASIC_DATA_GUID },
 	{ 0x07,	0x07,	"NTFS",		MICROSOFT_BASIC_DATA_GUID },
 	{ 0x08,	0x08,	"AIX fs",	NULL },
 	{ 0x09,	0x09,	"AIX/Coherent",	NULL },
 	{ 0x0A,	0x0A,	"OS/2 Bootmgr",	NULL },
-	{ 0x0B,	0x0B,	"Win95 FAT-32",	MICROSOFT_BASIC_DATA_GUID },
-	{ 0x0C,	0x0C,	"Win95 FAT32L",	MICROSOFT_BASIC_DATA_GUID },
+	{ 0x0B,	0x0B,	"FAT32",	MICROSOFT_BASIC_DATA_GUID },
+	{ 0x0C,	0x0C,	"FAT32 (LBA)",	MICROSOFT_BASIC_DATA_GUID },
 	{ 0x0D,   -1,	"BIOS boot",	BIOS_BOOT_GUID },
-	{ 0x0E,	0x0E,	"DOS FAT-16",	MICROSOFT_BASIC_DATA_GUID },
+	{ 0x0E,	0x0E,	"FAT16B (LBA)",	MICROSOFT_BASIC_DATA_GUID },
 	{ 0x0F,	0x0F,	"Extended LBA",	NULL },
 	{ 0x10,	0x10,	"OPUS",		NULL },
 	{ 0x11,	0x11,	"OS/2 hidden",	MICROSOFT_BASIC_DATA_GUID },
@@ -1142,6 +1142,36 @@ PRT_menuid_to_guid(const int menuid)
 
 	for (i = 0; i < nitems(menu_items); i++) {
 		if (gpt_item(i) == 0 && menu_items[i].mi_menuid == menuid)
+			return menu_items[i].mi_guid;
+	}
+
+	return NULL;
+}
+
+const char	*
+PRT_desc_to_guid(const char *desc)
+{
+	char buf[37];
+	unsigned int		 i;
+
+	strlcpy(buf, desc, sizeof(buf));
+	for (i = strlen(buf); i > 0; i--) {
+		if (buf[i - 1] != ' ')
+			break;
+		buf[i - 1] = '\0';
+	}
+
+	for (i = 0; i < nitems(gpt_types); i++) {
+		if (gpt_types[i].gt_desc == NULL)
+			continue;
+		if (strcasecmp(gpt_types[i].gt_desc, buf) == 0)
+			return gpt_types[i].gt_guid;
+		if (strcasecmp(gpt_types[i].gt_guid, buf) == 0)
+			return gpt_types[i].gt_guid;
+	}
+	for (i = 0; i < nitems(menu_items); i++) {
+		if (gpt_item(i) == 0 &&
+		    strcasecmp(menu_items[i].mi_name, buf) == 0)
 			return menu_items[i].mi_guid;
 	}
 

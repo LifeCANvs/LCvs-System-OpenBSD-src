@@ -1,4 +1,4 @@
-/*	$OpenBSD: machdep.c,v 1.672 2024/06/07 16:53:35 kettenis Exp $	*/
+/*	$OpenBSD: machdep.c,v 1.677 2025/05/21 04:11:57 mlarkin Exp $	*/
 /*	$NetBSD: machdep.c,v 1.214 1996/11/10 03:16:17 thorpej Exp $	*/
 
 /*-
@@ -115,6 +115,7 @@
 
 #include "acpi.h"
 #if NACPI > 0
+#include <dev/acpi/acpireg.h>
 #include <dev/acpi/acpivar.h>
 #endif
 
@@ -139,6 +140,7 @@ extern struct proc *npxproc;
 
 #ifdef HIBERNATE
 #include <machine/hibernate_var.h>
+#include <sys/hibernate.h>
 #endif /* HIBERNATE */
 
 #include "ukbd.h"
@@ -154,6 +156,12 @@ extern struct proc *npxproc;
 #else
 #define DPRINTF(x...)
 #endif	/* MACHDEP_DEBUG */
+
+const int softintr_to_ssir[NSOFTINTR] = {
+	SIR_CLOCK,
+	SIR_NET,
+	SIR_TTY,
+};
 
 void	replacesmap(void);
 int     intr_handler(struct intrframe *, struct intrhand *);
@@ -402,6 +410,10 @@ cpu_startup(void)
 
 	/* initialize CPU0's TSS and GDT and put them in the u-k maps */
 	cpu_enter_pages(&cpu_info_full_primary);
+
+#ifdef HIBERNATE
+	preallocate_hibernate_memory();
+#endif /* HIBERNATE */
 }
 
 void
@@ -1119,7 +1131,7 @@ cyrix3_cpu_setup(struct cpu_info *ci)
 		/*
 		 * C3 Nehemiah & later: fall through.
 		 */
-	
+
 	case 10: /* C7-M Type A */
 	case 13: /* C7-M Type D */
 	case 15: /* Nano */
@@ -1768,7 +1780,7 @@ identifycpu(struct cpu_info *ci)
 		 * with eax 0x01
 		 */
 
-		cpuid(0x01, regs); 
+		cpuid(0x01, regs);
 		ci->ci_cflushsz = ((regs[1] >> 8) & 0xff) * 8;
 	}
 
@@ -2282,7 +2294,7 @@ p3_get_bus_clock(struct cpu_info *ci)
 			goto print_msr;
 		}
 		break;
-	default: 
+	default:
 		/* no FSB on modern Intel processors */
 		break;
 	}
@@ -2598,6 +2610,11 @@ struct pcb dumppcb;
 __dead void
 boot(int howto)
 {
+#if NACPI > 0
+	if ((howto & RB_POWERDOWN) != 0 && acpi_softc)
+		acpi_softc->sc_state = ACPI_STATE_S5;
+#endif
+
 	if ((howto & RB_POWERDOWN) != 0)
 		lid_action = 0;
 
@@ -3189,7 +3206,7 @@ init386(paddr_t first_avail)
 	if (bios_memmap == NULL)
 		panic("no BIOS memory map supplied");
 #endif
- 
+
 	/*
 	 * account all the memory passed in the map from /boot
 	 * calculate avail_end and count the physmem.
@@ -3893,9 +3910,10 @@ int	intr_shared_edge;
  * We hand-code this to ensure that it's atomic.
  */
 void
-softintr(int sir)
+softintr(int si_level)
 {
 	struct cpu_info *ci = curcpu();
+	int sir = softintr_to_ssir[si_level];
 
 	__asm volatile("orl %1, %0" :
 	    "=m" (ci->ci_ipending) : "ir" (1 << sir));

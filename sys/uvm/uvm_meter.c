@@ -1,4 +1,4 @@
-/*	$OpenBSD: uvm_meter.c,v 1.50 2023/09/16 09:33:27 mpi Exp $	*/
+/*	$OpenBSD: uvm_meter.c,v 1.52 2025/02/25 11:29:17 mpi Exp $	*/
 /*	$NetBSD: uvm_meter.c,v 1.21 2001/07/14 06:36:03 matt Exp $	*/
 
 /*
@@ -267,7 +267,7 @@ uvmexp_read(struct uvmexp *uexp)
 		uexp->fltpgwait = (int)counters[flt_pgwait];
 		uexp->fltpgrele = (int)counters[flt_pgrele];
 		uexp->fltrelck = (int)counters[flt_relck];
-		uexp->fltrelckok = (int)counters[flt_relckok];
+		uexp->fltnorelck = (int)counters[flt_norelck];
 		uexp->fltanget = (int)counters[flt_anget];
 		uexp->fltanretry = (int)counters[flt_anretry];
 		uexp->fltamcopy = (int)counters[flt_amcopy];
@@ -280,6 +280,8 @@ uvmexp_read(struct uvmexp *uexp)
 		uexp->flt_obj = (int)counters[flt_obj];
 		uexp->flt_prcopy = (int)counters[flt_prcopy];
 		uexp->flt_przero = (int)counters[flt_przero];
+		uexp->fltup = (int)counters[flt_up];
+		uexp->fltnoup = (int)counters[flt_noup];
 }
 
 #ifdef DDB
@@ -301,9 +303,6 @@ uvmexp_print(int (*pr)(const char *, ...))
 	(*pr)("  %d VM pages: %d active, %d inactive, %d wired, %d free (%d zero)\n",
 	    uexp.npages, uexp.active, uexp.inactive, uexp.wired,
 	    uexp.free, uexp.zeropages);
-	(*pr)("  min  %d%% (%d) anon, %d%% (%d) vnode, %d%% (%d) vtext\n",
-	    uexp.anonminpct, uexp.anonmin, uexp.vnodeminpct,
-	    uexp.vnodemin, uexp.vtextminpct, uexp.vtextmin);
 	(*pr)("  freemin=%d, free-target=%d, inactive-target=%d, "
 	    "wired-max=%d\n", uexp.freemin, uexp.freetarg, uexp.inactarg,
 	    uexp.wiredmax);
@@ -317,9 +316,9 @@ uvmexp_print(int (*pr)(const char *, ...))
 	(*pr)("    noram=%d, noanon=%d, noamap=%d, pgwait=%d, pgrele=%d\n",
 	    uexp.fltnoram, uexp.fltnoanon, uexp.fltnoamap,
 	    uexp.fltpgwait, uexp.fltpgrele);
-	(*pr)("    ok relocks(total)=%d(%d), anget(retries)=%d(%d), "
-	    "amapcopy=%d\n", uexp.fltrelckok, uexp.fltrelck,
-	    uexp.fltanget, uexp.fltanretry, uexp.fltamcopy);
+	(*pr)("    relocks=%d(%d), upgrades=%d(%d) anget(retries)=%d(%d), "
+	    "amapcopy=%d\n", uexp.fltrelck, uexp.fltnorelck, uexp.fltup,
+	    uexp.fltnoup, uexp.fltanget, uexp.fltanretry, uexp.fltamcopy);
 	(*pr)("    neighbor anon/obj pg=%d/%d, gets(lock/unlock)=%d/%d\n",
 	    uexp.fltnamap, uexp.fltnomap, uexp.fltlget, uexp.fltget);
 	(*pr)("    cases: anon=%d, anoncow=%d, obj=%d, prcopy=%d, przero=%d\n",

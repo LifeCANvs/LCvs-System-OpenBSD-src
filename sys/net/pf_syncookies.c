@@ -1,4 +1,4 @@
-/*	$OpenBSD: pf_syncookies.c,v 1.7 2018/09/10 15:54:28 henning Exp $ */
+/*	$OpenBSD: pf_syncookies.c,v 1.9 2025/04/14 20:02:34 sf Exp $ */
 
 /* Copyright (c) 2016,2017 Henning Brauer <henning@openbsd.org>
  * Copyright (c) 2016 Alexandr Nedvedicky <sashan@openbsd.org>
@@ -197,16 +197,17 @@ pf_synflood_check(struct pf_pdesc *pd)
 }
 
 void
-pf_syncookie_send(struct pf_pdesc *pd)
+pf_syncookie_send(struct pf_pdesc *pd, u_short *reason)
 {
-	uint16_t	mss;
+	uint16_t	mss, mssdflt;
 	uint32_t	iss;
 
-	mss = max(tcp_mssdflt, pf_get_mss(pd));
+	mssdflt = atomic_load_int(&tcp_mssdflt);
+	mss = max(pf_get_mss(pd, mssdflt), mssdflt);
 	iss = pf_syncookie_generate(pd, mss);
 	pf_send_tcp(NULL, pd->af, pd->dst, pd->src, *pd->dport, *pd->sport,
 	    iss, ntohl(pd->hdr.tcp.th_seq) + 1, TH_SYN|TH_ACK, 0, mss,
-	    0, 1, 0, pd->rdomain);
+	    0, 1, 0, pd->rdomain, reason);
 	pf_status.syncookies_inflight[pf_syncookie_status.oddeven]++;
 	pf_status.lcounters[LCNT_SYNCOOKIES_SENT]++;
 }
@@ -367,7 +368,7 @@ pf_syncookie_generate(struct pf_pdesc *pd, uint16_t mss)
 }
 
 struct mbuf *
-pf_syncookie_recreate_syn(struct pf_pdesc *pd)
+pf_syncookie_recreate_syn(struct pf_pdesc *pd, u_short *reason)
 {
 	uint8_t			 wscale;
 	uint16_t		 mss;
@@ -387,5 +388,6 @@ pf_syncookie_recreate_syn(struct pf_pdesc *pd)
 
 	return (pf_build_tcp(NULL, pd->af, pd->src, pd->dst, *pd->sport,
 	    *pd->dport, seq, 0, TH_SYN, wscale, mss, pd->ttl, 0,
-	    PF_TAG_SYNCOOKIE_RECREATED, cookie.flags.sack_ok, pd->rdomain));
+	    PF_TAG_SYNCOOKIE_RECREATED, cookie.flags.sack_ok, pd->rdomain,
+	    reason));
 }

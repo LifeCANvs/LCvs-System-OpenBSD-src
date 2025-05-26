@@ -1,4 +1,4 @@
-/*	$OpenBSD: if_spppsubr.c,v 1.193 2024/05/13 01:15:53 jsg Exp $	*/
+/*	$OpenBSD: if_spppsubr.c,v 1.196 2025/03/02 21:28:32 bluhm Exp $	*/
 /*
  * Synchronous PPP link level subroutines.
  *
@@ -415,6 +415,30 @@ spppattach(struct ifnet *ifp)
 {
 }
 
+int
+sppp_proto_up(struct ifnet *ifp, uint16_t proto)
+{
+	struct sppp *sp = (struct sppp *)ifp;
+	int af = AF_UNSPEC;
+
+	switch (ntohs(proto)) {
+	case PPP_IP:
+		if (sp->state[IDX_IPCP] == STATE_OPENED)
+			af = AF_INET;
+		break;
+#ifdef INET6
+	case PPP_IPV6:
+		if (sp->state[IDX_IPV6CP] == STATE_OPENED)
+			af = AF_INET6;
+		break;
+#endif
+	default:
+		break;
+	}
+
+	return (af);
+}
+
 /*
  * Process the received packet.
  */
@@ -509,7 +533,7 @@ sppp_input(struct ifnet *ifp, struct mbuf *m)
 			if (sp->state[IDX_IPCP] == STATE_OPENED) {
 				sp->pp_last_activity = tv.tv_sec;
 				if (ifp->if_flags & IFF_UP) {
-					ipv4_input(ifp, m);
+					ipv4_input(ifp, m, NULL);
 					return;
 				}
 			}
@@ -524,7 +548,7 @@ sppp_input(struct ifnet *ifp, struct mbuf *m)
 			if (sp->state[IDX_IPV6CP] == STATE_OPENED) {
 				sp->pp_last_activity = tv.tv_sec;
 				if (ifp->if_flags & IFF_UP) {
-					ipv6_input(ifp, m);
+					ipv6_input(ifp, m, NULL);
 					return;
 				}
 			}
@@ -1496,7 +1520,7 @@ sppp_close_event(const struct cp *cp, struct sppp *sp)
 }
 
 void
-sppp_increasing_timeout (const struct cp *cp, struct sppp *sp)
+sppp_increasing_timeout(const struct cp *cp, struct sppp *sp)
 {
 	int timo;
 

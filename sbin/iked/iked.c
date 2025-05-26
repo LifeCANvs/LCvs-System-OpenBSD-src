@@ -1,4 +1,4 @@
-/*	$OpenBSD: iked.c,v 1.70 2024/02/15 20:10:45 tobhe Exp $	*/
+/*	$OpenBSD: iked.c,v 1.72 2024/12/26 18:24:54 sthen Exp $	*/
 
 /*
  * Copyright (c) 2019 Tobias Heider <tobias.heider@stusta.de>
@@ -178,10 +178,6 @@ main(int argc, char *argv[])
 	group_init();
 	policy_init(env);
 
-	/* check for root privileges */
-	if (geteuid())
-		errx(1, "need root privileges");
-
 	if ((ps->ps_pw =  getpwnam(IKED_USER)) == NULL)
 		errx(1, "unknown user %s", IKED_USER);
 
@@ -193,6 +189,11 @@ main(int argc, char *argv[])
 
 	if (opts & IKED_OPT_NOACTION)
 		ps->ps_noaction = 1;
+	else {
+		/* check for root privileges */
+		if (geteuid())
+			errx(1, "need root privileges");
+	}
 
 	ps->ps_instance = proc_instance;
 	if (title != NULL)
@@ -307,6 +308,8 @@ parent_configure(struct iked *env)
 	config_setstatic(env);
 	config_setcoupled(env, env->sc_decoupled ? 0 : 1);
 	config_setocsp(env);
+	config_setradauth(env);
+	config_setradacct(env);
 	/* Must be last */
 	config_setmode(env, env->sc_passive ? 1 : 0);
 
@@ -324,6 +327,7 @@ parent_reload(struct iked *env, int reset, const char *filename)
 
 	if (reset == RESET_RELOAD) {
 		config_setreset(env, RESET_POLICY, PROC_IKEV2);
+		config_setreset(env, RESET_RADIUS, PROC_IKEV2);
 		if (config_setkeys(env) == -1)
 			fatalx("%s: failed to send keys", __func__);
 		config_setreset(env, RESET_CA, PROC_CERT);

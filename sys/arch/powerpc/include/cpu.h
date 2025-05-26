@@ -1,4 +1,4 @@
-/*	$OpenBSD: cpu.h,v 1.77 2024/02/25 19:15:50 cheloha Exp $	*/
+/*	$OpenBSD: cpu.h,v 1.80 2025/04/07 15:43:00 gkoehler Exp $	*/
 /*	$NetBSD: cpu.h,v 1.1 1996/09/30 16:34:21 ws Exp $	*/
 
 /*
@@ -65,7 +65,7 @@ struct cpu_info {
 	struct srp_hazard ci_srp_hazards[SRP_HAZARD_NUM];
 #endif
 
-	int ci_intrdepth;
+	int ci_idepth;
 	char *ci_intstk;
 #define CPUSAVE_LEN	8
 	register_t ci_tempsave[CPUSAVE_LEN];
@@ -155,7 +155,7 @@ extern struct cpu_info cpu_info[PPC_MAXPROCS];
 
 #define	CLKF_USERMODE(frame)	(((frame)->srr1 & PSL_PR) != 0)
 #define	CLKF_PC(frame)		((frame)->srr0)
-#define	CLKF_INTR(frame)	((frame)->depth != 0)
+#define	CLKF_INTR(frame)	((frame)->depth > 1)
 
 extern int ppc_cpuidle;
 extern int ppc_proc_is_64b;
@@ -259,13 +259,13 @@ flushdcache(void *from, int len)
 }
 
 #define FUNC_SPR(n, name) \
-static __inline u_int32_t ppc_mf ## name (void)			\
+static __inline u_int32_t ppc_mf ## name(void)			\
 {								\
 	u_int32_t ret;						\
 	__asm volatile ("mfspr %0," # n : "=r" (ret));		\
 	return ret;						\
 }								\
-static __inline void ppc_mt ## name (u_int32_t val)		\
+static __inline void ppc_mt ## name(u_int32_t val)		\
 {								\
 	__asm volatile ("mtspr "# n ",%0" :: "r" (val));	\
 }								\
@@ -331,7 +331,7 @@ FUNC_SPR(1013, dabr)
 FUNC_SPR(1023, pir)
 
 static __inline u_int32_t
-ppc_mftbl (void)
+ppc_mftbl(void)
 {
 	int ret;
 	__asm volatile ("mftb %0" : "=r" (ret));
@@ -359,7 +359,7 @@ ppc_mttb(u_int64_t tb)
 }
 
 static __inline u_int32_t
-ppc_mfmsr (void)
+ppc_mfmsr(void)
 {
 	int ret;
         __asm volatile ("mfmsr %0" : "=r" (ret));
@@ -367,7 +367,7 @@ ppc_mfmsr (void)
 }
 
 static __inline void
-ppc_mtmsr (u_int32_t val)
+ppc_mtmsr(u_int32_t val)
 {
         __asm volatile ("mtmsr %0" :: "r" (val));
 }

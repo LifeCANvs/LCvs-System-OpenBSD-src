@@ -1,4 +1,4 @@
-/* $OpenBSD: window-buffer.c,v 1.38 2024/03/21 11:32:49 nicm Exp $ */
+/* $OpenBSD: window-buffer.c,v 1.42 2025/04/22 12:23:26 nicm Exp $ */
 
 /*
  * Copyright (c) 2017 Nicholas Marriott <nicholas.marriott@gmail.com>
@@ -44,12 +44,8 @@ static void		 window_buffer_key(struct window_mode_entry *,
 #define WINDOW_BUFFER_DEFAULT_KEY_FORMAT \
 	"#{?#{e|<:#{line},10}," \
 		"#{line}" \
-	"," \
-		"#{?#{e|<:#{line},36},"	\
-	        	"M-#{a:#{e|+:97,#{e|-:#{line},10}}}" \
-		"," \
-	        	"" \
-		"}" \
+	",#{e|<:#{line},36},"	\
+		"M-#{a:#{e|+:97,#{e|-:#{line},10}}}" \
 	"}"
 
 static const struct menu_item window_buffer_menu_items[] = {
@@ -350,7 +346,7 @@ window_buffer_init(struct window_mode_entry *wme, struct cmd_find_state *fs,
 
 	data->data = mode_tree_start(wp, args, window_buffer_build,
 	    window_buffer_draw, window_buffer_search, window_buffer_menu, NULL,
-	    window_buffer_get_key, data, window_buffer_menu_items,
+	    window_buffer_get_key, NULL, data, window_buffer_menu_items,
 	    window_buffer_sort_list, nitems(window_buffer_sort_list), &s);
 	mode_tree_zoom(data->data, args);
 
@@ -408,8 +404,17 @@ window_buffer_do_delete(void *modedata, void *itemdata,
 	struct window_buffer_itemdata	*item = itemdata;
 	struct paste_buffer		*pb;
 
-	if (item == mode_tree_get_current(data->data))
-		mode_tree_down(data->data, 0);
+	if (item == mode_tree_get_current(data->data) &&
+	    !mode_tree_down(data->data, 0)) {
+		/*
+		 *If we were unable to select the item further down we are at
+		 * the end of the list. Move one element up instead, to make
+		 * sure that we preserve a valid selection or we risk having
+		 * the tree build logic reset it to the first item.
+		 */
+		mode_tree_up(data->data, 0);
+	}
+
 	if ((pb = paste_get_name(item->name)) != NULL)
 		paste_free(pb);
 }
@@ -508,7 +513,7 @@ window_buffer_key(struct window_mode_entry *wme, struct client *c,
 	struct window_buffer_itemdata	*item;
 	int				 finished;
 
-	if (paste_get_top(NULL) == NULL) {
+	if (paste_is_empty()) {
 		finished = 1;
 		goto out;
 	}
@@ -541,7 +546,7 @@ window_buffer_key(struct window_mode_entry *wme, struct client *c,
 	}
 
 out:
-	if (finished || paste_get_top(NULL) == NULL)
+	if (finished || paste_is_empty())
 		window_pane_reset_mode(wp);
 	else {
 		mode_tree_draw(mtd);

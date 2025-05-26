@@ -1,4 +1,4 @@
-/*	$OpenBSD: virtio.h,v 1.51 2024/02/20 21:40:37 dv Exp $	*/
+/*	$OpenBSD: virtio.h,v 1.54 2025/05/12 17:17:42 dv Exp $	*/
 
 /*
  * Copyright (c) 2015 Mike Larkin <mlarkin@openbsd.org>
@@ -53,8 +53,8 @@
 #define VIONET_MAX_TXLEN	VIONET_HARD_MTU + ETHER_HDR_LEN
 
 /* VMM Control Interface shutdown timeout (in seconds) */
-#define VMMCI_TIMEOUT		3
-#define VMMCI_SHUTDOWN_TIMEOUT	120
+#define VMMCI_TIMEOUT_SHORT	3
+#define VMMCI_TIMEOUT_LONG	120
 
 /* All the devices we support have either 1, 2 or 3 queues */
 /* viornd - 1 queue
@@ -321,8 +321,10 @@ struct vmmci_dev {
 	enum vmmci_cmd cmd;
 	uint32_t vm_id;
 	int irq;
-
 	uint8_t pci_id;
+
+	pthread_mutex_t mutex;
+	struct vm_dev_pipe dev_pipe;
 };
 
 /* XXX to be removed once vioscsi is adapted to vectorized io. */
@@ -346,8 +348,8 @@ uint32_t vring_size(uint32_t);
 int vm_device_pipe(struct virtio_dev *, void (*)(int, short, void *),
     struct event_base *);
 int virtio_pci_io(int, uint16_t, uint32_t *, uint8_t *, void *, uint8_t);
-void virtio_assert_pic_irq(struct virtio_dev *, int);
-void virtio_deassert_pic_irq(struct virtio_dev *, int);
+void virtio_assert_irq(struct virtio_dev *, int);
+void virtio_deassert_irq(struct virtio_dev *, int);
 
 int virtio_rnd_io(int, uint16_t, uint32_t *, uint8_t *, void *, uint8_t);
 int viornd_dump(int);
@@ -388,5 +390,9 @@ int vioscsi_io(int, uint16_t, uint32_t *, uint8_t *, void *, uint8_t);
 void vioscsi_update_qs(struct vioscsi_dev *);
 void vioscsi_update_qa(struct vioscsi_dev *);
 int vioscsi_notifyq(struct vioscsi_dev *);
+
+/* imsg handling */
+void	viodev_msg_read(struct imsg *, struct viodev_msg *);
+void	vionet_hostmac_read(struct imsg *, struct vionet_dev *);
 
 #endif /* _VIRTIO_H_ */

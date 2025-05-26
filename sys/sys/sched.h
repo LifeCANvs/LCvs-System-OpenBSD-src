@@ -1,4 +1,4 @@
-/*	$OpenBSD: sched.h,v 1.72 2024/06/03 12:48:25 claudio Exp $	*/
+/*	$OpenBSD: sched.h,v 1.74 2025/05/16 13:40:30 mpi Exp $	*/
 /* $NetBSD: sched.h,v 1.2 1999/02/28 18:14:58 ross Exp $ */
 
 /*-
@@ -108,7 +108,7 @@ struct smr_entry;
 struct schedstate_percpu {
 	struct proc *spc_idleproc;	/* idle proc for this cpu */
 	TAILQ_HEAD(prochead, proc) spc_qs[SCHED_NQS];
-	LIST_HEAD(,proc) spc_deadproc;
+	TAILQ_HEAD(,proc) spc_deadproc;
 	struct timespec spc_runtime;	/* time curproc started running */
 	volatile int spc_schedflags;	/* flags; see below */
 	u_int spc_schedticks;		/* ticks for schedclock() */
@@ -169,6 +169,7 @@ void cpu_idle_enter(void);
 void cpu_idle_cycle(void);
 void cpu_idle_leave(void);
 void sched_peg_curproc(struct cpu_info *ci);
+void sched_unpeg_curproc(void);
 void sched_barrier(struct cpu_info *ci);
 
 int sysctl_hwsetperf(void *, size_t *, void *, size_t);

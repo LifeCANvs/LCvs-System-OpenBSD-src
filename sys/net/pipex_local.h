@@ -1,4 +1,4 @@
-/*	$OpenBSD: pipex_local.h,v 1.52 2024/05/29 00:48:15 jsg Exp $	*/
+/*	$OpenBSD: pipex_local.h,v 1.54 2025/03/02 21:28:32 bluhm Exp $	*/
 
 /*
  * Copyright (c) 2009 Internet Initiative Japan Inc.
@@ -140,6 +140,7 @@ struct pipex_l2tp_session {
 	uint16_t peer_tunnel_id;	/* [I] peer's tunnel-id */
 
 	uint32_t option_flags;		/* [I] protocol options */
+	uint32_t ipsecflowinfo;		/* [I] IPsec SA flow id for NAT-T */
 
 	int16_t ns_gap;		/* [s] gap between userland and pipex */
 	int16_t nr_gap;		/* [s] gap between userland and pipex */
@@ -150,7 +151,6 @@ struct pipex_l2tp_session {
 
 	uint16_t nr_nxt;	/* [s] next sequence number to recv */
 	uint16_t nr_acked;	/* [s] acked sequence number to recv */
-	uint32_t ipsecflowinfo;	/* [s] IPsec SA flow id for NAT-T */
 };
 #endif /* PIPEX_L2TP */
 
@@ -426,16 +426,19 @@ struct pipex_session  *pipex_lookup_by_ip_address_locked (struct in_addr);
 struct pipex_session  *pipex_lookup_by_ip_address (struct in_addr);
 struct pipex_session  *pipex_lookup_by_session_id_locked (int, int);
 struct pipex_session  *pipex_lookup_by_session_id (int, int);
-void                  pipex_ip_output (struct mbuf *, struct pipex_session *);
-void                  pipex_ppp_output (struct mbuf *, struct pipex_session *, int);
-int                   pipex_ppp_proto (struct mbuf *, struct pipex_session *, int, int *);
-void                  pipex_ppp_input (struct mbuf *, struct pipex_session *, int);
-void                  pipex_ip_input (struct mbuf *, struct pipex_session *);
-#ifdef INET6
-void                  pipex_ip6_input (struct mbuf *, struct pipex_session *);
-#endif
+void                  pipex_ip_output(struct mbuf *, struct pipex_session *);
+void                  pipex_ppp_output(struct mbuf *, struct pipex_session *,
+			int);
+int                   pipex_ppp_proto(struct mbuf *, struct pipex_session *,
+			int, int *);
+void                  pipex_ppp_input(struct mbuf *, struct pipex_session *,
+			int, struct netstack *);
+void                  pipex_ip_input(struct mbuf *, struct pipex_session *,
+			struct netstack *);
+void                  pipex_ip6_input(struct mbuf *, struct pipex_session *,
+			struct netstack *);
 struct mbuf           *pipex_common_input(struct pipex_session *,
-                          struct mbuf *, int, int, int);
+                          struct mbuf *, int, int, int, struct netstack *);
 
 #ifdef PIPEX_PPPOE
 void                  pipex_pppoe_output (struct mbuf *, struct pipex_session *);

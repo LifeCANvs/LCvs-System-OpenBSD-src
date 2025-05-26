@@ -1,4 +1,4 @@
-/*	$OpenBSD: if_pppx.c,v 1.128 2023/12/23 10:52:54 bluhm Exp $ */
+/*	$OpenBSD: if_pppx.c,v 1.134 2025/03/02 21:28:32 bluhm Exp $ */
 
 /*
  * Copyright (c) 2010 Claudio Jeker <claudio@openbsd.org>
@@ -401,11 +401,11 @@ pppxwrite(dev_t dev, struct uio *uio, int ioflag)
 
 	switch (proto) {
 	case AF_INET:
-		ipv4_input(&pxi->pxi_if, top);
+		ipv4_input(&pxi->pxi_if, top, NULL);
 		break;
 #ifdef INET6
 	case AF_INET6:
-		ipv6_input(&pxi->pxi_if, top);
+		ipv6_input(&pxi->pxi_if, top, NULL);
 		break;
 #endif
 	default:
@@ -443,8 +443,6 @@ pppxioctl(dev_t dev, u_long cmd, caddr_t addr, int flags, struct proc *p)
 		    (struct pipex_session_descr_req *)addr);
 		break;
 
-	case FIONBIO:
-		break;
 	case FIONREAD:
 		*(int *)addr = mq_hdatalen(&pxd->pxd_svcq);
 		break;
@@ -562,7 +560,7 @@ pppxclose(dev_t dev, int flags, int mode, struct proc *p)
 	mq_purge(&pxd->pxd_svcq);
 
 	klist_free(&pxd->pxd_rklist);
-	klist_free(&pxd->pxd_rklist);
+	klist_free(&pxd->pxd_wklist);
 
 	free(pxd, M_DEVBUF, sizeof(*pxd));
 
@@ -786,10 +784,8 @@ pppx_set_session_descr(struct pppx_dev *pxd,
 	if (pxi == NULL)
 		return (EINVAL);
 
-	NET_LOCK();
 	(void)memset(pxi->pxi_if.if_description, 0, IFDESCRSIZE);
 	strlcpy(pxi->pxi_if.if_description, req->pdr_descr, IFDESCRSIZE);
-	NET_UNLOCK();
 
 	pppx_if_rele(pxi);
 
@@ -1071,7 +1067,7 @@ pppacopen(dev_t dev, int flags, int mode, struct proc *p)
 
 	ifp->if_softc = sc;
 	ifp->if_type = IFT_L3IPVLAN;
-	ifp->if_hdrlen = sizeof(uint32_t); /* for BPF */;
+	ifp->if_hdrlen = sizeof(uint32_t); /* for BPF */
 	ifp->if_mtu = MAXMCLBYTES - sizeof(uint32_t);
 	ifp->if_flags = IFF_SIMPLEX | IFF_BROADCAST;
 	ifp->if_xflags = IFXF_CLONED | IFXF_MPSAFE;
@@ -1197,11 +1193,11 @@ pppacwrite(dev_t dev, struct uio *uio, int ioflag)
 
 	switch (proto) {
 	case AF_INET:
-		ipv4_input(ifp, m);
+		ipv4_input(ifp, m, NULL);
 		break;
 #ifdef INET6
 	case AF_INET6:
-		ipv6_input(ifp, m);
+		ipv6_input(ifp, m, NULL);
 		break;
 #endif
 	default:
@@ -1222,8 +1218,6 @@ pppacioctl(dev_t dev, u_long cmd, caddr_t data, int flags, struct proc *p)
 	int error = 0;
 
 	switch (cmd) {
-	case FIONBIO:
-		break;
 	case FIONREAD:
 		*(int *)data = mq_hdatalen(&sc->sc_mq);
 		break;
@@ -1417,9 +1411,11 @@ pppac_del_session(struct pppac_softc *sc, struct pipex_session_close_req *req)
 		return (EINVAL);
 	}
 	pipex_unlink_session_locked(session);
-	pipex_rele_session(session);
 
 	mtx_leave(&pipex_list_mtx);
+
+	pipex_export_session_stats(session, &req->psr_stat);
+	pipex_rele_session(session);
 
 	return (0);
 }

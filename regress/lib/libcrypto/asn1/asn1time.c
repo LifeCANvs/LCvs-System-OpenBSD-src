@@ -1,4 +1,4 @@
-/* $OpenBSD: asn1time.c,v 1.29 2024/05/25 18:59:03 tb Exp $ */
+/* $OpenBSD: asn1time.c,v 1.31 2025/05/22 04:54:14 joshua Exp $ */
 /*
  * Copyright (c) 2015 Joel Sing <jsing@openbsd.org>
  * Copyright (c) 2024 Google Inc.
@@ -33,6 +33,7 @@ struct asn1_time_test {
 	const char *data;
 	const unsigned char der[32];
 	time_t time;
+	int generalized_time;
 };
 
 static const struct asn1_time_test asn1_invtime_tests[] = {
@@ -73,20 +74,19 @@ static const struct asn1_time_test asn1_invtime_tests[] = {
 	{
 		.str = "aaaaaaaaaaaaaaZ",
 	},
-	/* utc time with omitted seconds, should fail */
 	{
+		/* UTC time with omitted seconds, should fail */
 		.str = "1609082343Z",
 	},
-};
-
-static const struct asn1_time_test asn1_invgentime_tests[] = {
-	/* Generalized time with omitted seconds, should fail */
 	{
+		/* Generalized time with omitted seconds, should fail */
 		.str = "201612081934Z",
+		.generalized_time = 1,
 	},
-	/* Valid UTC time, should fail as a generalized time */
 	{
+		/* Valid UTC time, should fail as a generalized time */
 		.str = "160908234300Z",
+		.generalized_time = 1,
 	},
 };
 
@@ -235,7 +235,7 @@ asn1_compare_str(int test_no, const struct asn1_string_st *asn1str,
 }
 
 static int
-asn1_invtime_test(int test_no, const struct asn1_time_test *att, int gen)
+asn1_invtime_test(int test_no, const struct asn1_time_test *att)
 {
 	ASN1_GENERALIZEDTIME *gt = NULL;
 	ASN1_UTCTIME *ut = NULL;
@@ -255,7 +255,7 @@ asn1_invtime_test(int test_no, const struct asn1_time_test *att, int gen)
 		goto done;
 	}
 
-	if (gen)  {
+	if (att->generalized_time)  {
 		failure = 0;
 		goto done;
 	}
@@ -581,14 +581,16 @@ asn1_time_compare_families(const struct asn1_time_test *fam1, size_t fam1_size,
 			asn1_cmp = ASN1_TIME_compare(t1, t2);
 
 			if (time_cmp != asn1_cmp) {
-				fprintf(stderr, "%s vs. %s: want %d, got %d\n",
+				fprintf(stderr, "ASN1_TIME_compare - %s vs. %s: "
+				    "want %d, got %d\n",
 				    att1->str, att2->str, time_cmp, asn1_cmp);
 				comparison_failure |= 1;
 			}
 
 			time_cmp = ASN1_TIME_cmp_time_t(t1, att2->time);
 			if (time_cmp != asn1_cmp) {
-				fprintf(stderr, "%s vs. %lld: want %d, got %d\n",
+				fprintf(stderr, "ASN1_TIME_cmp_time_t - %s vs. %lld: "
+				    "want %d, got %d\n",
 				    att1->str, (long long)att2->time,
 				    asn1_cmp, time_cmp);
 				comparison_failure |= 1;
@@ -598,7 +600,8 @@ asn1_time_compare_families(const struct asn1_time_test *fam1, size_t fam1_size,
 			if (t1->type != V_ASN1_UTCTIME)
 				asn1_cmp = -2;
 			if (time_cmp != asn1_cmp) {
-				fprintf(stderr, "%s vs. %lld: want %d, got %d\n",
+				fprintf(stderr, "ASN1_UTCTIME_cmp_time_t - %s vs. %lld: "
+				    "want %d, got %d\n",
 				    att1->str, (long long)att2->time,
 				    asn1_cmp, time_cmp);
 				comparison_failure |= 1;
@@ -839,13 +842,7 @@ main(int argc, char **argv)
 	fprintf(stderr, "Invalid time tests...\n");
 	for (i = 0; i < N_INVTIME_TESTS; i++) {
 		att = &asn1_invtime_tests[i];
-		failed |= asn1_invtime_test(i, att, 0);
-	}
-
-	fprintf(stderr, "Invalid generalized time tests...\n");
-	for (i = 0; i < N_INVGENTIME_TESTS; i++) {
-		att = &asn1_invgentime_tests[i];
-		failed |= asn1_invtime_test(i, att, 1);
+		failed |= asn1_invtime_test(i, att);
 	}
 
 	fprintf(stderr, "GENERALIZEDTIME tests...\n");

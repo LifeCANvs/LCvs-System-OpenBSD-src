@@ -46,6 +46,7 @@ struct fb_info {
 	void *par;
 	int fbcon_rotate_hint;
 	bool skip_vt_switch;
+	bool skip_panic;
 	int flags;
 };
 
@@ -60,11 +61,9 @@ struct fb_info {
 #define FBINFO_STATE_RUNNING	0
 #define FBINFO_STATE_SUSPENDED	1
 
-#define FBINFO_DEFAULT		0
-#define FBINFO_VIRTFB		1
-#define FBINFO_READS_FAST	2
-
-#define FBINFO_HIDE_SMEM_START	0
+#define FBINFO_VIRTFB		0x0001
+#define FBINFO_READS_FAST	0x0002
+#define FBINFO_HIDE_SMEM_START	0x0004
 
 #define FB_ROTATE_UR		0
 #define FB_ROTATE_CW		1
@@ -72,6 +71,8 @@ struct fb_info {
 #define FB_ROTATE_CCW		3
 
 #define FB_GEN_DEFAULT_DEFERRED_IOMEM_OPS(a, b, c)
+#define FB_GEN_DEFAULT_DEFERRED_DMAMEM_OPS(a, b, c)
+#define FB_GEN_DEFAULT_DEFERRED_SYSMEM_OPS(a, b, c)
 
 static inline struct fb_info *
 framebuffer_alloc(size_t size, void *dev)
@@ -106,6 +107,11 @@ register_framebuffer(struct fb_info *fbi)
 
 static inline void
 unregister_framebuffer(struct fb_info *fbi)
+{
+}
+
+static inline void
+fb_deferred_io_cleanup(struct fb_info *fbi)
 {
 }
 

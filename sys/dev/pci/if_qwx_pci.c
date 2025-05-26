@@ -1,4 +1,4 @@
-/*	$OpenBSD: if_qwx_pci.c,v 1.19 2024/05/28 09:26:55 stsp Exp $	*/
+/*	$OpenBSD: if_qwx_pci.c,v 1.24 2025/03/28 13:55:27 kevlo Exp $	*/
 
 /*
  * Copyright 2023 Stefan Sperling <stsp@openbsd.org>
@@ -123,6 +123,8 @@
 #define TCSR_SOC_HW_VERSION		0x0224
 #define TCSR_SOC_HW_VERSION_MAJOR_MASK	GENMASK(11, 8)
 #define TCSR_SOC_HW_VERSION_MINOR_MASK	GENMASK(7, 0)
+
+#define TCSR_SOC_HW_SUB_VER		0x1910010
 
 /*
  * pci.h
@@ -374,11 +376,9 @@ struct qwx_pci_softc {
 	struct qwx_dmamem	*cmd_ctxt;
 
 
-	struct qwx_pci_xfer_ring xfer_rings[4];
-#define QWX_PCI_XFER_RING_LOOPBACK_OUTBOUND	0
-#define QWX_PCI_XFER_RING_LOOPBACK_INBOUND	1
-#define QWX_PCI_XFER_RING_IPCR_OUTBOUND		2
-#define QWX_PCI_XFER_RING_IPCR_INBOUND		3
+	struct qwx_pci_xfer_ring xfer_rings[2];
+#define QWX_PCI_XFER_RING_IPCR_OUTBOUND		0
+#define QWX_PCI_XFER_RING_IPCR_INBOUND		1
 	struct qwx_pci_event_ring event_rings[QWX_NUM_EVENT_CTX];
 	struct qwx_pci_cmd_ring cmd_ring;
 };
@@ -603,6 +603,17 @@ const struct qwx_msi_config qwx_msi_config[] = {
 		},
 		.hw_rev = ATH11K_HW_WCN6750_HW10,
 	},
+	{
+		.total_vectors = 32,
+		.total_users = 4,
+		.users = (struct qwx_msi_user[]) {
+			{ .name = "MHI", .num_vectors = 3, .base_vector = 0 },
+			{ .name = "CE", .num_vectors = 10, .base_vector = 3 },
+			{ .name = "WAKE", .num_vectors = 1, .base_vector = 13 },
+			{ .name = "DP", .num_vectors = 18, .base_vector = 14 },
+		},
+		.hw_rev = ATH11K_HW_QCA2066_HW21,
+	},
 };
 
 int
@@ -744,8 +755,7 @@ qwx_pci_attach(struct device *parent, struct device *self, void *aux)
 	struct qwx_softc *sc = &psc->sc_sc;
 	struct ieee80211com *ic = &sc->sc_ic;
 	struct ifnet *ifp = &ic->ic_if;
-	uint32_t soc_hw_version_major, soc_hw_version_minor;
-	const struct qwx_pci_ops *pci_ops;
+	uint32_t soc_hw_version_major, soc_hw_version_minor, sub_version;
 	struct pci_attach_args *pa = aux;
 	pci_intr_handle_t ih;
 	pcireg_t memtype, reg;
@@ -884,6 +894,9 @@ qwx_pci_attach(struct device *parent, struct device *self, void *aux)
 
 	pci_set_powerstate(pa->pa_pc, pa->pa_tag, PCI_PMCSR_STATE_D0);
 
+	/* register PCI ops */
+	psc->sc_pci_ops = &qwx_pci_ops_qca6390;
+
 	switch (PCI_PRODUCT(pa->pa_id)) {
 	case PCI_PRODUCT_QUALCOMM_QCA6390:
 		qwx_pci_read_hw_version(sc, &soc_hw_version_major,
@@ -898,11 +911,10 @@ qwx_pci_attach(struct device *parent, struct device *self, void *aux)
 			return;
 		}
 
-		pci_ops = &qwx_pci_ops_qca6390;
 		psc->max_chan = QWX_MHI_CONFIG_QCA6390_MAX_CHANNELS;
 		break;
 	case PCI_PRODUCT_QUALCOMM_QCN9074:
-		pci_ops = &qwx_pci_ops_qcn9074;
+		psc->sc_pci_ops = &qwx_pci_ops_qcn9074;
 		sc->sc_hw_rev = ATH11K_HW_QCN9074_HW10;
 		psc->max_chan = QWX_MHI_CONFIG_QCA9074_MAX_CHANNELS;
 		break;
@@ -919,7 +931,18 @@ qwx_pci_attach(struct device *parent, struct device *self, void *aux)
 				break;
 			case 0x10:
 			case 0x11:
-				sc->sc_hw_rev = ATH11K_HW_WCN6855_HW21;
+				sub_version =
+				    qwx_pcic_read32(sc, TCSR_SOC_HW_SUB_VER);
+				switch (sub_version) {
+				case 0x1019a0e1:
+				case 0x1019b0e1:
+				case 0x1019c0e1:
+				case 0x1019d0e1:
+					sc->sc_hw_rev = ATH11K_HW_QCA2066_HW21;
+					break;
+				default:
+					sc->sc_hw_rev = ATH11K_HW_WCN6855_HW21;
+				}
 				break;
 			default:
 				goto unsupported_wcn6855_soc;
@@ -932,16 +955,12 @@ unsupported_wcn6855_soc:
 			return;
 		}
 
-		pci_ops = &qwx_pci_ops_qca6390;
 		psc->max_chan = QWX_MHI_CONFIG_QCA6390_MAX_CHANNELS;
 		break;
 	default:
 		printf(": unsupported chip\n");
 		return;
 	}
-
-	/* register PCI ops */
-	psc->sc_pci_ops = pci_ops;
 
 	error = qwx_pcic_init_msi_config(sc);
 	if (error)
@@ -1297,18 +1316,6 @@ qwx_pci_alloc_xfer_rings_qca6390(struct qwx_pci_softc *psc)
 	int ret;
 
 	ret = qwx_pci_alloc_xfer_ring(sc,
-	    &psc->xfer_rings[QWX_PCI_XFER_RING_LOOPBACK_OUTBOUND],
-	    0, MHI_CHAN_TYPE_OUTBOUND, 0, 32);
-	if (ret)
-		goto fail;
-
-	ret = qwx_pci_alloc_xfer_ring(sc,
-	    &psc->xfer_rings[QWX_PCI_XFER_RING_LOOPBACK_INBOUND],
-	    1, MHI_CHAN_TYPE_INBOUND, 0, 32);
-	if (ret)
-		goto fail;
-
-	ret = qwx_pci_alloc_xfer_ring(sc,
 	    &psc->xfer_rings[QWX_PCI_XFER_RING_IPCR_OUTBOUND],
 	    20, MHI_CHAN_TYPE_OUTBOUND, 1, 64);
 	if (ret)
@@ -1331,18 +1338,6 @@ qwx_pci_alloc_xfer_rings_qcn9074(struct qwx_pci_softc *psc)
 {
 	struct qwx_softc *sc = &psc->sc_sc;
 	int ret;
-
-	ret = qwx_pci_alloc_xfer_ring(sc,
-	    &psc->xfer_rings[QWX_PCI_XFER_RING_LOOPBACK_OUTBOUND],
-	    0, MHI_CHAN_TYPE_OUTBOUND, 1, 32);
-	if (ret)
-		goto fail;
-
-	ret = qwx_pci_alloc_xfer_ring(sc,
-	    &psc->xfer_rings[QWX_PCI_XFER_RING_LOOPBACK_INBOUND],
-	    1, MHI_CHAN_TYPE_INBOUND, 1, 32);
-	if (ret)
-		goto fail;
 
 	ret = qwx_pci_alloc_xfer_ring(sc,
 	    &psc->xfer_rings[QWX_PCI_XFER_RING_IPCR_OUTBOUND],
@@ -4091,7 +4086,9 @@ qwx_pci_intr(void *arg)
 #else
 		printf("%s: fatal firmware error\n",
 		   sc->sc_dev.dv_xname);
-		if (!test_bit(ATH11K_FLAG_CRASH_FLUSH, sc->sc_flags)) {
+		if (!test_bit(ATH11K_FLAG_CRASH_FLUSH, sc->sc_flags) &&
+		    (sc->sc_ic.ic_if.if_flags & (IFF_UP | IFF_RUNNING)) ==
+		    (IFF_UP | IFF_RUNNING)) {
 			/* Try to reset the device. */
 			set_bit(ATH11K_FLAG_CRASH_FLUSH, sc->sc_flags);
 			task_add(systq, &sc->init_task);
@@ -4128,9 +4125,11 @@ qwx_pci_intr(void *arg)
 				ret = 1;
 		}
 
-		for (i = 0; i < nitems(sc->ext_irq_grp); i++) {
-			if (qwx_dp_service_srng(sc, i))
-				ret = 1;
+		if (test_bit(ATH11K_FLAG_EXT_IRQ_ENABLED, sc->sc_flags)) {
+			for (i = 0; i < nitems(sc->ext_irq_grp); i++) {
+				if (qwx_dp_service_srng(sc, i))
+					ret = 1;
+			}
 		}
 	}
 

@@ -1,4 +1,4 @@
-/* $OpenBSD: x509_lib.c,v 1.21 2024/05/28 15:40:38 tb Exp $ */
+/* $OpenBSD: x509_lib.c,v 1.25 2025/05/10 05:54:39 tb Exp $ */
 /* Written by Dr Stephen N Henson (steve@openssl.org) for the OpenSSL
  * project 1999.
  */
@@ -60,94 +60,109 @@
 #include <stdio.h>
 
 #include <openssl/conf.h>
-#include <openssl/err.h>
 #include <openssl/x509v3.h>
 
+#include "err_local.h"
 #include "x509_local.h"
-
-extern const X509V3_EXT_METHOD v3_bcons, v3_nscert, v3_key_usage, v3_ext_ku;
-extern const X509V3_EXT_METHOD v3_pkey_usage_period, v3_info, v3_sinfo;
-extern const X509V3_EXT_METHOD v3_ns_ia5_list[], v3_alt[], v3_skey_id, v3_akey_id;
-extern const X509V3_EXT_METHOD v3_crl_num, v3_crl_reason, v3_crl_invdate;
-extern const X509V3_EXT_METHOD v3_delta_crl, v3_cpols, v3_crld, v3_freshest_crl;
-extern const X509V3_EXT_METHOD v3_ocsp_nonce, v3_ocsp_accresp, v3_ocsp_acutoff;
-extern const X509V3_EXT_METHOD v3_ocsp_crlid, v3_ocsp_nocheck, v3_ocsp_serviceloc;
-extern const X509V3_EXT_METHOD v3_crl_hold;
-extern const X509V3_EXT_METHOD v3_policy_mappings, v3_policy_constraints;
-extern const X509V3_EXT_METHOD v3_name_constraints, v3_inhibit_anyp, v3_idp;
-extern const X509V3_EXT_METHOD v3_addr, v3_asid;
-extern const X509V3_EXT_METHOD v3_ct_scts[3];
-
-static const X509V3_EXT_METHOD *standard_exts[] = {
-	&v3_nscert,
-	&v3_ns_ia5_list[0],
-	&v3_ns_ia5_list[1],
-	&v3_ns_ia5_list[2],
-	&v3_ns_ia5_list[3],
-	&v3_ns_ia5_list[4],
-	&v3_ns_ia5_list[5],
-	&v3_ns_ia5_list[6],
-	&v3_skey_id,
-	&v3_key_usage,
-	&v3_pkey_usage_period,
-	&v3_alt[0],
-	&v3_alt[1],
-	&v3_bcons,
-	&v3_crl_num,
-	&v3_cpols,
-	&v3_akey_id,
-	&v3_crld,
-	&v3_ext_ku,
-	&v3_delta_crl,
-	&v3_crl_reason,
-#ifndef OPENSSL_NO_OCSP
-	&v3_crl_invdate,
-#endif
-	&v3_info,
-#ifndef OPENSSL_NO_RFC3779
-	&v3_addr,
-	&v3_asid,
-#endif
-#ifndef OPENSSL_NO_OCSP
-	&v3_ocsp_nonce,
-	&v3_ocsp_crlid,
-	&v3_ocsp_accresp,
-	&v3_ocsp_nocheck,
-	&v3_ocsp_acutoff,
-	&v3_ocsp_serviceloc,
-#endif
-	&v3_sinfo,
-	&v3_policy_constraints,
-#ifndef OPENSSL_NO_OCSP
-	&v3_crl_hold,
-#endif
-	&v3_name_constraints,
-	&v3_policy_mappings,
-	&v3_inhibit_anyp,
-	&v3_idp,
-	&v3_alt[2],
-	&v3_freshest_crl,
-#ifndef OPENSSL_NO_CT
-	&v3_ct_scts[0],
-	&v3_ct_scts[1],
-	&v3_ct_scts[2],
-#endif
-};
-
-#define STANDARD_EXTENSION_COUNT (sizeof(standard_exts) / sizeof(standard_exts[0]))
 
 const X509V3_EXT_METHOD *
 X509V3_EXT_get_nid(int nid)
 {
-	size_t i;
-
-	for (i = 0; i < STANDARD_EXTENSION_COUNT; i++) {
-		if (standard_exts[i]->ext_nid == nid)
-			return standard_exts[i];
+	switch (nid) {
+	case NID_authority_key_identifier:
+		return x509v3_ext_method_authority_key_identifier();
+	case NID_basic_constraints:
+		return x509v3_ext_method_basic_constraints();
+	case NID_certificate_issuer:
+		return x509v3_ext_method_certificate_issuer();
+	case NID_certificate_policies:
+		return x509v3_ext_method_certificate_policies();
+	case NID_crl_distribution_points:
+		return x509v3_ext_method_crl_distribution_points();
+	case NID_crl_number:
+		return x509v3_ext_method_crl_number();
+	case NID_crl_reason:
+		return x509v3_ext_method_crl_reason();
+#ifndef OPENSSL_NO_CT
+	case NID_ct_cert_scts:
+		return x509v3_ext_method_ct_cert_scts();
+	case NID_ct_precert_poison:
+		return x509v3_ext_method_ct_precert_poison();
+	case NID_ct_precert_scts:
+		return x509v3_ext_method_ct_precert_scts();
+#endif
+	case NID_delta_crl:
+		return x509v3_ext_method_delta_crl();
+	case NID_ext_key_usage:
+		return x509v3_ext_method_ext_key_usage();
+	case NID_freshest_crl:
+		return x509v3_ext_method_freshest_crl();
+#ifndef OPENSSL_NO_OCSP
+	case NID_hold_instruction_code:
+		return x509v3_ext_method_hold_instruction_code();
+	case NID_id_pkix_OCSP_CrlID:
+		return x509v3_ext_method_id_pkix_OCSP_CrlID();
+	case NID_id_pkix_OCSP_Nonce:
+		return x509v3_ext_method_id_pkix_OCSP_Nonce();
+	case NID_id_pkix_OCSP_acceptableResponses:
+		return x509v3_ext_method_id_pkix_OCSP_acceptableResponses();
+	case NID_id_pkix_OCSP_archiveCutoff:
+		return x509v3_ext_method_id_pkix_OCSP_archiveCutoff();
+	case NID_id_pkix_OCSP_serviceLocator:
+		return x509v3_ext_method_id_pkix_OCSP_serviceLocator();
+#endif
+	case NID_info_access:
+		return x509v3_ext_method_info_access();
+	case NID_inhibit_any_policy:
+		return x509v3_ext_method_inhibit_any_policy();
+	case NID_invalidity_date:
+		return x509v3_ext_method_invalidity_date();
+	case NID_issuer_alt_name:
+		return x509v3_ext_method_issuer_alt_name();
+	case NID_issuing_distribution_point:
+		return x509v3_ext_method_issuing_distribution_point();
+	case NID_key_usage:
+		return x509v3_ext_method_key_usage();
+	case NID_name_constraints:
+		return x509v3_ext_method_name_constraints();
+	case NID_netscape_base_url:
+		return x509v3_ext_method_netscape_base_url();
+	case NID_netscape_ca_policy_url:
+		return x509v3_ext_method_netscape_ca_policy_url();
+	case NID_netscape_ca_revocation_url:
+		return x509v3_ext_method_netscape_ca_revocation_url();
+	case NID_netscape_cert_type:
+		return x509v3_ext_method_netscape_cert_type();
+	case NID_netscape_comment:
+		return x509v3_ext_method_netscape_comment();
+	case NID_netscape_renewal_url:
+		return x509v3_ext_method_netscape_renewal_url();
+	case NID_netscape_revocation_url:
+		return x509v3_ext_method_netscape_revocation_url();
+	case NID_netscape_ssl_server_name:
+		return x509v3_ext_method_netscape_ssl_server_name();
+	case NID_policy_constraints:
+		return x509v3_ext_method_policy_constraints();
+	case NID_policy_mappings:
+		return x509v3_ext_method_policy_mappings();
+	case NID_private_key_usage_period:
+		return x509v3_ext_method_private_key_usage_period();
+#ifndef OPENSSL_NO_RFC3779
+	case NID_sbgp_ipAddrBlock:
+		return x509v3_ext_method_sbgp_ipAddrBlock();
+	case NID_sbgp_autonomousSysNum:
+		return x509v3_ext_method_sbgp_autonomousSysNum();
+#endif
+	case NID_sinfo_access:
+		return x509v3_ext_method_sinfo_access();
+	case NID_subject_alt_name:
+		return x509v3_ext_method_subject_alt_name();
+	case NID_subject_key_identifier:
+		return x509v3_ext_method_subject_key_identifier();
+	default:
+		return NULL;
 	}
-
-	return NULL;
-}
+};
 LCRYPTO_ALIAS(X509V3_EXT_get_nid);
 
 const X509V3_EXT_METHOD *
@@ -178,77 +193,69 @@ X509V3_EXT_d2i(X509_EXTENSION *ext)
 }
 LCRYPTO_ALIAS(X509V3_EXT_d2i);
 
-/* Get critical flag and decoded version of extension from a NID.
- * The "idx" variable returns the last found extension and can
- * be used to retrieve multiple extensions of the same NID.
- * However multiple extensions with the same NID is usually
- * due to a badly encoded certificate so if idx is NULL we
- * choke if multiple extensions exist.
- * The "crit" variable is set to the critical value.
- * The return value is the decoded extension or NULL on
- * error. The actual error can have several different causes,
- * the value of *crit reflects the cause:
- * >= 0, extension found but not decoded (reflects critical value).
- * -1 extension not found.
- * -2 extension occurs more than once.
+/*
+ * This API is only safe to call with known nid, crit != NULL and idx == NULL.
+ * On NULL return, crit acts as a failure indicator: crit == -1 means an
+ * extension of type nid was not present, crit != -1 is fatal: crit == -2
+ * means multiple extensions of type nid are present; if crit is 0 or 1, this
+ * implies the extension was found but could not be decoded.
  */
 
 void *
-X509V3_get_d2i(const STACK_OF(X509_EXTENSION) *x, int nid, int *crit, int *idx)
+X509V3_get_d2i(const STACK_OF(X509_EXTENSION) *x509_exts, int nid, int *crit,
+    int *idx)
 {
-	int lastpos, i;
-	X509_EXTENSION *ex, *found_ex = NULL;
+	X509_EXTENSION *ext;
+	int lastpos = idx == NULL ? -1 : *idx;
 
-	if (!x) {
-		if (idx)
-			*idx = -1;
-		if (crit)
-			*crit = -1;
+	if (crit != NULL)
+		*crit = -1;
+	if (idx != NULL)
+		*idx = -1;
+
+	/*
+	 * Nothing to do if no extensions, unknown nid, or missing extension.
+	 */
+
+	if (x509_exts == NULL)
+		return NULL;
+	if ((lastpos = X509v3_get_ext_by_NID(x509_exts, nid, lastpos)) < 0)
+		return NULL;
+	if ((ext = X509v3_get_ext(x509_exts, lastpos)) == NULL)
+		return NULL;
+
+	/*
+	 * API madness. Only check for a second extension of type nid if
+	 * idx == NULL. Indicate this by setting *crit to -2. If idx != NULL,
+	 * don't care and set *idx to the index of the first extension found.
+	 */
+
+	if (idx == NULL && X509v3_get_ext_by_NID(x509_exts, nid, lastpos) > 0) {
+		if (crit != NULL)
+			*crit = -2;
 		return NULL;
 	}
-	if (idx)
-		lastpos = *idx + 1;
-	else
-		lastpos = 0;
-	if (lastpos < 0)
-		lastpos = 0;
-	for (i = lastpos; i < sk_X509_EXTENSION_num(x); i++) {
-		ex = sk_X509_EXTENSION_value(x, i);
-		if (OBJ_obj2nid(ex->object) == nid) {
-			if (idx) {
-				*idx = i;
-				found_ex = ex;
-				break;
-			} else if (found_ex) {
-				/* Found more than one */
-				if (crit)
-					*crit = -2;
-				return NULL;
-			}
-			found_ex = ex;
-		}
-	}
-	if (found_ex) {
-		/* Found it */
-		if (crit)
-			*crit = X509_EXTENSION_get_critical(found_ex);
-		return X509V3_EXT_d2i(found_ex);
-	}
 
-	/* Extension not found */
-	if (idx)
-		*idx = -1;
-	if (crit)
-		*crit = -1;
-	return NULL;
+	/*
+	 * Another beautiful API detail: *crit will be set to 0 or 1, so if the
+	 * extension fails to decode, we can deduce this from return value NULL
+	 * and crit != -1.
+	 */
+
+	if (crit != NULL)
+		*crit = X509_EXTENSION_get_critical(ext);
+	if (idx != NULL)
+		*idx = lastpos;
+
+	return X509V3_EXT_d2i(ext);
 }
 LCRYPTO_ALIAS(X509V3_get_d2i);
 
 int
-X509V3_add1_i2d(STACK_OF(X509_EXTENSION) **x, int nid, void *value,
+X509V3_add1_i2d(STACK_OF(X509_EXTENSION) **x509_exts, int nid, void *value,
     int crit, unsigned long flags)
 {
-	STACK_OF(X509_EXTENSION) *exts = *x;
+	STACK_OF(X509_EXTENSION) *exts = *x509_exts;
 	X509_EXTENSION *ext = NULL;
 	X509_EXTENSION *existing;
 	int extidx;
@@ -256,7 +263,7 @@ X509V3_add1_i2d(STACK_OF(X509_EXTENSION) **x, int nid, void *value,
 	int ret = 0;
 
 	/* See if the extension already exists. */
-	extidx = X509v3_get_ext_by_NID(*x, nid, -1);
+	extidx = X509v3_get_ext_by_NID(*x509_exts, nid, -1);
 
 	switch (flags & X509V3_ADD_OP_MASK) {
 	case X509V3_ADD_DEFAULT:
@@ -296,7 +303,8 @@ X509V3_add1_i2d(STACK_OF(X509_EXTENSION) **x, int nid, void *value,
 			errcode = X509V3_R_EXTENSION_NOT_FOUND;
 			goto err;
 		}
-		if ((existing = sk_X509_EXTENSION_delete(*x, extidx)) == NULL) {
+		if ((existing = sk_X509_EXTENSION_delete(*x509_exts,
+		    extidx)) == NULL) {
 			ret = -1;
 			goto err;
 		}
@@ -319,10 +327,10 @@ X509V3_add1_i2d(STACK_OF(X509_EXTENSION) **x, int nid, void *value,
 
 	/* If extension exists, replace it. */
 	if (extidx >= 0) {
-		existing = sk_X509_EXTENSION_value(*x, extidx);
+		existing = sk_X509_EXTENSION_value(*x509_exts, extidx);
 		X509_EXTENSION_free(existing);
 		existing = NULL;
-		if (sk_X509_EXTENSION_set(*x, extidx, ext) == NULL) {
+		if (sk_X509_EXTENSION_set(*x509_exts, extidx, ext) == NULL) {
 			/*
 			 * XXX - Can't happen. If it did happen, |existing| is
 			 * now a freed pointer. Nothing we can do here.
@@ -341,7 +349,7 @@ X509V3_add1_i2d(STACK_OF(X509_EXTENSION) **x, int nid, void *value,
 		goto err;
 	ext = NULL;
 
-	*x = exts;
+	*x509_exts = exts;
 
  done:
 	return 1;
@@ -350,7 +358,7 @@ X509V3_add1_i2d(STACK_OF(X509_EXTENSION) **x, int nid, void *value,
 	if ((flags & X509V3_ADD_SILENT) == 0 && errcode != 0)
 		X509V3error(errcode);
 
-	if (exts != *x)
+	if (exts != *x509_exts)
 		sk_X509_EXTENSION_pop_free(exts, X509_EXTENSION_free);
 	X509_EXTENSION_free(ext);
 

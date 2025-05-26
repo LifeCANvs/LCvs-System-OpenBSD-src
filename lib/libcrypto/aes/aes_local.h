@@ -1,4 +1,4 @@
-/* $OpenBSD: aes_local.h,v 1.3 2024/03/27 11:15:44 jsing Exp $ */
+/* $OpenBSD: aes_local.h,v 1.5 2025/04/21 12:23:09 jsing Exp $ */
 /* ====================================================================
  * Copyright (c) 1998-2002 The OpenSSL Project.  All rights reserved.
  *
@@ -54,19 +54,11 @@
 
 #include <openssl/opensslconf.h>
 
-#ifdef OPENSSL_NO_AES
-#error AES is disabled.
-#endif
-
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
 __BEGIN_HIDDEN_DECLS
-
-typedef unsigned int u32;
-typedef unsigned short u16;
-typedef unsigned char u8;
 
 #define MAXKC   (256/32)
 #define MAXKB   (256/8)

@@ -1,4 +1,4 @@
-/*	$OpenBSD: newsyslog.c,v 1.114 2024/04/22 14:20:35 millert Exp $	*/
+/*	$OpenBSD: newsyslog.c,v 1.116 2025/05/08 15:30:41 deraadt Exp $	*/
 
 /*
  * Copyright (c) 1999, 2002, 2003 Todd C. Miller <millert@openbsd.org>
@@ -191,10 +191,6 @@ main(int argc, char **argv)
 	TAILQ_INIT(&config);
 	TAILQ_INIT(&runlist);
 
-	/* Keep passwd and group files open for faster lookups. */
-	setpassent(1);
-	setgroupent(1);
-
 	ret = parse_file(&config, &listlen);
 	if (argc == 0)
 		TAILQ_CONCAT(&runlist, &config, next);
@@ -284,6 +280,7 @@ do_entry(struct conf_entry *ent)
 	struct stat sb;
 	int modhours;
 	off_t size;
+	int oversized;
 
 	if (lstat(ent->log, &sb) != 0)
 		return;
@@ -307,8 +304,9 @@ do_entry(struct conf_entry *ent)
 	    (ent->flags & CE_FOLLOW) ? "F" : "",
 	    (ent->flags & CE_MONITOR) && monitormode ? "M" : ""));
 	size = sizefile(&sb);
+	oversized = (ent->size > 0 && size >= ent->size);
 	modhours = age_old_log(ent);
-	if (ent->flags & CE_TRIMAT && !force) {
+	if (ent->flags & CE_TRIMAT && !force && !oversized) {
 		if (timenow < ent->trim_at ||
 		    difftime(timenow, ent->trim_at) >= 60 * 60) {
 			DPRINTF(("--> will trim at %s",
@@ -326,7 +324,7 @@ do_entry(struct conf_entry *ent)
 	if (monitormode && (ent->flags & CE_MONITOR) && domonitor(ent))
 		DPRINTF(("--> monitored\n"));
 	else if (!monitormode &&
-	    (force || (ent->size > 0 && size >= ent->size) ||
+	    (force || oversized ||
 	    (ent->hours <= 0 && (ent->flags & CE_TRIMAT)) ||
 	    (ent->hours > 0 && (modhours >= ent->hours || modhours < 0)
 	    && ((ent->flags & CE_BINARY) || size >= MIN_SIZE)))) {

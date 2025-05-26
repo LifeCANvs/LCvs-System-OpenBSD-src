@@ -1,4 +1,4 @@
-/*	$OpenBSD: kern_event.c,v 1.198 2023/08/20 15:13:43 visa Exp $	*/
+/*	$OpenBSD: kern_event.c,v 1.205 2025/05/21 14:10:16 visa Exp $	*/
 
 /*-
  * Copyright (c) 1999,2000,2001 Jonathan Lemon <jlemon@FreeBSD.org>
@@ -30,6 +30,7 @@
 
 #include <sys/param.h>
 #include <sys/systm.h>
+#include <sys/atomic.h>
 #include <sys/proc.h>
 #include <sys/pledge.h>
 #include <sys/malloc.h>
@@ -124,12 +125,22 @@ int	filt_kqueue_common(struct knote *kn, struct kqueue *kq);
 int	filt_procattach(struct knote *kn);
 void	filt_procdetach(struct knote *kn);
 int	filt_proc(struct knote *kn, long hint);
+int	filt_procmodify(struct kevent *kev, struct knote *kn);
+int	filt_procprocess(struct knote *kn, struct kevent *kev);
+int	filt_sigattach(struct knote *kn);
+void	filt_sigdetach(struct knote *kn);
+int	filt_signal(struct knote *kn, long hint);
 int	filt_fileattach(struct knote *kn);
 void	filt_timerexpire(void *knx);
+void	filt_dotimerexpire(struct knote *kn);
 int	filt_timerattach(struct knote *kn);
 void	filt_timerdetach(struct knote *kn);
 int	filt_timermodify(struct kevent *kev, struct knote *kn);
 int	filt_timerprocess(struct knote *kn, struct kevent *kev);
+int	filt_userattach(struct knote *kn);
+void	filt_userdetach(struct knote *kn);
+int	filt_usermodify(struct kevent *kev, struct knote *kn);
+int	filt_userprocess(struct knote *kn, struct kevent *kev);
 void	filt_seltruedetach(struct knote *kn);
 
 const struct filterops kqread_filtops = {
@@ -142,10 +153,21 @@ const struct filterops kqread_filtops = {
 };
 
 const struct filterops proc_filtops = {
-	.f_flags	= 0,
+	.f_flags	= FILTEROP_MPSAFE,
 	.f_attach	= filt_procattach,
 	.f_detach	= filt_procdetach,
 	.f_event	= filt_proc,
+	.f_modify	= filt_procmodify,
+	.f_process	= filt_procprocess,
+};
+
+const struct filterops sig_filtops = {
+	.f_flags	= FILTEROP_MPSAFE,
+	.f_attach	= filt_sigattach,
+	.f_detach	= filt_sigdetach,
+	.f_event	= filt_signal,
+	.f_modify	= filt_procmodify,
+	.f_process	= filt_procprocess,
 };
 
 const struct filterops file_filtops = {
@@ -156,7 +178,7 @@ const struct filterops file_filtops = {
 };
 
 const struct filterops timer_filtops = {
-	.f_flags	= 0,
+	.f_flags	= FILTEROP_MPSAFE,
 	.f_attach	= filt_timerattach,
 	.f_detach	= filt_timerdetach,
 	.f_event	= NULL,
@@ -164,11 +186,27 @@ const struct filterops timer_filtops = {
 	.f_process	= filt_timerprocess,
 };
 
+const struct filterops user_filtops = {
+	.f_flags	= FILTEROP_MPSAFE,
+	.f_attach	= filt_userattach,
+	.f_detach	= filt_userdetach,
+	.f_event	= NULL,
+	.f_modify	= filt_usermodify,
+	.f_process	= filt_userprocess,
+};
+
+/*
+ * Locking:
+ *	I	immutable after creation
+ *	a	atomic operations
+ *	t	ft_mtx
+ */
+
 struct	pool knote_pool;
 struct	pool kqueue_pool;
 struct	mutex kqueue_klist_lock = MUTEX_INITIALIZER(IPL_MPFLOOR);
-int kq_ntimeouts = 0;
-int kq_timeoutmax = (4 * 1024);
+struct	rwlock kqueue_ps_list_lock = RWLOCK_INITIALIZER("kqpsl");
+unsigned int kq_usereventsmax = 1024;	/* per process */
 
 #define KN_HASH(val, mask)	(((val) ^ (val >> 8)) & (mask))
 
@@ -185,6 +223,7 @@ const struct filterops *const sysfilt_ops[] = {
 	&timer_filtops,			/* EVFILT_TIMER */
 	&file_filtops,			/* EVFILT_DEVICE */
 	&file_filtops,			/* EVFILT_EXCEPT */
+	&user_filtops,			/* EVFILT_USER */
 };
 
 void
@@ -323,22 +362,23 @@ int
 filt_procattach(struct knote *kn)
 {
 	struct process *pr;
-	int s;
+	int nolock;
 
 	if ((curproc->p_p->ps_flags & PS_PLEDGE) &&
-	    (curproc->p_p->ps_pledge & PLEDGE_PROC) == 0)
+	    (curproc->p_pledge & PLEDGE_PROC) == 0)
 		return pledge_fail(curproc, EPERM, PLEDGE_PROC);
 
 	if (kn->kn_id > PID_MAX)
 		return ESRCH;
 
+	KERNEL_LOCK();
 	pr = prfind(kn->kn_id);
 	if (pr == NULL)
-		return (ESRCH);
+		goto fail;
 
 	/* exiting processes can't be specified */
 	if (pr->ps_flags & PS_EXITING)
-		return (ESRCH);
+		goto fail;
 
 	kn->kn_ptr.p_process = pr;
 	kn->kn_flags |= EV_CLEAR;		/* automatically set */
@@ -350,13 +390,26 @@ filt_procattach(struct knote *kn)
 		kn->kn_data = kn->kn_sdata;		/* ppid */
 		kn->kn_fflags = NOTE_CHILD;
 		kn->kn_flags &= ~EV_FLAG1;
+		rw_assert_wrlock(&kqueue_ps_list_lock);
 	}
 
-	s = splhigh();
+	/* this needs both the ps_mtx and exclusive kqueue_ps_list_lock. */
+	nolock = (rw_status(&kqueue_ps_list_lock) == RW_WRITE);
+	if (!nolock)
+		rw_enter_write(&kqueue_ps_list_lock);
+	mtx_enter(&pr->ps_mtx);
 	klist_insert_locked(&pr->ps_klist, kn);
-	splx(s);
+	mtx_leave(&pr->ps_mtx);
+	if (!nolock)
+		rw_exit_write(&kqueue_ps_list_lock);
+
+	KERNEL_UNLOCK();
 
 	return (0);
+
+fail:
+	KERNEL_UNLOCK();
+	return (ESRCH);
 }
 
 /*
@@ -370,25 +423,25 @@ filt_procattach(struct knote *kn)
 void
 filt_procdetach(struct knote *kn)
 {
-	struct kqueue *kq = kn->kn_kq;
 	struct process *pr = kn->kn_ptr.p_process;
-	int s, status;
+	int status;
 
-	mtx_enter(&kq->kq_lock);
+	/* this needs both the ps_mtx and exclusive kqueue_ps_list_lock. */
+	rw_enter_write(&kqueue_ps_list_lock);
+	mtx_enter(&pr->ps_mtx);
 	status = kn->kn_status;
-	mtx_leave(&kq->kq_lock);
 
-	if (status & KN_DETACHED)
-		return;
+	if ((status & KN_DETACHED) == 0)
+		klist_remove_locked(&pr->ps_klist, kn);
 
-	s = splhigh();
-	klist_remove_locked(&pr->ps_klist, kn);
-	splx(s);
+	mtx_leave(&pr->ps_mtx);
+	rw_exit_write(&kqueue_ps_list_lock);
 }
 
 int
 filt_proc(struct knote *kn, long hint)
 {
+	struct process *pr = kn->kn_ptr.p_process;
 	struct kqueue *kq = kn->kn_kq;
 	u_int event;
 
@@ -409,17 +462,14 @@ filt_proc(struct knote *kn, long hint)
 	 */
 	if (event == NOTE_EXIT) {
 		struct process *pr = kn->kn_ptr.p_process;
-		int s;
 
 		mtx_enter(&kq->kq_lock);
 		kn->kn_status |= KN_DETACHED;
 		mtx_leave(&kq->kq_lock);
 
-		s = splhigh();
 		kn->kn_flags |= (EV_EOF | EV_ONESHOT);
 		kn->kn_data = W_EXITCODE(pr->ps_xexit, pr->ps_xsig);
 		klist_remove_locked(&pr->ps_klist, kn);
-		splx(s);
 		return (1);
 	}
 
@@ -442,12 +492,99 @@ filt_proc(struct knote *kn, long hint)
 		kev.fflags = kn->kn_sfflags;
 		kev.data = kn->kn_id;			/* parent */
 		kev.udata = kn->kn_udata;		/* preserve udata */
+
+		rw_assert_wrlock(&kqueue_ps_list_lock);
+		mtx_leave(&pr->ps_mtx);
 		error = kqueue_register(kq, &kev, 0, NULL);
+		mtx_enter(&pr->ps_mtx);
+
 		if (error)
 			kn->kn_fflags |= NOTE_TRACKERR;
 	}
 
 	return (kn->kn_fflags != 0);
+}
+
+int
+filt_procmodify(struct kevent *kev, struct knote *kn)
+{
+	struct process *pr = kn->kn_ptr.p_process;
+	int active;
+
+	mtx_enter(&pr->ps_mtx);
+	active = knote_modify(kev, kn);
+	mtx_leave(&pr->ps_mtx);
+
+	return (active);
+}
+
+/*
+ * By default only grab the mutex here. If the event requires extra protection
+ * because it alters the klist (NOTE_EXIT, NOTE_FORK the caller of the knote
+ * needs to grab the rwlock first.
+ */
+int
+filt_procprocess(struct knote *kn, struct kevent *kev)
+{
+	struct process *pr = kn->kn_ptr.p_process;
+	int active;
+
+	mtx_enter(&pr->ps_mtx);
+	active = knote_process(kn, kev);
+	mtx_leave(&pr->ps_mtx);
+
+	return (active);
+}
+
+/*
+ * signal knotes are shared with proc knotes, so we apply a mask to
+ * the hint in order to differentiate them from process hints.  This
+ * could be avoided by using a signal-specific knote list, but probably
+ * isn't worth the trouble.
+ */
+int
+filt_sigattach(struct knote *kn)
+{
+	struct process *pr = curproc->p_p;
+
+	if (kn->kn_id >= NSIG)
+		return EINVAL;
+
+	kn->kn_ptr.p_process = pr;
+	kn->kn_flags |= EV_CLEAR;		/* automatically set */
+
+	/* this needs both the ps_mtx and exclusive kqueue_ps_list_lock. */
+	rw_enter_write(&kqueue_ps_list_lock);
+	mtx_enter(&pr->ps_mtx);
+	klist_insert_locked(&pr->ps_klist, kn);
+	mtx_leave(&pr->ps_mtx);
+	rw_exit_write(&kqueue_ps_list_lock);
+
+	return (0);
+}
+
+void
+filt_sigdetach(struct knote *kn)
+{
+	struct process *pr = kn->kn_ptr.p_process;
+
+	rw_enter_write(&kqueue_ps_list_lock);
+	mtx_enter(&pr->ps_mtx);
+	klist_remove_locked(&pr->ps_klist, kn);
+	mtx_leave(&pr->ps_mtx);
+	rw_exit_write(&kqueue_ps_list_lock);
+}
+
+int
+filt_signal(struct knote *kn, long hint)
+{
+	if (hint & NOTE_SIGNAL) {
+		hint &= ~NOTE_SIGNAL;
+
+		if (kn->kn_id == hint)
+			kn->kn_data++;
+	}
+	return (kn->kn_data != 0);
 }
 
 #define NOTE_TIMER_UNITMASK \
@@ -483,50 +620,74 @@ filt_timervalidate(int sfflags, int64_t sdata, struct timespec *ts)
 	return (0);
 }
 
+struct filt_timer {
+	struct mutex	ft_mtx;
+	struct timeout	ft_to;		/* [t] */
+	int		ft_reschedule;	/* [t] */
+};
+
 static void
 filt_timeradd(struct knote *kn, struct timespec *ts)
 {
 	struct timespec expiry, now;
-	struct timeout *to = kn->kn_hook;
+	struct filt_timer *ft = kn->kn_hook;
 	int tticks;
+
+	MUTEX_ASSERT_LOCKED(&ft->ft_mtx);
+
+	ft->ft_reschedule = ((kn->kn_flags & EV_ONESHOT) == 0 &&
+	    (kn->kn_sfflags & NOTE_ABSTIME) == 0);
 
 	if (kn->kn_sfflags & NOTE_ABSTIME) {
 		nanotime(&now);
 		if (timespeccmp(ts, &now, >)) {
 			timespecsub(ts, &now, &expiry);
 			/* XXX timeout_abs_ts with CLOCK_REALTIME */
-			timeout_add(to, tstohz(&expiry));
+			timeout_add(&ft->ft_to, tstohz(&expiry));
 		} else {
 			/* Expire immediately. */
-			filt_timerexpire(kn);
+			filt_dotimerexpire(kn);
 		}
 		return;
 	}
 
 	tticks = tstohz(ts);
 	/* Remove extra tick from tstohz() if timeout has fired before. */
-	if (timeout_triggered(to))
+	if (timeout_triggered(&ft->ft_to))
 		tticks--;
-	timeout_add(to, (tticks > 0) ? tticks : 1);
+	timeout_add(&ft->ft_to, (tticks > 0) ? tticks : 1);
+}
+
+void
+filt_dotimerexpire(struct knote *kn)
+{
+	struct timespec ts;
+	struct filt_timer *ft = kn->kn_hook;
+	struct kqueue *kq = kn->kn_kq;
+
+	MUTEX_ASSERT_LOCKED(&ft->ft_mtx);
+
+	kn->kn_data++;
+
+	mtx_enter(&kq->kq_lock);
+	knote_activate(kn);
+	mtx_leave(&kq->kq_lock);
+
+	if (ft->ft_reschedule) {
+		(void)filt_timervalidate(kn->kn_sfflags, kn->kn_sdata, &ts);
+		filt_timeradd(kn, &ts);
+	}
 }
 
 void
 filt_timerexpire(void *knx)
 {
-	struct timespec ts;
 	struct knote *kn = knx;
-	struct kqueue *kq = kn->kn_kq;
+	struct filt_timer *ft = kn->kn_hook;
 
-	kn->kn_data++;
-	mtx_enter(&kq->kq_lock);
-	knote_activate(kn);
-	mtx_leave(&kq->kq_lock);
-
-	if ((kn->kn_flags & EV_ONESHOT) == 0 &&
-	    (kn->kn_sfflags & NOTE_ABSTIME) == 0) {
-		(void)filt_timervalidate(kn->kn_sfflags, kn->kn_sdata, &ts);
-		filt_timeradd(kn, &ts);
-	}
+	mtx_enter(&ft->ft_mtx);
+	filt_dotimerexpire(kn);
+	mtx_leave(&ft->ft_mtx);
 }
 
 /*
@@ -535,24 +696,33 @@ filt_timerexpire(void *knx)
 int
 filt_timerattach(struct knote *kn)
 {
+	struct filedesc *fdp = kn->kn_kq->kq_fdp;
 	struct timespec ts;
-	struct timeout *to;
+	struct filt_timer *ft;
+	u_int nuserevents;
 	int error;
 
 	error = filt_timervalidate(kn->kn_sfflags, kn->kn_sdata, &ts);
 	if (error != 0)
 		return (error);
 
-	if (kq_ntimeouts > kq_timeoutmax)
+	nuserevents = atomic_inc_int_nv(&fdp->fd_nuserevents);
+	if (nuserevents > atomic_load_int(&kq_usereventsmax)) {
+		atomic_dec_int(&fdp->fd_nuserevents);
 		return (ENOMEM);
-	kq_ntimeouts++;
+	}
 
 	if ((kn->kn_sfflags & NOTE_ABSTIME) == 0)
 		kn->kn_flags |= EV_CLEAR;	/* automatically set */
-	to = malloc(sizeof(*to), M_KEVENT, M_WAITOK);
-	timeout_set(to, filt_timerexpire, kn);
-	kn->kn_hook = to;
+
+	ft = malloc(sizeof(*ft), M_KEVENT, M_WAITOK);
+	mtx_init(&ft->ft_mtx, IPL_SOFTCLOCK);
+	timeout_set(&ft->ft_to, filt_timerexpire, kn);
+	kn->kn_hook = ft;
+
+	mtx_enter(&ft->ft_mtx);
 	filt_timeradd(kn, &ts);
+	mtx_leave(&ft->ft_mtx);
 
 	return (0);
 }
@@ -560,12 +730,16 @@ filt_timerattach(struct knote *kn)
 void
 filt_timerdetach(struct knote *kn)
 {
-	struct timeout *to;
+	struct filedesc *fdp = kn->kn_kq->kq_fdp;
+	struct filt_timer *ft = kn->kn_hook;
 
-	to = (struct timeout *)kn->kn_hook;
-	timeout_del_barrier(to);
-	free(to, M_KEVENT, sizeof(*to));
-	kq_ntimeouts--;
+	mtx_enter(&ft->ft_mtx);
+	ft->ft_reschedule = 0;
+	mtx_leave(&ft->ft_mtx);
+
+	timeout_del_barrier(&ft->ft_to);
+	free(ft, M_KEVENT, sizeof(*ft));
+	atomic_dec_int(&fdp->fd_nuserevents);
 }
 
 int
@@ -573,7 +747,7 @@ filt_timermodify(struct kevent *kev, struct knote *kn)
 {
 	struct timespec ts;
 	struct kqueue *kq = kn->kn_kq;
-	struct timeout *to = kn->kn_hook;
+	struct filt_timer *ft = kn->kn_hook;
 	int error;
 
 	error = filt_timervalidate(kev->fflags, kev->data, &ts);
@@ -584,9 +758,13 @@ filt_timermodify(struct kevent *kev, struct knote *kn)
 	}
 
 	/* Reset the timer. Any pending events are discarded. */
+	mtx_enter(&ft->ft_mtx);
+	ft->ft_reschedule = 0;
+	mtx_leave(&ft->ft_mtx);
 
-	timeout_del_barrier(to);
+	timeout_del_barrier(&ft->ft_to);
 
+	mtx_enter(&ft->ft_mtx);
 	mtx_enter(&kq->kq_lock);
 	if (kn->kn_status & KN_QUEUED)
 		knote_dequeue(kn);
@@ -596,8 +774,9 @@ filt_timermodify(struct kevent *kev, struct knote *kn)
 	kn->kn_data = 0;
 	knote_assign(kev, kn);
 	/* Reinit timeout to invoke tick adjustment again. */
-	timeout_set(to, filt_timerexpire, kn);
+	timeout_set(&ft->ft_to, filt_timerexpire, kn);
 	filt_timeradd(kn, &ts);
+	mtx_leave(&ft->ft_mtx);
 
 	return (0);
 }
@@ -605,17 +784,96 @@ filt_timermodify(struct kevent *kev, struct knote *kn)
 int
 filt_timerprocess(struct knote *kn, struct kevent *kev)
 {
-	int active, s;
+	struct filt_timer *ft = kn->kn_hook;
+	int active;
 
-	s = splsoftclock();
+	mtx_enter(&ft->ft_mtx);
 	active = (kn->kn_data != 0);
 	if (active)
 		knote_submit(kn, kev);
-	splx(s);
+	mtx_leave(&ft->ft_mtx);
 
 	return (active);
 }
 
+int
+filt_userattach(struct knote *kn)
+{
+	struct filedesc *fdp = kn->kn_kq->kq_fdp;
+	u_int nuserevents;
+
+	nuserevents = atomic_inc_int_nv(&fdp->fd_nuserevents);
+	if (nuserevents > atomic_load_int(&kq_usereventsmax)) {
+		atomic_dec_int(&fdp->fd_nuserevents);
+		return (ENOMEM);
+	}
+
+	kn->kn_ptr.p_useract = ((kn->kn_sfflags & NOTE_TRIGGER) != 0);
+	kn->kn_fflags = kn->kn_sfflags & NOTE_FFLAGSMASK;
+	kn->kn_data = kn->kn_sdata;
+
+	return (0);
+}
+
+void
+filt_userdetach(struct knote *kn)
+{
+	struct filedesc *fdp = kn->kn_kq->kq_fdp;
+
+	atomic_dec_int(&fdp->fd_nuserevents);
+}
+
+int
+filt_usermodify(struct kevent *kev, struct knote *kn)
+{
+	unsigned int ffctrl, fflags;
+
+	if (kev->fflags & NOTE_TRIGGER)
+		kn->kn_ptr.p_useract = 1;
+
+	ffctrl = kev->fflags & NOTE_FFCTRLMASK;
+	fflags = kev->fflags & NOTE_FFLAGSMASK;
+	switch (ffctrl) {
+	case NOTE_FFNOP:
+		break;
+	case NOTE_FFAND:
+		kn->kn_fflags &= fflags;
+		break;
+	case NOTE_FFOR:
+		kn->kn_fflags |= fflags;
+		break;
+	case NOTE_FFCOPY:
+		kn->kn_fflags = fflags;
+		break;
+	default:
+		/* ignored, should not happen */
+		break;
+	}
+
+	kn->kn_data = kev->data;
+	kn->kn_udata = kev->udata;
+
+	/* Allow clearing of an activated event. */
+	if (kev->flags & EV_CLEAR)
+		kn->kn_ptr.p_useract = 0;
+
+	return (kn->kn_ptr.p_useract);
+}
+
+int
+filt_userprocess(struct knote *kn, struct kevent *kev)
+{
+	int active;
+
+	active = kn->kn_ptr.p_useract;
+	if (active && kev != NULL) {
+		*kev = kn->kn_kevent;
+		if (kn->kn_flags & EV_CLEAR)
+			kn->kn_ptr.p_useract = 0;
+	}
+
+	return (active);
+}
 
 /*
  * filt_seltrue:
@@ -1296,6 +1554,17 @@ again:
 		filter_detach(kn);
 		knote_drop(kn, p);
 		goto done;
+	} else if (kn->kn_fop == &user_filtops) {
+		/* Call f_modify to allow NOTE_TRIGGER without EV_ADD. */
+		mtx_leave(&kq->kq_lock);
+		active = filter_modify(kev, kn);
+		mtx_enter(&kq->kq_lock);
+		if (active)
+			knote_activate(kn);
+		if (kev->flags & EV_ERROR) {
+			error = kev->data;
+			goto release;
+		}
 	}
 
 	if ((kev->flags & EV_DISABLE) && ((kn->kn_status & KN_DISABLED) == 0))
@@ -1943,12 +2212,26 @@ knote_fdclose(struct proc *p, int fd)
 void
 knote_processexit(struct process *pr)
 {
-	KERNEL_ASSERT_LOCKED();
-
+	/* this needs both the ps_mtx and exclusive kqueue_ps_list_lock. */
+	rw_enter_write(&kqueue_ps_list_lock);
+	mtx_enter(&pr->ps_mtx);
 	knote_locked(&pr->ps_klist, NOTE_EXIT);
+	mtx_leave(&pr->ps_mtx);
+	rw_exit_write(&kqueue_ps_list_lock);
 
 	/* remove other knotes hanging off the process */
 	klist_invalidate(&pr->ps_klist);
+}
+
+void
+knote_processfork(struct process *pr, pid_t pid)
+{
+	/* this needs both the ps_mtx and exclusive kqueue_ps_list_lock. */
+	rw_enter_write(&kqueue_ps_list_lock);
+	mtx_enter(&pr->ps_mtx);
+	knote_locked(&pr->ps_klist, NOTE_FORK | pid);
+	mtx_leave(&pr->ps_mtx);
+	rw_exit_write(&kqueue_ps_list_lock);
 }
 
 void

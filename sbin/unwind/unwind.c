@@ -1,4 +1,4 @@
-/*	$OpenBSD: unwind.c,v 1.68 2023/02/15 13:47:00 florian Exp $	*/
+/*	$OpenBSD: unwind.c,v 1.76 2025/04/27 16:21:53 florian Exp $	*/
 
 /*
  * Copyright (c) 2018 Florian Obser <florian@openbsd.org>
@@ -239,9 +239,13 @@ main(int argc, char *argv[])
 	if ((iev_frontend = malloc(sizeof(struct imsgev))) == NULL ||
 	    (iev_resolver = malloc(sizeof(struct imsgev))) == NULL)
 		fatal(NULL);
-	imsg_init(&iev_frontend->ibuf, pipe_main2frontend[0]);
+	if (imsgbuf_init(&iev_frontend->ibuf, pipe_main2frontend[0]) == -1)
+		fatal(NULL);
+	imsgbuf_allow_fdpass(&iev_frontend->ibuf);
 	iev_frontend->handler = main_dispatch_frontend;
-	imsg_init(&iev_resolver->ibuf, pipe_main2resolver[0]);
+	if (imsgbuf_init(&iev_resolver->ibuf, pipe_main2resolver[0]) == -1)
+		fatal(NULL);
+	imsgbuf_allow_fdpass(&iev_resolver->ibuf);
 	iev_resolver->handler = main_dispatch_resolver;
 
 	/* Setup event handlers for pipes. */
@@ -312,9 +316,9 @@ main_shutdown(void)
 	int	 status;
 
 	/* Close pipes. */
-	msgbuf_clear(&iev_frontend->ibuf.w);
+	imsgbuf_clear(&iev_frontend->ibuf);
 	close(iev_frontend->ibuf.fd);
-	msgbuf_clear(&iev_resolver->ibuf.w);
+	imsgbuf_clear(&iev_resolver->ibuf);
 	close(iev_resolver->ibuf.fd);
 
 	config_clear(main_conf);
@@ -398,16 +402,18 @@ main_dispatch_frontend(int fd, short event, void *bula)
 	ibuf = &iev->ibuf;
 
 	if (event & EV_READ) {
-		if ((n = imsg_read(ibuf)) == -1 && errno != EAGAIN)
-			fatal("imsg_read error");
+		if ((n = imsgbuf_read(ibuf)) == -1)
+			fatal("imsgbuf_read error");
 		if (n == 0)	/* Connection closed. */
 			shut = 1;
 	}
 	if (event & EV_WRITE) {
-		if ((n = msgbuf_write(&ibuf->w)) == -1 && errno != EAGAIN)
-			fatal("msgbuf_write");
-		if (n == 0)	/* Connection closed. */
-			shut = 1;
+		if (imsgbuf_write(ibuf) == -1) {
+			if (errno == EPIPE)	/* Connection closed. */
+				shut = 1;
+			else
+				fatal("imsgbuf_write");
+		}
 	}
 
 	for (;;) {
@@ -461,16 +467,18 @@ main_dispatch_resolver(int fd, short event, void *bula)
 	ibuf = &iev->ibuf;
 
 	if (event & EV_READ) {
-		if ((n = imsg_read(ibuf)) == -1 && errno != EAGAIN)
-			fatal("imsg_read error");
+		if ((n = imsgbuf_read(ibuf)) == -1)
+			fatal("imsgbuf_read error");
 		if (n == 0)	/* Connection closed. */
 			shut = 1;
 	}
 	if (event & EV_WRITE) {
-		if ((n = msgbuf_write(&ibuf->w)) == -1 && errno != EAGAIN)
-			fatal("msgbuf_write");
-		if (n == 0)	/* Connection closed. */
-			shut = 1;
+		if (imsgbuf_write(ibuf) == -1) {
+			if (errno == EPIPE)	/* Connection closed. */
+				shut = 1;
+			else
+				fatal("imsgbuf_write");
+		}
 	}
 
 	for (;;) {
@@ -523,7 +531,7 @@ void
 imsg_event_add(struct imsgev *iev)
 {
 	iev->events = EV_READ;
-	if (iev->ibuf.w.queued)
+	if (imsgbuf_queuelen(&iev->ibuf) > 0)
 		iev->events |= EV_WRITE;
 
 	event_del(&iev->ev);
@@ -912,6 +920,12 @@ imsg_receive_config(struct imsg *imsg, struct uw_conf **xconf)
 			fatal(NULL);
 		memcpy(uw_forwarder, imsg->data, sizeof(struct
 		    uw_forwarder));
+		if (uw_forwarder->ip[sizeof(uw_forwarder->ip) - 1] != '\0')
+			fatalx("%s: invalid uw_forwarder", __func__);
+		if (uw_forwarder->auth_name[
+		    sizeof(uw_forwarder->auth_name) - 1] != '\0')
+			fatalx("%s: invalid uw_forwarder", __func__);
+
 		TAILQ_INSERT_TAIL(&nconf->uw_forwarder_list,
 		    uw_forwarder, entry);
 		break;
@@ -925,6 +939,12 @@ imsg_receive_config(struct imsg *imsg, struct uw_conf **xconf)
 			fatal(NULL);
 		memcpy(uw_forwarder, imsg->data, sizeof(struct
 		    uw_forwarder));
+		if (uw_forwarder->ip[sizeof(uw_forwarder->ip) - 1] != '\0')
+			fatalx("%s: invalid uw_forwarder", __func__);
+		if (uw_forwarder->auth_name[
+		    sizeof(uw_forwarder->auth_name) - 1] != '\0')
+			fatalx("%s: invalid uw_forwarder", __func__);
+
 		TAILQ_INSERT_TAIL(&nconf->uw_dot_forwarder_list,
 		    uw_forwarder, entry);
 		break;
@@ -938,6 +958,10 @@ imsg_receive_config(struct imsg *imsg, struct uw_conf **xconf)
 			fatal(NULL);
 		memcpy(force_entry, imsg->data, sizeof(struct
 		    force_tree_entry));
+		if (force_entry->domain[
+		    sizeof(force_entry->domain) - 1] != '\0')
+			fatalx("%s: invalid force_entry", __func__);
+
 		if (RB_INSERT(force_tree, &nconf->force, force_entry) != NULL) {
 			free(force_entry);
 			fatalx("%s: IMSG_RECONF_FORCE duplicate entry",

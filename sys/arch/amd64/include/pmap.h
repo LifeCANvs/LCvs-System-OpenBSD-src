@@ -1,4 +1,4 @@
-/*	$OpenBSD: pmap.h,v 1.88 2023/12/29 13:23:28 jca Exp $	*/
+/*	$OpenBSD: pmap.h,v 1.93 2025/05/20 12:46:52 jsg Exp $	*/
 /*	$NetBSD: pmap.h,v 1.1 2003/04/26 18:39:46 fvdl Exp $	*/
 
 /*
@@ -293,6 +293,7 @@ LIST_HEAD(pmap_head, pmap); /* struct pmap_head: head of a pmap list */
 #define PMAP_TYPE_EPT		2
 #define PMAP_TYPE_RVI		3
 #define pmap_nested(pm) ((pm)->pm_type != PMAP_TYPE_NORMAL)
+#define pmap_is_ept(pm) ((pm)->pm_type == PMAP_TYPE_EPT)
 
 struct pmap {
 	struct mutex pm_mtx;
@@ -320,6 +321,7 @@ struct pmap {
 };
 
 #define PMAP_EFI	PMAP_MD0
+#define PMAP_NOCRYPT	PMAP_MD1
 
 /*
  * MD flags that we use for pmap_enter (in the pa):
@@ -371,7 +373,6 @@ extern const long nbpd[], nkptpmax[];
 #define pmap_clear_reference(pg)	pmap_clear_attrs(pg, PG_U)
 #define pmap_is_modified(pg)		pmap_test_attrs(pg, PG_M)
 #define pmap_is_referenced(pg)		pmap_test_attrs(pg, PG_U)
-#define pmap_move(DP,SP,D,L,S)
 #define pmap_valid_entry(E) 		((E) & PG_V) /* is PDE or PTE valid? */
 
 #define pmap_proc_iflush(p,va,len)	/* nothing */
@@ -429,12 +430,6 @@ void	pmap_flush_cache(vaddr_t, vsize_t);
  * inline functions
  */
 
-static inline void
-pmap_remove_all(struct pmap *pmap)
-{
-	/* Nothing. */
-}
-
 /*
  * pmap_update_pg: flush one page from the TLB (or flush the whole thing
  *	if hardware doesn't support one-page flushing)
@@ -485,19 +480,8 @@ pmap_protect(struct pmap *pmap, vaddr_t sva, vaddr_t eva, vm_prot_t prot)
 }
 
 /*
- * various address inlines
- *
- *  vtopte: return a pointer to the PTE mapping a VA, works only for
- *  user and PT addresses
- *
  *  kvtopte: return a pointer to the PTE mapping a kernel VA
  */
-
-static inline pt_entry_t *
-vtopte(vaddr_t va)
-{
-	return (PTE_BASE + pl1_i(va));
-}
 
 static inline pt_entry_t *
 kvtopte(vaddr_t va)

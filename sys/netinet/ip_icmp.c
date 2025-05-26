@@ -1,4 +1,4 @@
-/*	$OpenBSD: ip_icmp.c,v 1.193 2024/06/07 18:24:16 bluhm Exp $	*/
+/*	$OpenBSD: ip_icmp.c,v 1.199 2025/03/02 21:28:32 bluhm Exp $	*/
 /*	$NetBSD: ip_icmp.c,v 1.19 1996/02/13 23:42:22 christos Exp $	*/
 
 /*
@@ -105,16 +105,21 @@
  * host table maintenance routines.
  */
 
+/*
+ * Locks used to protect data:
+ *	a	atomic
+ */
+
 #ifdef ICMPPRINTFS
 int	icmpprintfs = 0;	/* Settable from ddb */
 #endif
 
 /* values controllable via sysctl */
-int	icmpmaskrepl = 0;
-int	icmpbmcastecho = 0;
-int	icmptstamprepl = 1;
-int	icmperrppslim = 100;
-int	icmp_rediraccept = 0;
+int	icmpmaskrepl = 0;		/* [a] */
+int	icmpbmcastecho = 0;		/* [a] */
+int	icmptstamprepl = 1;		/* [a] */
+int	icmperrppslim = 100;		/* [a] */
+int	icmp_rediraccept = 0;		/* [a] */
 int	icmp_redirtimeout = 10 * 60;
 
 static int icmperrpps_count = 0;
@@ -135,7 +140,8 @@ const struct sysctl_bounded_args icmpctl_vars[] =  {
 
 void icmp_mtudisc_timeout(struct rtentry *, u_int);
 int icmp_ratelimit(const struct in_addr *, const int, const int);
-int icmp_input_if(struct ifnet *, struct mbuf **, int *, int, int);
+int icmp_input_if(struct ifnet *, struct mbuf **, int *, int, int,
+    struct netstack *);
 int icmp_sysctl_icmpstat(void *, size_t *, void *);
 
 void
@@ -305,7 +311,7 @@ icmp_error(struct mbuf *n, int type, int code, u_int32_t dest, int destmtu)
  * Process a received ICMP message.
  */
 int
-icmp_input(struct mbuf **mp, int *offp, int proto, int af)
+icmp_input(struct mbuf **mp, int *offp, int proto, int af, struct netstack *ns)
 {
 	struct ifnet *ifp;
 
@@ -315,13 +321,14 @@ icmp_input(struct mbuf **mp, int *offp, int proto, int af)
 		return IPPROTO_DONE;
 	}
 
-	proto = icmp_input_if(ifp, mp, offp, proto, af);
+	proto = icmp_input_if(ifp, mp, offp, proto, af, ns);
 	if_put(ifp);
 	return proto;
 }
 
 int
-icmp_input_if(struct ifnet *ifp, struct mbuf **mp, int *offp, int proto, int af)
+icmp_input_if(struct ifnet *ifp, struct mbuf **mp, int *offp, int proto,
+    int af, struct netstack *ns)
 {
 	struct mbuf *m = *mp;
 	int hlen = *offp;
@@ -506,7 +513,7 @@ icmp_input_if(struct ifnet *ifp, struct mbuf **mp, int *offp, int proto, int af)
 		break;
 
 	case ICMP_ECHO:
-		if (!icmpbmcastecho &&
+		if (atomic_load_int(&icmpbmcastecho) == 0 &&
 		    (m->m_flags & (M_MCAST | M_BCAST)) != 0) {
 			icmpstat_inc(icps_bmcastecho);
 			break;
@@ -515,10 +522,10 @@ icmp_input_if(struct ifnet *ifp, struct mbuf **mp, int *offp, int proto, int af)
 		goto reflect;
 
 	case ICMP_TSTAMP:
-		if (icmptstamprepl == 0)
+		if (atomic_load_int(&icmptstamprepl) == 0)
 			break;
 
-		if (!icmpbmcastecho &&
+		if (atomic_load_int(&icmpbmcastecho) == 0 &&
 		    (m->m_flags & (M_MCAST | M_BCAST)) != 0) {
 			icmpstat_inc(icps_bmcastecho);
 			break;
@@ -533,7 +540,7 @@ icmp_input_if(struct ifnet *ifp, struct mbuf **mp, int *offp, int proto, int af)
 		goto reflect;
 
 	case ICMP_MASKREQ:
-		if (icmpmaskrepl == 0)
+		if (atomic_load_int(&icmpmaskrepl) == 0)
 			break;
 		if (icmplen < ICMP_MASKLEN) {
 			icmpstat_inc(icps_badlen);
@@ -588,8 +595,9 @@ reflect:
 		struct sockaddr_in sgw;
 		struct sockaddr_in ssrc;
 		struct rtentry *newrt = NULL;
+		int i_am_router = (atomic_load_int(&ip_forwarding) != 0);
 
-		if (icmp_rediraccept == 0 || ip_forwarding == 1)
+		if (atomic_load_int(&icmp_rediraccept) == 0 || i_am_router)
 			goto freeit;
 		if (code > 3)
 			goto badcode;
@@ -667,7 +675,7 @@ reflect:
 	}
 
 raw:
-	return rip_input(mp, offp, proto, af);
+	return rip_input(mp, offp, proto, af, ns);
 
 freeit:
 	m_freem(m);
@@ -883,24 +891,27 @@ icmp_sysctl(int *name, u_int namelen, void *oldp, size_t *oldlenp, void *newp,
 		return (ENOTDIR);
 
 	switch (name[0]) {
-	case ICMPCTL_REDIRTIMEOUT:
+	case ICMPCTL_REDIRTIMEOUT: {
+		size_t savelen = *oldlenp;
+
+		if ((error = sysctl_vslock(oldp, savelen)))
+			break;
 		NET_LOCK();
 		error = sysctl_int_bounded(oldp, oldlenp, newp, newlen,
 		    &icmp_redirtimeout, 0, INT_MAX);
 		rt_timer_queue_change(&icmp_redirect_timeout_q,
 		    icmp_redirtimeout);
 		NET_UNLOCK();
+		sysctl_vsunlock(oldp, savelen);
 		break;
-
+	}
 	case ICMPCTL_STATS:
 		error = icmp_sysctl_icmpstat(oldp, oldlenp, newp);
 		break;
 
 	default:
-		NET_LOCK();
 		error = sysctl_bounded_arr(icmpctl_vars, nitems(icmpctl_vars),
 		    name, namelen, oldp, oldlenp, newp, newlen);
-		NET_UNLOCK();
 		break;
 	}
 
@@ -999,6 +1010,7 @@ icmp_mtudisc(struct icmp *icp, u_int rtableid)
 {
 	struct rtentry *rt;
 	struct ifnet *ifp;
+	u_int rtmtu;
 	u_long mtu = ntohs(icp->icmp_nextmtu);  /* Why a long?  IPv6 */
 
 	rt = icmp_mtudisc_clone(icp->icmp_ip.ip_dst, rtableid, 0);
@@ -1011,17 +1023,18 @@ icmp_mtudisc(struct icmp *icp, u_int rtableid)
 		return;
 	}
 
+	rtmtu = atomic_load_int(&rt->rt_mtu);
 	if (mtu == 0) {
 		int i = 0;
 
 		mtu = ntohs(icp->icmp_ip.ip_len);
 		/* Some 4.2BSD-based routers incorrectly adjust the ip_len */
-		if (mtu > rt->rt_mtu && rt->rt_mtu != 0)
+		if (mtu > rtmtu && rtmtu != 0)
 			mtu -= (icp->icmp_ip.ip_hl << 2);
 
 		/* If we still can't guess a value, try the route */
 		if (mtu == 0) {
-			mtu = rt->rt_mtu;
+			mtu = rtmtu;
 
 			/* If no route mtu, default to the interface mtu */
 
@@ -1046,8 +1059,8 @@ icmp_mtudisc(struct icmp *icp, u_int rtableid)
 	if ((rt->rt_locks & RTV_MTU) == 0) {
 		if (mtu < 296 || mtu > ifp->if_mtu)
 			rt->rt_locks |= RTV_MTU;
-		else if (rt->rt_mtu > mtu || rt->rt_mtu == 0)
-			rt->rt_mtu = mtu;
+		else if (rtmtu > mtu || rtmtu == 0)
+			atomic_cas_uint(&rt->rt_mtu, rtmtu, mtu);
 	}
 
 	if_put(ifp);
@@ -1080,7 +1093,7 @@ icmp_mtudisc_timeout(struct rtentry *rt, u_int rtableid)
 			    rtableid, NULL);
 	} else {
 		if ((rt->rt_locks & RTV_MTU) == 0)
-			rt->rt_mtu = 0;
+			atomic_store_int(&rt->rt_mtu, 0);
 	}
 
 	if_put(ifp);
@@ -1097,9 +1110,10 @@ icmp_mtudisc_timeout(struct rtentry *rt, u_int rtableid)
 int
 icmp_ratelimit(const struct in_addr *dst, const int type, const int code)
 {
+	int icmperrppslim_local = atomic_load_int(&icmperrppslim);
 	/* PPS limit */
 	if (!ppsratecheck(&icmperrppslim_last, &icmperrpps_count,
-	    icmperrppslim))
+	    icmperrppslim_local))
 		return 1;	/* The packet is subject to rate limit */
 	return 0;	/* okay to send */
 }

@@ -28,6 +28,7 @@ struct mipi_dsi_device {
 	uint32_t mode_flags;
 #define MIPI_DSI_MODE_LPM	(1 << 0)
 	bool attached;
+	struct device dev;
 };
 
 struct mipi_dsi_msg {
@@ -59,6 +60,15 @@ enum mipi_dsi_pixel_format {
 	MIPI_DSI_FMT_RGB565,
 };
 
+enum mipi_dsi_compression_algo {
+	MIPI_DSI_COMPRESSION_DSC
+};
+
+struct mipi_dsi_multi_context {
+	struct mipi_dsi_device *dsi;
+	int accum_err;
+};
+
 int mipi_dsi_attach(struct mipi_dsi_device *);
 int mipi_dsi_create_packet(struct mipi_dsi_packet *,
     const struct mipi_dsi_msg *);
@@ -70,8 +80,8 @@ ssize_t mipi_dsi_dcs_write(struct mipi_dsi_device *, u8, const void *, size_t);
 int mipi_dsi_dcs_nop(struct mipi_dsi_device *);
 int mipi_dsi_set_maximum_return_packet_size(struct mipi_dsi_device *, u16);
 bool mipi_dsi_packet_format_is_long(u8);
-ssize_t mipi_dsi_compression_mode(struct mipi_dsi_device *, bool);
-ssize_t mipi_dsi_picture_parameter_set(struct mipi_dsi_device *,
+int mipi_dsi_compression_mode(struct mipi_dsi_device *, bool);
+int mipi_dsi_picture_parameter_set(struct mipi_dsi_device *,
     const struct drm_dsc_picture_parameter_set *);
 
 static inline int

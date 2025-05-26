@@ -1,4 +1,4 @@
-/*	$OpenBSD: kern_clock.c,v 1.123 2024/02/12 22:07:33 cheloha Exp $	*/
+/*	$OpenBSD: kern_clock.c,v 1.125 2025/05/02 05:04:38 dlg Exp $	*/
 /*	$NetBSD: kern_clock.c,v 1.34 1996/06/09 04:51:03 briggs Exp $	*/
 
 /*-
@@ -49,6 +49,7 @@
 #include <sys/sysctl.h>
 #include <sys/sched.h>
 #include <sys/timetc.h>
+#include <uvm/uvm_extern.h>
 
 /*
  * Clock handling routines.
@@ -267,6 +268,8 @@ statclock(struct clockrequest *cr, void *cf, void *arg)
 	struct schedstate_percpu *spc = &ci->ci_schedstate;
 	struct proc *p = curproc;
 	struct process *pr;
+	int tu_tick = -1;
+	int cp_time;
 
 	if (statclock_is_randomized) {
 		count = clockrequest_advance_random(cr, statclock_min,
@@ -281,11 +284,8 @@ statclock(struct clockrequest *cr, void *cf, void *arg)
 		 * Came from user mode; CPU was in user state.
 		 * If this process is being profiled record the tick.
 		 */
-		p->p_uticks += count;
-		if (pr->ps_nice > NZERO)
-			spc->spc_cp_time[CP_NICE] += count;
-		else
-			spc->spc_cp_time[CP_USER] += count;
+		tu_tick = TU_UTICKS;
+		cp_time = (pr->ps_nice > NZERO) ? CP_NICE : CP_USER;
 	} else {
 		/*
 		 * Came from kernel mode, so we were:
@@ -301,21 +301,42 @@ statclock(struct clockrequest *cr, void *cf, void *arg)
 		 * in ``non-process'' (i.e., interrupt) work.
 		 */
 		if (CLKF_INTR(frame)) {
-			if (p != NULL)
-				p->p_iticks += count;
-			spc->spc_cp_time[spc->spc_spinning ?
-			    CP_SPIN : CP_INTR] += count;
+			tu_tick = TU_ITICKS;
+			cp_time = CP_INTR;
 		} else if (p != NULL && p != spc->spc_idleproc) {
-			p->p_sticks += count;
-			spc->spc_cp_time[spc->spc_spinning ?
-			    CP_SPIN : CP_SYS] += count;
+			tu_tick = TU_STICKS;
+			cp_time = CP_SYS;
 		} else
-			spc->spc_cp_time[spc->spc_spinning ?
-			    CP_SPIN : CP_IDLE] += count;
+			cp_time = CP_IDLE;
+
+		if (spc->spc_spinning)
+			cp_time = CP_SPIN;
 	}
+
+	spc->spc_cp_time[cp_time] += count;
 
 	if (p != NULL) {
 		p->p_cpticks += count;
+
+		if (!ISSET(p->p_flag, P_SYSTEM) && tu_tick != -1) {
+			struct vmspace *vm = p->p_vmspace;
+			struct tusage *tu = &p->p_tu;
+
+			tu_enter(tu);
+			tu->tu_ticks[tu_tick] += count;
+
+			/* maxrss is handled by uvm */
+			if (tu_tick != TU_ITICKS) {
+				tu->tu_ixrss +=
+				    (vm->vm_tsize << (PAGE_SHIFT - 10)) * count;
+				tu->tu_idrss +=
+				    (vm->vm_dused << (PAGE_SHIFT - 10)) * count;
+				tu->tu_isrss +=
+				    (vm->vm_ssize << (PAGE_SHIFT - 10)) * count;
+			}
+			tu_leave(tu);
+		}
+
 		/*
 		 * schedclock() runs every fourth statclock().
 		 */

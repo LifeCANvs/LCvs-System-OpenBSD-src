@@ -1,4 +1,4 @@
-/*	$OpenBSD: intr.c,v 1.10 2022/07/27 20:26:17 kettenis Exp $	*/
+/*	$OpenBSD: intr.c,v 1.14 2025/04/26 11:01:55 visa Exp $	*/
 
 /*
  * Copyright (c) 2011 Dale Rahn <drahn@openbsd.org>
@@ -21,13 +21,15 @@
 #include <sys/atomic.h>
 #include <sys/malloc.h>
 
+#include <uvm/uvm_extern.h>
+
 #include <machine/cpu.h>
 #include <machine/intr.h>
 #include <machine/sbi.h>
 
 #include <dev/ofw/openfirm.h>
 
-uint32_t riscv_intr_get_parent(int);
+int riscv_intr_get_parent(int);
 uint32_t riscv_intr_map_msi(int, uint64_t *);
 
 void *riscv_intr_prereg_establish_fdt(void *, int *, int, struct cpu_info *,
@@ -66,6 +68,7 @@ riscv_cpu_intr(void *frame)
 {
 	struct cpu_info	*ci = curcpu();
 
+	uvmexp.intrs++;
 	ci->ci_idepth++;
 	(*riscv_intr_dispatch)(frame);
 	ci->ci_idepth--;
@@ -74,17 +77,21 @@ riscv_cpu_intr(void *frame)
 /*
  * Find the interrupt parent by walking up the tree.
  */
-uint32_t
+int
 riscv_intr_get_parent(int node)
 {
-	uint32_t phandle = 0;
+	uint32_t phandle;
 
-	while (node && !phandle) {
+	while (node) {
 		phandle = OF_getpropint(node, "interrupt-parent", 0);
+		if (phandle)
+			return OF_getnodebyphandle(phandle);
 		node = OF_parent(node);
+		if (OF_getpropbool(node, "interrupt-controller"))
+			return node;
 	}
 
-	return phandle;
+	return 0;
 }
 
 uint32_t
@@ -271,8 +278,6 @@ riscv_intr_register_fdt(struct interrupt_controller *ic)
 
 	ic->ic_cells = OF_getpropint(ic->ic_node, "#interrupt-cells", 0);
 	ic->ic_phandle = OF_getpropint(ic->ic_node, "phandle", 0);
-	if (ic->ic_phandle == 0)
-		return;
 	KASSERT(ic->ic_cells <= MAX_INTERRUPT_CELLS);
 
 	LIST_INSERT_HEAD(&interrupt_controllers, ic, ic_list);
@@ -323,7 +328,8 @@ riscv_intr_establish_fdt_idx_cpu(int node, int idx, int level,
     struct cpu_info *ci, int (*func)(void *), void *cookie, char *name)
 {
 	struct interrupt_controller *ic;
-	int i, len, ncells, extended = 1;
+	int i, len, ncells, parent;
+	int extended = 1;
 	uint32_t *cell, *cells, phandle;
 	struct machine_intr_handle *ih;
 	void *val = NULL;
@@ -338,9 +344,9 @@ riscv_intr_establish_fdt_idx_cpu(int node, int idx, int level,
 
 	/* Old style. */
 	if (!extended) {
-		phandle = riscv_intr_get_parent(node);
+		parent = riscv_intr_get_parent(node);
 		LIST_FOREACH(ic, &interrupt_controllers, ic_list) {
-			if (ic->ic_phandle == phandle)
+			if (ic->ic_node == parent)
 				break;
 		}
 
@@ -610,10 +616,9 @@ riscv_do_pending_intr(int pcpl)
 	}
 
 	do {
-		DO_SOFTINT(SIR_TTY, IPL_SOFTTTY);
-		DO_SOFTINT(SIR_NET, IPL_SOFTNET);
-		DO_SOFTINT(SIR_CLOCK, IPL_SOFTCLOCK);
-		DO_SOFTINT(SIR_SOFT, IPL_SOFT);
+		DO_SOFTINT(SOFTINTR_TTY, IPL_SOFTTTY);
+		DO_SOFTINT(SOFTINTR_NET, IPL_SOFTNET);
+		DO_SOFTINT(SOFTINTR_CLOCK, IPL_SOFTCLOCK);
 	} while (ci->ci_ipending & riscv_smask[pcpl]);
 
 	/* Don't use splx... we are here already! */
@@ -621,8 +626,9 @@ riscv_do_pending_intr(int pcpl)
 	intr_restore(sie);
 }
 
-void riscv_set_intr_func(int (*raise)(int), int (*lower)(int),
-    void (*x)(int), void (*setipl)(int))
+void
+riscv_set_intr_func(int (*raise)(int), int (*lower)(int), void (*x)(int),
+    void (*setipl)(int))
 {
 	riscv_intr_func.raise		= raise;
 	riscv_intr_func.lower		= lower;
@@ -630,7 +636,8 @@ void riscv_set_intr_func(int (*raise)(int), int (*lower)(int),
 	riscv_intr_func.setipl		= setipl;
 }
 
-void riscv_set_intr_handler(void (*intr_handle)(void *))
+void
+riscv_set_intr_handler(void (*intr_handle)(void *))
 {
 	riscv_intr_dispatch		= intr_handle;
 }
@@ -647,14 +654,12 @@ riscv_init_smask(void)
 
 	for (i = IPL_NONE; i <= IPL_HIGH; i++)  {
 		riscv_smask[i] = 0;
-		if (i < IPL_SOFT)
-			riscv_smask[i] |= SI_TO_IRQBIT(SIR_SOFT);
 		if (i < IPL_SOFTCLOCK)
-			riscv_smask[i] |= SI_TO_IRQBIT(SIR_CLOCK);
+			riscv_smask[i] |= SI_TO_IRQBIT(SOFTINTR_CLOCK);
 		if (i < IPL_SOFTNET)
-			riscv_smask[i] |= SI_TO_IRQBIT(SIR_NET);
+			riscv_smask[i] |= SI_TO_IRQBIT(SOFTINTR_NET);
 		if (i < IPL_SOFTTTY)
-			riscv_smask[i] |= SI_TO_IRQBIT(SIR_TTY);
+			riscv_smask[i] |= SI_TO_IRQBIT(SOFTINTR_TTY);
 	}
 }
 
@@ -687,6 +692,11 @@ splx(int ipl)
 	riscv_intr_func.x(ipl);
 }
 
+void
+softintr(int si)
+{
+	curcpu()->ci_ipending |= SI_TO_IRQBIT(si);
+}
 
 #ifdef DIAGNOSTIC
 void

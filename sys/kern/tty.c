@@ -1,4 +1,4 @@
-/*	$OpenBSD: tty.c,v 1.176 2022/08/14 01:58:28 jsg Exp $	*/
+/*	$OpenBSD: tty.c,v 1.178 2024/12/30 02:46:00 guenther Exp $	*/
 /*	$NetBSD: tty.c,v 1.68.4.2 1996/06/06 16:04:52 thorpej Exp $	*/
 
 /*-
@@ -764,8 +764,6 @@ ttioctl(struct tty *tp, u_long cmd, caddr_t data, int flag, struct proc *p)
 			CLR(tp->t_state, TS_ASYNC);
 		splx(s);
 		break;
-	case FIONBIO:			/* set/clear non-blocking i/o */
-		break;			/* XXX: delete. */
 	case FIONREAD:			/* get # bytes to read */
 		s = spltty();
 		*(int *)data = ttnread(tp);
@@ -2152,6 +2150,7 @@ ttyinfo(struct tty *tp)
 {
 	struct process *pr, *pickpr;
 	struct proc *p, *pick;
+	struct tusage tu;
 	struct timespec utime, stime;
 	int tmp;
 
@@ -2214,7 +2213,8 @@ update_pickpr:
 		    pickpr->ps_vmspace != NULL)
 			rss = vm_resident_count(pickpr->ps_vmspace);
 
-		calctsru(&pickpr->ps_tu, &utime, &stime, NULL);
+		tuagg_get_process(&tu, pickpr);
+		calctsru(&tu, &utime, &stime, NULL);
 
 		/* Round up and print user time. */
 		utime.tv_nsec += 5000000;

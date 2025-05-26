@@ -1,4 +1,4 @@
-/* $OpenBSD: trap.c,v 1.48 2024/02/21 15:53:07 deraadt Exp $ */
+/* $OpenBSD: trap.c,v 1.52 2025/03/01 07:42:09 miod Exp $ */
 /*-
  * Copyright (c) 2014 Andrew Turner
  * All rights reserved.
@@ -36,7 +36,6 @@
 #include <sys/signalvar.h>
 #include <sys/user.h>
 
-#include <uvm/uvm.h>
 #include <uvm/uvm_extern.h>
 
 #include <machine/cpu.h>
@@ -187,6 +186,99 @@ kdata_abort(struct trapframe *frame, uint64_t esr, uint64_t far, int exe)
 	}
 }
 
+static int
+emulate_msr(struct trapframe *frame, uint64_t esr)
+{
+	u_int rt = ISS_MSR_Rt(esr);
+	uint64_t val;
+
+	/* Only emulate reads. */
+	if ((esr & ISS_MSR_DIR) == 0)
+		return 0;
+
+	/* Only emulate non-debug System register access. */
+	if (ISS_MSR_OP0(esr) != 3 || ISS_MSR_OP1(esr) != 0 ||
+	    ISS_MSR_CRn(esr) != 0)
+		return 0;
+
+	switch (ISS_MSR_CRm(esr)) {
+	case 0:
+		switch (ISS_MSR_OP2(esr)) {
+		case 0:		/* MIDR_EL1 */
+			val = READ_SPECIALREG(midr_el1);
+			break;
+		case 5:		/* MPIDR_EL1 */
+			/*
+			 * Don't reveal the topology to userland.  But
+			 * return a valid value; Bit 31 is RES1.
+			 */
+			val = 0x80000000;
+			break;
+		case 6:		/* REVIDR_EL1 */
+			val = 0;
+			break;
+		default:
+			return 0;
+		}
+		break;
+	case 4:
+		switch (ISS_MSR_OP2(esr)) {
+		case 0:		/* ID_AA64PFR0_EL1 */
+			val = cpu_id_aa64pfr0;
+			break;
+		case 1:		/* ID_AA64PFR1_EL1 */
+			val = cpu_id_aa64pfr1;
+			break;
+		case 2:		/* ID_AA64PFR2_EL1 */
+		case 4:		/* ID_AA64ZFR0_EL1 */
+		case 5:		/* ID_AA64SMFR0_EL1 */
+			val = 0;
+			break;
+		default:
+			return 0;
+		}
+		break;
+	case 6:
+		switch (ISS_MSR_OP2(esr)) {
+		case 0:	/* ID_AA64ISAR0_EL1 */
+			val = cpu_id_aa64isar0;
+			break;
+		case 1: /* ID_AA64ISAR1_EL1 */
+			val = cpu_id_aa64isar1;
+			break;
+		case 2: /* ID_AA64ISAR2_EL2 */
+			val = cpu_id_aa64isar2;
+			break;
+		default:
+			return 0;
+		}
+		break;
+	case 7:
+		switch (ISS_MSR_OP2(esr)) {
+		case 0: /* ID_AA64MMFR0_EL1 */
+		case 1: /* ID_AA64MMFR1_EL1 */
+		case 2: /* ID_AA64MMFR2_EL1 */
+		case 3: /* ID_AA64MMFR3_EL1 */
+		case 4: /* ID_AA64MMFR4_EL1 */
+			val = 0;
+			break;
+		default:
+			return 0;
+		}
+		break;
+	default:
+		return 0;
+	}
+
+	if (rt < 30)
+		frame->tf_x[rt] = val;
+	else if (rt == 30)
+		frame->tf_lr = val;
+	frame->tf_elr += 4;
+
+	return 1;
+}
+
 void
 do_el1h_sync(struct trapframe *frame)
 {
@@ -199,6 +291,7 @@ do_el1h_sync(struct trapframe *frame)
 	far = READ_SPECIALREG(far_el1);
 
 	intr_enable();
+	uvmexp.traps++;
 
 	/*
 	 * Sanity check we are in an exception er can handle. The IL bit
@@ -269,6 +362,7 @@ do_el0_sync(struct trapframe *frame)
 	far = READ_SPECIALREG(far_el1);
 
 	intr_enable();
+	uvmexp.traps++;
 
 	p->p_addr->u_pcb.pcb_tf = frame;
 	refreshcreds(p);
@@ -279,6 +373,9 @@ do_el0_sync(struct trapframe *frame)
 		sv.sival_ptr = (void *)frame->tf_elr;
 		trapsignal(p, SIGILL, esr, ILL_ILLOPC, sv);
 		break;
+	case EXCP_SVE:
+		sve_load(p);
+		break;
 	case EXCP_FP_SIMD:
 	case EXCP_TRAP_FP:
 		fpu_load(p);
@@ -288,6 +385,10 @@ do_el0_sync(struct trapframe *frame)
 		sv.sival_ptr = (void *)frame->tf_elr;
 		trapsignal(p, SIGILL, esr, ILL_BTCFI, sv);
 		break;
+	case EXCP_MSR:
+		if (emulate_msr(frame, esr))
+			break;
+		/* FALLTHROUGH */
 	case EXCP_FPAC:
 		curcpu()->ci_flush_bp();
 		sv.sival_ptr = (void *)frame->tf_elr;

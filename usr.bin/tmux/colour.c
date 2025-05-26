@@ -1,4 +1,4 @@
-/* $OpenBSD: colour.c,v 1.26 2023/01/03 11:43:24 nicm Exp $ */
+/* $OpenBSD: colour.c,v 1.29 2025/03/04 08:45:04 nicm Exp $ */
 
 /*
  * Copyright (c) 2008 Nicholas Marriott <nicholas.marriott@gmail.com>
@@ -180,6 +180,46 @@ colour_tostring(int c)
 		return ("brightwhite");
 	}
 	return ("invalid");
+}
+
+/* Convert background colour to theme. */
+enum client_theme
+colour_totheme(int c)
+{
+	int	r, g, b, brightness;
+
+	if (c == -1)
+		return (THEME_UNKNOWN);
+
+	if (c & COLOUR_FLAG_RGB) {
+		r = (c >> 16) & 0xff;
+		g = (c >> 8) & 0xff;
+		b = (c >> 0) & 0xff;
+
+		brightness = r + g + b;
+		if (brightness > 382)
+			return (THEME_LIGHT);
+		return (THEME_DARK);
+	}
+
+	if (c & COLOUR_FLAG_256)
+		return (colour_totheme(colour_256toRGB(c)));
+
+	switch (c) {
+	case 0:
+	case 90:
+		return (THEME_DARK);
+	case 7:
+	case 97:
+		return (THEME_LIGHT);
+	default:
+		if (c >= 0 && c <= 7)
+			return (colour_totheme(colour_256toRGB(c)));
+		if (c >= 90 && c <= 97)
+			return (colour_totheme(colour_256toRGB(8 + c - 90)));
+		break;
+	}
+	return (THEME_UNKNOWN);
 }
 
 /* Convert colour from string. */
@@ -942,13 +982,17 @@ colour_byname(const char *name)
 		{ "yellow3", 0xcdcd00 },
 		{ "yellow4", 0x8b8b00 }
 	};
-	u_int	i;
-	int	c;
+	u_int		 i;
+	int		 c;
+	const char	*errstr;
 
 	if (strncmp(name, "grey", 4) == 0 || strncmp(name, "gray", 4) == 0) {
-		if (!isdigit((u_char)name[4]))
+		if (name[4] == '\0')
 			return (0xbebebe|COLOUR_FLAG_RGB);
-		c = round(2.55 * atoi(name + 4));
+		c = strtonum(name + 4, 0, 100, &errstr);
+		if (errstr != NULL)
+			return (-1);
+		c = round(2.55 * c);
 		if (c < 0 || c > 255)
 			return (-1);
 		return (colour_join_rgb(c, c, c));

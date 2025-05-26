@@ -1,4 +1,4 @@
-/*	$OpenBSD: vioblk.c,v 1.13 2024/02/20 21:40:37 dv Exp $	*/
+/*	$OpenBSD: vioblk.c,v 1.22 2025/05/12 17:17:42 dv Exp $	*/
 
 /*
  * Copyright (c) 2023 Dave Voutila <dv@openbsd.org>
@@ -16,8 +16,7 @@
  * ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
  * OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
  */
-#include <sys/mman.h>
-#include <sys/param.h> /* PAGE_SIZE */
+#include <stdint.h>
 
 #include <dev/pci/virtio_pcireg.h>
 #include <dev/pv/vioblkreg.h>
@@ -25,7 +24,6 @@
 
 #include <errno.h>
 #include <event.h>
-#include <fcntl.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
@@ -176,7 +174,11 @@ vioblk_main(int fd, int fd_vmm)
 	/* Configure our sync channel event handler. */
 	log_debug("%s: wiring in sync channel handler (fd=%d)", __func__,
 		dev.sync_fd);
-	imsg_init(&dev.sync_iev.ibuf, dev.sync_fd);
+	if (imsgbuf_init(&dev.sync_iev.ibuf, dev.sync_fd) == -1) {
+		log_warn("imsgbuf_init");
+		goto fail;
+	}
+	imsgbuf_allow_fdpass(&dev.sync_iev.ibuf);
 	dev.sync_iev.handler = handle_sync_io;
 	dev.sync_iev.data = &dev;
 	dev.sync_iev.events = EV_READ;
@@ -218,7 +220,7 @@ fail:
 	msg.data = ret;
 	imsg_compose(&dev.sync_iev.ibuf, IMSG_DEVOP_MSG, 0, 0, -1, &msg,
 	    sizeof(msg));
-	imsg_flush(&dev.sync_iev.ibuf);
+	imsgbuf_flush(&dev.sync_iev.ibuf);
 
 	close_fd(dev.sync_fd);
 	close_fd(dev.async_fd);
@@ -367,6 +369,7 @@ vioblk_notifyq(struct vioblk_dev *dev)
 			 * often send this command regardless.
 			 */
 			ds = VIRTIO_BLK_S_UNSUPP;
+			break;
 		default:
 			log_warnx("%s: unsupported vioblk command %d", __func__,
 			    cmd->type);
@@ -432,10 +435,11 @@ dev_dispatch_vm(int fd, short event, void *arg)
 	struct imsg	 	 imsg;
 	ssize_t			 n = 0;
 	int			 verbose;
+	uint32_t		 type;
 
 	if (event & EV_READ) {
-		if ((n = imsg_read(ibuf)) == -1 && errno != EAGAIN)
-			fatal("%s: imsg_read", __func__);
+		if ((n = imsgbuf_read(ibuf)) == -1)
+			fatal("%s: imsgbuf_read", __func__);
 		if (n == 0) {
 			/* this pipe is dead, so remove the event handler */
 			log_debug("%s: pipe dead (EV_READ)", __func__);
@@ -446,14 +450,15 @@ dev_dispatch_vm(int fd, short event, void *arg)
 	}
 
 	if (event & EV_WRITE) {
-		if ((n = msgbuf_write(&ibuf->w)) == -1 && errno != EAGAIN)
-			fatal("%s: msgbuf_write", __func__);
-		if (n == 0) {
-			/* this pipe is dead, so remove the event handler */
-			log_debug("%s: pipe dead (EV_WRITE)", __func__);
-			event_del(&iev->ev);
-			event_loopbreak();
-			return;
+		if (imsgbuf_write(ibuf) == -1) {
+			if (errno == EPIPE) {
+				/* this pipe is dead, remove the handler */
+				log_debug("%s: pipe dead (EV_WRITE)", __func__);
+				event_del(&iev->ev);
+				event_loopexit(NULL);
+				return;
+			}
+			fatal("%s: imsgbuf_write", __func__);
 		}
 	}
 
@@ -463,7 +468,8 @@ dev_dispatch_vm(int fd, short event, void *arg)
 		if (n == 0)
 			break;
 
-		switch (imsg.hdr.type) {
+		type = imsg_get_type(&imsg);
+		switch (type) {
 		case IMSG_VMDOP_PAUSE_VM:
 			log_debug("%s: pausing", __func__);
 			break;
@@ -471,13 +477,11 @@ dev_dispatch_vm(int fd, short event, void *arg)
 			log_debug("%s: unpausing", __func__);
 			break;
 		case IMSG_CTL_VERBOSE:
-			IMSG_SIZE_CHECK(&imsg, &verbose);
-			memcpy(&verbose, imsg.data, sizeof(verbose));
+			verbose = imsg_int_read(&imsg);
 			log_setverbose(verbose);
 			break;
 		default:
-			log_warnx("%s: unhandled imsg type %d", __func__,
-			    imsg.hdr.type);
+			log_warnx("%s: unhandled imsg type %d", __func__, type);
 			break;
 		}
 		imsg_free(&imsg);
@@ -501,8 +505,8 @@ handle_sync_io(int fd, short event, void *arg)
 	int8_t intr = INTR_STATE_NOOP;
 
 	if (event & EV_READ) {
-		if ((n = imsg_read(ibuf)) == -1 && errno != EAGAIN)
-			fatal("%s: imsg_read", __func__);
+		if ((n = imsgbuf_read(ibuf)) == -1)
+			fatal("%s: imsgbuf_read", __func__);
 		if (n == 0) {
 			/* this pipe is dead, so remove the event handler */
 			log_debug("%s: vioblk pipe dead (EV_READ)", __func__);
@@ -513,14 +517,15 @@ handle_sync_io(int fd, short event, void *arg)
 	}
 
 	if (event & EV_WRITE) {
-		if ((n = msgbuf_write(&ibuf->w)) == -1 && errno != EAGAIN)
-			fatal("%s: msgbuf_write", __func__);
-		if (n == 0) {
-			/* this pipe is dead, so remove the event handler */
-			log_debug("%s: vioblk pipe dead (EV_WRITE)", __func__);
-			event_del(&iev->ev);
-			event_loopexit(NULL);
-			return;
+		if (imsgbuf_write(ibuf) == -1) {
+			if (errno == EPIPE) {
+				/* this pipe is dead, remove the handler */
+				log_debug("%s: pipe dead (EV_WRITE)", __func__);
+				event_del(&iev->ev);
+				event_loopexit(NULL);
+				return;
+			}
+			fatal("%s: imsgbuf_write", __func__);
 		}
 	}
 
@@ -531,8 +536,7 @@ handle_sync_io(int fd, short event, void *arg)
 			break;
 
 		/* Unpack our message. They ALL should be dev messeges! */
-		IMSG_SIZE_CHECK(&imsg, &msg);
-		memcpy(&msg, imsg.data, sizeof(msg));
+		viodev_msg_read(&imsg, &msg);
 		imsg_free(&imsg);
 
 		switch (msg.type) {
@@ -555,7 +559,7 @@ handle_sync_io(int fd, short event, void *arg)
 		case VIODEV_MSG_IO_WRITE:
 			/* Write IO: no reply needed */
 			if (handle_io_write(&msg, dev) == 1)
-				virtio_assert_pic_irq(dev, 0);
+				virtio_assert_irq(dev, 0);
 			break;
 		case VIODEV_MSG_SHUTDOWN:
 			event_del(&dev->sync_iev.ev);
@@ -614,7 +618,7 @@ handle_io_write(struct viodev_msg *msg, struct virtio_dev *dev)
 			vioblk->cfg.isr_status = 0;
 			vioblk->vq[0].last_avail = 0;
 			vioblk->vq[0].notified_avail = 0;
-			virtio_deassert_pic_irq(dev, msg->vcpu);
+			virtio_deassert_irq(dev, msg->vcpu);
 		}
 		break;
 	default:

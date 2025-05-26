@@ -1,4 +1,4 @@
-.\"	$OpenBSD: acpi.4,v 1.74 2024/04/09 20:18:37 mglocker Exp $
+.\"	$OpenBSD: acpi.4,v 1.78 2025/05/20 10:17:38 jmc Exp $
 .\"
 .\" Copyright (c) 2006 Alexander Yurchenko <grange@openbsd.org>
 .\"
@@ -14,7 +14,7 @@
 .\" ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
 .\" OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
 .\"
-.Dd $Mdocdate: April 9 2024 $
+.Dd $Mdocdate: May 20 2025 $
 .Dt ACPI 4
 .Os
 .Sh NAME
@@ -52,6 +52,8 @@ ACPI control method battery
 ACPI button
 .It Xr acpicbkbd 4
 Chromebook keyboard backlight
+.It Xr acpicmos 4
+CMOS memory manager
 .It Xr acpicpu 4
 ACPI processor power and performance state
 .It Xr acpidock 4
@@ -94,6 +96,8 @@ ACPI thermal zone
 ACPI video
 .It Xr acpivout 4
 ACPI video output
+.It Xr acpiwmi 4
+ACPI WMI interface
 .It Xr ahci 4
 Advanced Host Controller Interface for Serial ATA
 .It Xr aibs 4
@@ -122,12 +126,16 @@ Synopsys DesignWare I2C controller
 Intel Gemini Lake GPIO controller
 .It Xr imxiic 4
 i.MX onboard I2C controller
+.It Xr intelpmc 4
+Intel power management controller
 .It Xr iosf 4
 Intel OnChip System Fabric device
 .It Xr ipmi 4
 Intelligent Platform Management Interface driver
 .It Xr pchgpio 4
 Intel PCH GPIO controller
+.It Xr pckbc 4
+Keyboard controller
 .It Xr pluart 4
 ARM PrimeCell PL011 UART
 .It Xr qcgpio 4

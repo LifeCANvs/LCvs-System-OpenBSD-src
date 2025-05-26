@@ -1,4 +1,4 @@
-/* $OpenBSD: locore.S,v 1.46 2024/03/16 20:46:28 kettenis Exp $ */
+/* $OpenBSD: locore.S,v 1.48 2025/01/31 16:42:26 kettenis Exp $ */
 /*-
  * Copyright (c) 2012-2014 Andrew Turner
  * All rights reserved.
@@ -80,8 +80,7 @@ drop_to_el1:
 	msr	hstr_el2, xzr
 
 	/* Enable access to the physical timers at EL1 */
-	mrs	x2, cnthctl_el2
-	orr	x2, x2, #(CNTHCTL_EL1PCTEN | CNTHCTL_EL1PCEN)
+	mov	x2, #(CNTHCTL_EL1PCTEN | CNTHCTL_EL1PCEN)
 	msr	cnthctl_el2, x2
 
 	/* Set the counter offset to a known value */
@@ -315,6 +314,9 @@ initstack:
 	.globl initstack_end
 initstack_end:
 
+/* The signal trampoline saves and restores the floating-point registers. */
+.arch_extension	fp
+
 	.text
 	.globl	sigcode
 	.type	sigcode,@function
@@ -386,6 +388,9 @@ esigfill:
 	.globl	sigfillsiz
 sigfillsiz:
 	.word	esigfill - sigfill
+
+/* Back to normal kernel code. */
+.arch_extension	nofp
 
 	.text
 

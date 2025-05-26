@@ -1,4 +1,4 @@
-/*      $OpenBSD: ip_gre.c,v 1.87 2023/12/15 00:24:56 bluhm Exp $ */
+/*      $OpenBSD: ip_gre.c,v 1.89 2025/01/01 13:44:22 bluhm Exp $ */
 /*	$NetBSD: ip_gre.c,v 1.9 1999/10/25 19:18:11 drochner Exp $ */
 
 /*
@@ -35,10 +35,6 @@
  * output half is in net/if_gre.[ch]
  * This currently handles IPPROTO_GRE, IPPROTO_MOBILE
  */
-
-
-#include "gre.h"
-#if NGRE > 0
 
 #include <sys/param.h>
 #include <sys/systm.h>
@@ -80,7 +76,7 @@ int
 gre_send(struct socket *so, struct mbuf *m, struct mbuf *nam,
     struct mbuf *control)
 {
-#ifdef  PIPEX 
+#ifdef PIPEX
 	struct inpcb *inp = sotoinpcb(so);
 
 	if (inp->inp_pipex) {
@@ -114,5 +110,3 @@ gre_send(struct socket *so, struct mbuf *m, struct mbuf *nam,
 #endif
 	return rip_send(so, m, nam, control);
 }
-
-#endif /* if NGRE > 0 */

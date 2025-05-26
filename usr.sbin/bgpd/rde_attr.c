@@ -1,4 +1,4 @@
-/*	$OpenBSD: rde_attr.c,v 1.134 2023/07/12 14:45:43 claudio Exp $ */
+/*	$OpenBSD: rde_attr.c,v 1.137 2025/04/14 11:49:39 claudio Exp $ */
 
 /*
  * Copyright (c) 2004 Claudio Jeker <claudio@openbsd.org>
@@ -80,20 +80,19 @@ attr_optadd(struct rde_aspath *asp, uint8_t flags, uint8_t type,
 	struct attr	*a, *t;
 	void		*p;
 
-	/* known optional attributes were validated previously */
-	if ((a = attr_lookup(flags, type, data, len)) == NULL)
-		a = attr_alloc(flags, type, data, len);
-
 	/* attribute allowed only once */
 	for (l = 0; l < asp->others_len; l++) {
 		if (asp->others[l] == NULL)
 			break;
-		if (type == asp->others[l]->type) {
-			if (a->refcnt == 0)
-				attr_put(a);
+		if (type == asp->others[l]->type)
 			return (-1);
-		}
+		if (type < asp->others[l]->type)
+			break;
 	}
+
+	/* known optional attributes were validated previously */
+	if ((a = attr_lookup(flags, type, data, len)) == NULL)
+		a = attr_alloc(flags, type, data, len);
 
 	/* add attribute to the table but first bump refcnt */
 	a->refcnt++;
@@ -114,7 +113,7 @@ attr_optadd(struct rde_aspath *asp, uint8_t flags, uint8_t type,
 
 	/* no empty slot found, need to realloc */
 	if (asp->others_len == UCHAR_MAX)
-		fatalx("attr_optadd: others_len overflow");
+		fatalx("attr_optadd: attribute overflow");
 
 	asp->others_len++;
 	if ((p = reallocarray(asp->others,
@@ -190,6 +189,8 @@ attr_diff(struct attr *oa, struct attr *ob)
 		return (1);
 	if (oa->len < ob->len)
 		return (-1);
+	if (oa->len == 0)
+		return (0);
 	r = memcmp(oa->data, ob->data, oa->len);
 	if (r > 0)
 		return (1);
@@ -357,7 +358,8 @@ aspath_get(void *data, uint16_t len)
 	aspath->len = len;
 	aspath->ascnt = aspath_count(data, len);
 	aspath->source_as = aspath_extract_origin(data, len);
-	memcpy(aspath->data, data, len);
+	if (len != 0)
+		memcpy(aspath->data, data, len);
 
 	return (aspath);
 }
@@ -396,7 +398,7 @@ aspath_put(struct aspath *aspath)
 u_char *
 aspath_deflate(u_char *data, uint16_t *len, int *flagnew)
 {
-	uint8_t	*seg, *nseg, *ndata;
+	uint8_t		*seg, *nseg, *ndata = NULL;
 	uint32_t	 as;
 	int		 i;
 	uint16_t	 seg_size, olen, nlen;
@@ -414,6 +416,9 @@ aspath_deflate(u_char *data, uint16_t *len, int *flagnew)
 		if (seg_size > olen)
 			fatalx("%s: would overflow", __func__);
 	}
+
+	if (nlen == 0)
+		goto done;
 
 	if ((ndata = malloc(nlen)) == NULL)
 		fatal("%s", __func__);
@@ -437,6 +442,7 @@ aspath_deflate(u_char *data, uint16_t *len, int *flagnew)
 		}
 	}
 
+ done:
 	*len = nlen;
 	return (ndata);
 }
@@ -791,6 +797,10 @@ aspath_prepend(struct aspath *asp, uint32_t as, int quantum, uint16_t *len)
 		fatalx("aspath_prepend: preposterous prepend");
 	if (quantum == 0) {
 		/* no change needed but return a copy */
+		if (asp->len == 0) {
+			*len = 0;
+			return (NULL);
+		}
 		p = malloc(asp->len);
 		if (p == NULL)
 			fatal("%s", __func__);
@@ -834,7 +844,8 @@ aspath_prepend(struct aspath *asp, uint32_t as, int quantum, uint16_t *len)
 			wpos += sizeof(uint32_t);
 		}
 	}
-	memcpy(p + wpos, asp->data + shift, asp->len - shift);
+	if (asp->len > shift)
+		memcpy(p + wpos, asp->data + shift, asp->len - shift);
 
 	*len = l;
 	return (p);
@@ -851,6 +862,11 @@ aspath_override(struct aspath *asp, uint32_t neighbor_as, uint32_t local_as,
 	uint32_t	 as;
 	uint16_t	 l, seg_size;
 	uint8_t		 i, seg_len, seg_type;
+
+	if (asp->len == 0) {
+		*len = 0;
+		return (NULL);
+	}
 
 	p = malloc(asp->len);
 	if (p == NULL)

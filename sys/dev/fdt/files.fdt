@@ -1,4 +1,4 @@
-#	$OpenBSD: files.fdt,v 1.202 2024/03/27 15:15:00 patrick Exp $
+#	$OpenBSD: files.fdt,v 1.208 2025/04/22 05:31:50 deraadt Exp $
 #
 # Config file and device description for machine-independent FDT code.
 # Included by ports that need it.
@@ -229,6 +229,9 @@ file	dev/fdt/sdhc_fdt.c		sdhc_fdt
 attach	xhci at fdt with xhci_fdt
 file	dev/fdt/xhci_fdt.c		xhci_fdt
 
+attach	ufshci at fdt with ufshci_fdt
+file	dev/fdt/ufshci_fdt.c		ufshci_fdt
+
 device	syscon: fdt
 attach	syscon at fdt
 file	dev/fdt/syscon.c		syscon
@@ -332,6 +335,18 @@ file	dev/fdt/hireset.c		hireset
 device	hitemp
 attach	hitemp at fdt
 file	dev/fdt/hitemp.c		hitemp
+
+device	mtintc
+attach	mtintc at fdt
+file	dev/fdt/mtintc.c		mtintc
+
+device	mtrng
+attach	mtrng at fdt
+file	dev/fdt/mtrng.c			mtrng
+
+device	mtxhci: usbus
+attach	mtxhci at fdt
+file	dev/fdt/mtxhci.c		mtxhci
 
 device	rkanxdp
 attach	rkanxdp at fdt
@@ -681,6 +696,11 @@ device	qccpu
 attach	qccpu at fdt
 file	dev/fdt/qccpu.c		qccpu
 
+# Qualcomm CPUCP Mailbox
+device	qccpucp
+attach	qccpucp at fdt
+file	dev/fdt/qccpucp.c		qccpucp
+
 device	qcdwusb: fdt
 attach	qcdwusb at fdt
 file	dev/fdt/qcdwusb.c		qcdwusb
@@ -709,7 +729,7 @@ attach	qcpas at fdt
 file	dev/fdt/qcpas.c			qcpas
 
 # Qualcomm SCM
-device	qcscm
+#device	qcscm	# XXX in sys/conf/files, because shared between ACPI and FDT 
 attach	qcscm at fdt
 file	dev/fdt/qcscm.c			qcscm
 

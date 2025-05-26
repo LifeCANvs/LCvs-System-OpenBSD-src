@@ -1,4 +1,4 @@
-/*	$OpenBSD: viocon.c,v 1.11 2024/05/24 10:05:55 jsg Exp $	*/
+/*	$OpenBSD: viocon.c,v 1.17 2025/01/16 10:33:27 sf Exp $	*/
 
 /*
  * Copyright (c) 2013-2015 Stefan Fritsch <sf@sfritsch.de>
@@ -46,7 +46,7 @@
 #define DPRINTF(x...)
 #endif
 
-struct virtio_feature_name viocon_feature_names[] = {
+static const struct virtio_feature_name viocon_feature_names[] = {
 #if VIRTIO_DEBUG
 	{ VIRTIO_CONSOLE_F_SIZE,	"Size" },
 	{ VIRTIO_CONSOLE_F_MULTIPORT,	"MultiPort" },
@@ -159,10 +159,11 @@ dev2port(dev_t dev)
 	return dev2sc(dev)->sc_ports[VIOCONPORT(dev)];
 }
 
-int viocon_match(struct device *parent, void *match, void *aux)
+int
+viocon_match(struct device *parent, void *match, void *aux)
 {
-	struct virtio_softc *va = aux;
-	if (va->sc_childdevid == PCI_PRODUCT_VIRTIO_CONSOLE)
+	struct virtio_attach_args *va = aux;
+	if (va->va_devid == PCI_PRODUCT_VIRTIO_CONSOLE)
 		return 1;
 	return 0;
 }
@@ -178,7 +179,6 @@ viocon_attach(struct device *parent, struct device *self, void *aux)
 		panic("already attached to something else");
 	vsc->sc_child = self;
 	vsc->sc_ipl = IPL_TTY;
-	vsc->sc_config_change = NULL;
 	sc->sc_virtio = vsc;
 	sc->sc_max_ports = maxports;
 
@@ -192,7 +192,8 @@ viocon_attach(struct device *parent, struct device *self, void *aux)
 	}
 
 	vsc->sc_driver_features = VIRTIO_CONSOLE_F_SIZE;
-	virtio_negotiate_features(vsc, viocon_feature_names);
+	if (virtio_negotiate_features(vsc, viocon_feature_names) != 0)
+		goto err;
 
 	printf("\n");
 	DPRINTF("%s: softc: %p\n", __func__, sc);
@@ -200,10 +201,11 @@ viocon_attach(struct device *parent, struct device *self, void *aux)
 		printf("\n%s: viocon_port_create failed\n", __func__);
 		goto err;
 	}
+	if (virtio_attach_finish(vsc, va) != 0)
+		goto err;
 	viocon_rx_fill(sc->sc_ports[0]);
-	virtio_set_status(vsc, VIRTIO_CONFIG_DEVICE_STATUS_DRIVER_OK);
-
 	return;
+
 err:
 	vsc->sc_child = VIRTIO_CHILD_ERROR;
 	free(vsc->sc_vqs, M_DEVBUF, 2 * (maxports + 1) * sizeof(struct virtqueue));
@@ -234,8 +236,7 @@ viocon_port_create(struct viocon_softc *sc, int portidx)
 	txidx = rxidx + 1;
 
 	snprintf(name, sizeof(name), "p%drx", portidx);
-	if (virtio_alloc_vq(vsc, &vsc->sc_vqs[rxidx], rxidx, BUFSIZE, 1,
-	    name) != 0) {
+	if (virtio_alloc_vq(vsc, &vsc->sc_vqs[rxidx], rxidx, 1, name) != 0) {
 		printf("\nCan't alloc %s virtqueue\n", name);
 		goto err;
 	}
@@ -245,8 +246,7 @@ viocon_port_create(struct viocon_softc *sc, int portidx)
 	DPRINTF("%s: rx: %p\n", __func__, vp->vp_rx);
 
 	snprintf(name, sizeof(name), "p%dtx", portidx);
-	if (virtio_alloc_vq(vsc, &vsc->sc_vqs[txidx], txidx, BUFSIZE, 1,
-	    name) != 0) {
+	if (virtio_alloc_vq(vsc, &vsc->sc_vqs[txidx], txidx, 1, name) != 0) {
 		printf("\nCan't alloc %s virtqueue\n", name);
 		goto err;
 	}
@@ -462,7 +462,7 @@ vioconhwiflow(struct tty *tp, int stop)
 		virtio_stop_vq_intr(vp->vp_sc->sc_virtio, vp->vp_rx);
 	} else {
 		virtio_start_vq_intr(vp->vp_sc->sc_virtio, vp->vp_rx);
-		softintr_schedule(vp->vp_si);
+		virtio_check_vq(vp->vp_sc->sc_virtio, vp->vp_rx);
 	}
 	splx(s);
 	return 1;

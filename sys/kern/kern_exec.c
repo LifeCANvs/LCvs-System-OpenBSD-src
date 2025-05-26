@@ -1,4 +1,4 @@
-/*	$OpenBSD: kern_exec.c,v 1.255 2024/04/02 08:39:16 deraadt Exp $	*/
+/*	$OpenBSD: kern_exec.c,v 1.263 2025/05/24 06:49:16 deraadt Exp $	*/
 /*	$NetBSD: kern_exec.c,v 1.75 1996/02/09 18:59:28 christos Exp $	*/
 
 /*-
@@ -441,6 +441,9 @@ sys_execve(struct proc *p, void *v, register_t *retval)
 	 */
 	single_thread_set(p, SINGLE_EXIT);
 
+	/* Clear profiling state in new image */
+	prof_exec(pr);
+
 	/*
 	 * Prepare vmspace for remapping. Note that uvmspace_exec can replace
 	 * ps_vmspace!
@@ -514,12 +517,10 @@ sys_execve(struct proc *p, void *v, register_t *retval)
 		pr->ps_pin.pn_pins = pack.ep_pins;
 		pack.ep_pins = NULL;
 		pr->ps_pin.pn_npins = pack.ep_npins;
-		pr->ps_flags |= PS_PIN;
 	} else {
 		pr->ps_pin.pn_start = pr->ps_pin.pn_end = 0;
 		pr->ps_pin.pn_pins = NULL;
 		pr->ps_pin.pn_npins = 0;
-		pr->ps_flags &= ~PS_PIN;
 	}
 	if (pr->ps_libcpin.pn_pins) {
 		free(pr->ps_libcpin.pn_pins, M_PINSYSCALL,
@@ -527,7 +528,6 @@ sys_execve(struct proc *p, void *v, register_t *retval)
 		pr->ps_libcpin.pn_start = pr->ps_libcpin.pn_end = 0;
 		pr->ps_libcpin.pn_pins = NULL;
 		pr->ps_libcpin.pn_npins = 0;
-		pr->ps_flags &= ~PS_LIBCPIN;
 	}
 
 	stopprofclock(pr);	/* stop profiling */
@@ -555,10 +555,16 @@ sys_execve(struct proc *p, void *v, register_t *retval)
 	else
 		atomic_clearbits_int(&p->p_p->ps_flags, PS_NOBTCFI);
 
+	if (pack.ep_flags & EXEC_PROFILE)
+		atomic_setbits_int(&p->p_p->ps_flags, PS_PROFILE);
+	else
+		atomic_clearbits_int(&p->p_p->ps_flags, PS_PROFILE);
+
 	atomic_setbits_int(&pr->ps_flags, PS_EXEC);
 	if (pr->ps_flags & PS_PPWAIT) {
 		atomic_clearbits_int(&pr->ps_flags, PS_PPWAIT);
 		atomic_clearbits_int(&pr->ps_pptr->ps_flags, PS_ISPWAIT);
+		atomic_setbits_int(&pr->ps_pptr->ps_flags, PS_WAITEVENT);
 		wakeup(pr->ps_pptr);
 	}
 
@@ -575,10 +581,12 @@ sys_execve(struct proc *p, void *v, register_t *retval)
 		atomic_clearbits_int(&pr->ps_flags, PS_SUGIDEXEC);
 
 	if (pr->ps_flags & PS_EXECPLEDGE) {
+		p->p_pledge = pr->ps_execpledge;
 		pr->ps_pledge = pr->ps_execpledge;
 		atomic_setbits_int(&pr->ps_flags, PS_PLEDGE);
 	} else {
 		atomic_clearbits_int(&pr->ps_flags, PS_PLEDGE);
+		p->p_pledge = 0;
 		pr->ps_pledge = 0;
 		/* XXX XXX XXX XXX */
 		/* Clear our unveil paths out so the child
@@ -699,6 +707,7 @@ sys_execve(struct proc *p, void *v, register_t *retval)
 	/* reset CPU time usage for the thread, but not the process */
 	timespecclear(&p->p_tu.tu_runtime);
 	p->p_tu.tu_uticks = p->p_tu.tu_sticks = p->p_tu.tu_iticks = 0;
+	p->p_tu.tu_gen = 0;
 
 	memset(p->p_name, 0, sizeof p->p_name);
 
@@ -710,7 +719,7 @@ sys_execve(struct proc *p, void *v, register_t *retval)
 	/*
 	 * notify others that we exec'd
 	 */
-	knote_locked(&pr->ps_klist, NOTE_EXEC);
+	knote(&pr->ps_klist, NOTE_EXEC);
 
 	/* map the process's timekeep page, needs to be before exec_elf_fixup */
 	if (exec_timekeep_map(pr))
@@ -750,7 +759,7 @@ sys_execve(struct proc *p, void *v, register_t *retval)
 		atomic_clearbits_int(&p->p_p->ps_flags, PS_WXNEEDED);
 
 	atomic_clearbits_int(&pr->ps_flags, PS_INEXEC);
-	single_thread_clear(p, P_SUSPSIG);
+	single_thread_clear(p);
 
 	/* setregs() sets up all the registers, so just 'return' */
 	return EJUSTRETURN;
@@ -777,7 +786,7 @@ bad:
 freehdr:
 	free(pack.ep_hdr, M_EXEC, pack.ep_hdrlen);
 	atomic_clearbits_int(&pr->ps_flags, PS_INEXEC);
-	single_thread_clear(p, P_SUSPSIG);
+	single_thread_clear(p);
 
 	return (error);
 
@@ -798,11 +807,7 @@ exec_abort:
 free_pack_abort:
 	free(pack.ep_hdr, M_EXEC, pack.ep_hdrlen);
 	exit1(p, 0, SIGABRT, EXIT_NORMAL);
-
 	/* NOTREACHED */
-	atomic_clearbits_int(&pr->ps_flags, PS_INEXEC);
-
-	return (0);
 }
 
 

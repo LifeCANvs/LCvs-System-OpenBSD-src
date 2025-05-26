@@ -1,4 +1,4 @@
-/* $OpenBSD: tls13_internal.h,v 1.103 2024/01/27 14:31:01 jsing Exp $ */
+/* $OpenBSD: tls13_internal.h,v 1.105 2025/03/09 15:12:18 tb Exp $ */
 /*
  * Copyright (c) 2018 Bob Beck <beck@openbsd.org>
  * Copyright (c) 2018 Theo Buehler <tb@openbsd.org>
@@ -210,6 +210,8 @@ void tls13_record_layer_set_hash(struct tls13_record_layer *rl,
 void tls13_record_layer_set_legacy_version(struct tls13_record_layer *rl,
     uint16_t version);
 void tls13_record_layer_set_retry_after_phh(struct tls13_record_layer *rl, int retry);
+void tls13_record_layer_alert_sent(struct tls13_record_layer *rl,
+    uint8_t alert_level, uint8_t alert_desc);
 void tls13_record_layer_handshake_completed(struct tls13_record_layer *rl);
 int tls13_record_layer_set_read_traffic_key(struct tls13_record_layer *rl,
     struct tls13_secret *read_key, enum ssl_encryption_level_t read_level);
@@ -423,10 +425,10 @@ int tls13_error_setx(struct tls13_error *error, int code, int subcode,
     const char *file, int line, const char *fmt, ...);
 
 #define tls13_set_error(ctx, code, subcode, fmt, ...) \
-	tls13_error_set(&(ctx)->error, (code), (subcode), __FILE__, __LINE__, \
+	tls13_error_set(&(ctx)->error, (code), (subcode), OPENSSL_FILE, OPENSSL_LINE, \
 	    (fmt), __VA_ARGS__)
 #define tls13_set_errorx(ctx, code, subcode, fmt, ...) \
-	tls13_error_setx(&(ctx)->error, (code), (subcode), __FILE__, __LINE__, \
+	tls13_error_setx(&(ctx)->error, (code), (subcode), OPENSSL_FILE, OPENSSL_LINE, \
 	    (fmt), __VA_ARGS__)
 
 int tls13_exporter(struct tls13_ctx *ctx, const uint8_t *label, size_t label_len,

@@ -1,4 +1,4 @@
-/*	$OpenBSD: cpu.h,v 1.37 2024/06/09 21:15:29 jca Exp $	*/
+/*	$OpenBSD: cpu.h,v 1.39 2024/11/28 18:54:36 gkoehler Exp $	*/
 
 /*
  * Copyright (c) 2020 Mark Kettenis <kettenis@openbsd.org>
@@ -41,6 +41,7 @@
  */
 
 #include <machine/cpufunc.h>
+#include <machine/elf.h>
 #include <machine/frame.h>
 #include <machine/intr.h>
 #include <machine/psl.h>
@@ -173,12 +174,6 @@ void signotify(struct proc *);
 #define CPU_BUSY_CYCLE()	__asm volatile ("" ::: "memory")
 
 #define curpcb			curcpu()->ci_curpcb
-
-extern uint32_t cpu_features;
-extern uint32_t cpu_features2;
-
-#define PPC_FEATURE2_ARCH_3_00	0x00800000
-#define PPC_FEATURE2_DARN	0x00200000
 
 void cpu_init_features(void);
 void cpu_init(void);

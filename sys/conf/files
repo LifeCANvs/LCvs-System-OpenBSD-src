@@ -1,4 +1,4 @@
-#	$OpenBSD: files,v 1.732 2024/05/29 13:56:49 mglocker Exp $
+#	$OpenBSD: files,v 1.745 2025/04/23 21:40:22 kettenis Exp $
 #	$NetBSD: files,v 1.87 1996/05/19 17:17:50 jonathan Exp $
 
 #	@(#)files.newconf	7.5 (Berkeley) 5/10/93
@@ -429,6 +429,10 @@ file	dev/ic/bwi.c			bwi
 device	qwx: ether, ifnet, ifmedia, firmload, wlan
 file	dev/ic/qwx.c			qwx
 
+# Qualcomm 802.11be
+device	qwz: ether, ifnet, ifmedia, firmload, wlan
+file	dev/ic/qwz.c			qwz
+
 # Intel OnChip System Fabric
 device	iosf
 file	dev/ic/iosf.c			iosf	needs-flag
@@ -466,8 +470,13 @@ device	xhci: usbus
 file	dev/usb/xhci.c			xhci	needs-flag
 
 # AMD Cryptographic Co-processor
-device	ccp
+device	ccp {}
 file	dev/ic/ccp.c			ccp
+
+# AMD Platform Security Processor
+device	psp
+attach	psp at ccp
+file	dev/ic/psp.c			psp	needs-flag
 
 # SDHC SD/MMC controller
 define	sdhc
@@ -549,6 +558,9 @@ device	qcgpio
 # Qualcomm I2C controller
 device	qciic: i2cbus
 
+# Qualcomm Secure Channel Manager
+device	qcscm
+
 # UFS HC
 device	ufshci: scsi
 file	dev/ic/ufshci.c			ufshci needs-flag
@@ -564,6 +576,7 @@ pseudo-device msts: tty
 pseudo-device endrun: tty
 
 pseudo-device loop: ifnet
+pseudo-device rport: ifnet
 pseudo-device pair: ifnet, ether
 pseudo-device ppp: ifnet
 pseudo-device tun: ifnet
@@ -591,6 +604,9 @@ pseudo-device pppx: ifnet
 pseudo-device vxlan: ifnet, ether, etherbridge
 pseudo-device wg: ifnet
 
+pseudo-device af_frame
+file	net/af_frame.c			af_frame needs-flag
+
 pseudo-device ksyms
 file	dev/ksyms.c			ksyms needs-flag
 
@@ -600,6 +616,7 @@ file	dev/kstat.c			kstat needs-flag
 pseudo-device fuse
 file	miscfs/fuse/fuse_device.c	fuse	needs-flag
 file	miscfs/fuse/fuse_file.c		fuse
+file	miscfs/fuse/fuse_ihash.c	fuse
 file	miscfs/fuse/fuse_lookup.c	fuse
 file	miscfs/fuse/fuse_vfsops.c	fuse
 file	miscfs/fuse/fuse_vnops.c	fuse
@@ -722,6 +739,7 @@ file kern/kern_intrmap.c		intrmap
 file kern/kern_sensors.c
 file kern/kern_sig.c
 file kern/kern_smr.c
+file kern/kern_softintr.c
 file kern/kern_subr.c
 file kern/kern_sysctl.c
 file kern/kern_synch.c
@@ -851,9 +869,10 @@ file net/if_mpw.c			mpw
 file net/if_mpip.c			mpip
 file net/if_bpe.c			bpe			needs-count
 file net/if_vether.c			vether
+file net/if_rport.c			rport
 file net/if_pair.c			pair
 file net/if_pppx.c			pppx			needs-count
-file net/if_vxlan.c			vxlan			needs-count
+file net/if_vxlan.c			vxlan
 file net/if_wg.c			wg
 file net/wg_noise.c			wg
 file net/wg_cookie.c			wg
@@ -898,7 +917,7 @@ file netinet/tcp_subr.c
 file netinet/tcp_timer.c
 file netinet/tcp_usrreq.c
 file netinet/udp_usrreq.c
-file netinet/ip_gre.c
+file netinet/ip_gre.c			gre
 file netinet/ip_ipsp.c			ipsec | tcp_signature
 file netinet/ip_spd.c			ipsec | tcp_signature
 file netinet/ip_ipip.c
@@ -946,11 +965,12 @@ file nfs/krpc_subr.c			nfsclient
 file nfs/nfs_bio.c			nfsclient
 file nfs/nfs_boot.c			nfsclient
 file nfs/nfs_debug.c			nfsclient & ddb
-file nfs/nfs_node.c			nfsclient
 file nfs/nfs_kq.c			nfsclient
+file nfs/nfs_node.c			nfsclient
 file nfs/nfs_serv.c			nfsserver
 file nfs/nfs_socket.c			nfsserver | nfsclient
 file nfs/nfs_srvcache.c			nfsserver
+file nfs/nfs_srvsubs.c			nfsserver
 file nfs/nfs_subs.c			nfsserver | nfsclient
 file nfs/nfs_syscalls.c			nfsserver | nfsclient
 file nfs/nfs_vfsops.c			nfsclient

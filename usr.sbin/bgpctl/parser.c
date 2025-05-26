@@ -1,4 +1,4 @@
-/*	$OpenBSD: parser.c,v 1.134 2023/11/20 14:18:21 claudio Exp $ */
+/*	$OpenBSD: parser.c,v 1.138 2025/03/10 14:08:25 claudio Exp $ */
 
 /*
  * Copyright (c) 2003, 2004 Henning Brauer <henning@openbsd.org>
@@ -19,6 +19,8 @@
  */
 
 #include <sys/types.h>
+#include <sys/socket.h>
+#include <arpa/inet.h>
 
 #include <endian.h>
 #include <err.h>
@@ -183,6 +185,7 @@ static const struct token t_show_rib[] = {
 	{ ASTYPE,	"empty-as",	AS_EMPTY,	t_show_rib},
 	{ FLAG,		"error",	F_CTL_INVALID,	t_show_rib},
 	{ EXTCOMMUNITY,	"ext-community", NONE,		t_show_rib},
+	{ FLAG,		"filtered",	F_CTL_FILTERED,	t_show_rib},
 	{ FLAG,		"in",		F_CTL_ADJ_IN,	t_show_rib},
 	{ LRGCOMMUNITY,	"large-community", NONE,	t_show_rib},
 	{ FLAG,		"leaked",	F_CTL_LEAKED,	t_show_rib},
@@ -1324,7 +1327,7 @@ parseextvalue(int type, char *s, uint32_t *v, uint32_t *flag)
 		*v = uval | (uvalh << 16);
 		break;
 	case EXT_COMMUNITY_TRANS_IPV4:
-		if (inet_aton(s, &ip) == 0)
+		if (inet_pton(AF_INET, s, &ip) != 1)
 			errx(1, "Bad ext-community %s not parseable", s);
 		*v = ntohl(ip.s_addr);
 		break;

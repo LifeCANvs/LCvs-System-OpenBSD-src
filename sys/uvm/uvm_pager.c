@@ -1,4 +1,4 @@
-/*	$OpenBSD: uvm_pager.c,v 1.91 2023/08/11 17:53:22 mpi Exp $	*/
+/*	$OpenBSD: uvm_pager.c,v 1.94 2025/03/10 14:13:58 mpi Exp $	*/
 /*	$NetBSD: uvm_pager.c,v 1.36 2000/11/27 18:26:41 chs Exp $	*/
 
 /*
@@ -134,24 +134,6 @@ uvm_pseg_get(int flags)
 	int i;
 	struct uvm_pseg *pseg;
 
-	/*
-	 * XXX Prevent lock ordering issue in uvm_unmap_detach().  A real
-	 * fix would be to move the KERNEL_LOCK() out of uvm_unmap_detach().
-	 *
-	 *  witness_checkorder() at witness_checkorder+0xba0
-	 *  __mp_lock() at __mp_lock+0x5f
-	 *  uvm_unmap_detach() at uvm_unmap_detach+0xc5
-	 *  uvm_map() at uvm_map+0x857
-	 *  uvm_km_valloc_try() at uvm_km_valloc_try+0x65
-	 *  uvm_pseg_get() at uvm_pseg_get+0x6f
-	 *  uvm_pagermapin() at uvm_pagermapin+0x45
-	 *  uvn_io() at uvn_io+0xcf
-	 *  uvn_get() at uvn_get+0x156
-	 *  uvm_fault_lower() at uvm_fault_lower+0x28a
-	 *  uvm_fault() at uvm_fault+0x1b3
-	 *  upageflttrap() at upageflttrap+0x62
-	 */
-	KERNEL_LOCK();
 	mtx_enter(&uvm_pseg_lck);
 
 pager_seg_restart:
@@ -178,7 +160,6 @@ pager_seg_restart:
 			if (!UVM_PSEG_INUSE(pseg, i)) {
 				pseg->use |= 1 << i;
 				mtx_leave(&uvm_pseg_lck);
-				KERNEL_UNLOCK();
 				return pseg->start + i * MAXBSIZE;
 			}
 		}
@@ -191,7 +172,6 @@ pager_seg_fail:
 	}
 
 	mtx_leave(&uvm_pseg_lck);
-	KERNEL_UNLOCK();
 	return 0;
 }
 
@@ -540,7 +520,6 @@ uvm_pager_put(struct uvm_object *uobj, struct vm_page *pg,
 	 * now attempt the I/O.   if we have a failure and we are
 	 * clustered, we will drop the cluster and try again.
 	 */
-ReTry:
 	if (uobj) {
 		result = uobj->pgops->pgo_put(uobj, ppsp, *npages, flags);
 	} else {
@@ -584,48 +563,34 @@ ReTry:
 		 * "swblk" (for transient errors, so we can retry),
 		 * or 0 (for hard errors).
 		 */
-		if (uobj == NULL && pg != NULL) {
-			/* XXX daddr_t -> int */
-			int nswblk = (result == VM_PAGER_AGAIN) ? swblk : 0;
-			if (pg->pg_flags & PQ_ANON) {
-				rw_enter(pg->uanon->an_lock, RW_WRITE);
-				pg->uanon->an_swslot = nswblk;
-				rw_exit(pg->uanon->an_lock);
-			} else {
-				rw_enter(pg->uobject->vmobjlock, RW_WRITE);
-				uao_set_swslot(pg->uobject,
-					       pg->offset >> PAGE_SHIFT,
-					       nswblk);
-				rw_exit(pg->uobject->vmobjlock);
-			}
-		}
-		if (result == VM_PAGER_AGAIN) {
-			/*
-			 * for transient failures, free all the swslots that
-			 * we're not going to retry with.
-			 */
-			if (uobj == NULL) {
-				if (pg) {
-					/* XXX daddr_t -> int */
-					uvm_swap_free(swblk + 1, *npages - 1);
+		if (uobj == NULL) {
+			if (pg != NULL) {
+				if (pg->pg_flags & PQ_ANON) {
+					rw_enter(pg->uanon->an_lock, RW_WRITE);
+					pg->uanon->an_swslot = 0;
+					rw_exit(pg->uanon->an_lock);
 				} else {
-					/* XXX daddr_t -> int */
-					uvm_swap_free(swblk, *npages);
+					rw_enter(pg->uobject->vmobjlock, RW_WRITE);
+					uao_set_swslot(pg->uobject,
+					    pg->offset >> PAGE_SHIFT, 0);
+					rw_exit(pg->uobject->vmobjlock);
 				}
 			}
-			if (pg) {
-				ppsp[0] = pg;
-				*npages = 1;
-				goto ReTry;
-			}
-		} else if (uobj == NULL) {
 			/*
-			 * for hard errors on swap-backed pageouts,
-			 * mark the swslots as bad.  note that we do not
-			 * free swslots that we mark bad.
+			 * for transient failures, free all the swslots
 			 */
-			/* XXX daddr_t -> int */
-			uvm_swap_markbad(swblk, *npages);
+			if (result == VM_PAGER_AGAIN) {
+				/* XXX daddr_t -> int */
+				uvm_swap_free(swblk, *npages);
+			} else {
+				/*
+				 * for hard errors on swap-backed pageouts,
+				 * mark the swslots as bad.  note that we do not
+				 * free swslots that we mark bad.
+				 */
+				/* XXX daddr_t -> int */
+				uvm_swap_markbad(swblk, *npages);
+			}
 		}
 	}
 
@@ -634,7 +599,6 @@ ReTry:
 	 * was one).    give up!   the caller only has one page ("pg")
 	 * to worry about.
 	 */
-	
 	return result;
 }
 
@@ -797,7 +761,6 @@ uvm_aio_aiodone_pages(struct vm_page **pgs, int npages, boolean_t write,
 		anon_disposed = (pg->pg_flags & PG_RELEASED) != 0;
 		KASSERT(!anon_disposed || pg->uobject != NULL ||
 		    pg->uanon->an_ref == 0);
-		uvm_lock_pageq();
 
 		/*
 		 * if this was a successful write,
@@ -813,11 +776,9 @@ uvm_aio_aiodone_pages(struct vm_page **pgs, int npages, boolean_t write,
 		 * unlock everything for this page now.
 		 */
 		if (pg->uobject == NULL && anon_disposed) {
-			uvm_unlock_pageq();
 			uvm_anon_release(pg->uanon);
 		} else {
 			uvm_page_unbusy(&pg, 1);
-			uvm_unlock_pageq();
 			rw_exit(slock);
 		}
 	}

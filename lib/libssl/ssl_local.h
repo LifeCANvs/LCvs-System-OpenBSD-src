@@ -1,4 +1,4 @@
-/* $OpenBSD: ssl_local.h,v 1.16 2024/05/19 07:12:50 jsg Exp $ */
+/* $OpenBSD: ssl_local.h,v 1.33 2025/05/10 06:04:36 tb Exp $ */
 /* Copyright (C) 1995-1998 Eric Young (eay@cryptsoft.com)
  * All rights reserved.
  *
@@ -155,7 +155,6 @@
 
 #include <openssl/bio.h>
 #include <openssl/buffer.h>
-#include <openssl/dsa.h>
 #include <openssl/err.h>
 #include <openssl/rsa.h>
 #include <openssl/ssl.h>
@@ -167,8 +166,10 @@
 
 __BEGIN_HIDDEN_DECLS
 
+#ifndef CTASSERT
 #define CTASSERT(x)	extern char  _ctassert[(x) ? 1 : -1 ]   \
 			    __attribute__((__unused__))
+#endif
 
 #ifndef LIBRESSL_HAS_DTLS1_2
 #define LIBRESSL_HAS_DTLS1_2
@@ -201,16 +202,13 @@ __BEGIN_HIDDEN_DECLS
 
 /* Bits for algorithm_auth (server authentication) */
 #define SSL_aRSA		0x00000001L /* RSA auth */
-#define SSL_aDSS		0x00000002L /* DSS auth */
 #define SSL_aNULL		0x00000004L /* no auth (i.e. use ADH or AECDH) */
-#define SSL_aECDSA              0x00000040L /* ECDSA auth*/
+#define SSL_aECDSA		0x00000040L /* ECDSA auth*/
 #define SSL_aTLS1_3		0x00000400L /* TLSv1.3 authentication */
 
 /* Bits for algorithm_enc (symmetric encryption) */
-#define SSL_DES			0x00000001L
 #define SSL_3DES		0x00000002L
 #define SSL_RC4			0x00000004L
-#define SSL_IDEA		0x00000008L
 #define SSL_eNULL		0x00000010L
 #define SSL_AES128		0x00000020L
 #define SSL_AES256		0x00000040L
@@ -244,23 +242,11 @@ __BEGIN_HIDDEN_DECLS
 /* Bits for algorithm2 (handshake digests and other extra flags) */
 
 #define SSL_HANDSHAKE_MAC_MASK		0xff0
-#define SSL_HANDSHAKE_MAC_MD5		0x010
-#define SSL_HANDSHAKE_MAC_SHA		0x020
 #define SSL_HANDSHAKE_MAC_SHA256	0x080
 #define SSL_HANDSHAKE_MAC_SHA384	0x100
-#define SSL_HANDSHAKE_MAC_DEFAULT (SSL_HANDSHAKE_MAC_MD5 | SSL_HANDSHAKE_MAC_SHA)
 
 #define SSL3_CK_ID		0x03000000
 #define SSL3_CK_VALUE_MASK	0x0000ffff
-
-#define TLS1_PRF_DGST_MASK	(0xff << TLS1_PRF_DGST_SHIFT)
-
-#define TLS1_PRF_DGST_SHIFT 10
-#define TLS1_PRF_MD5 (SSL_HANDSHAKE_MAC_MD5 << TLS1_PRF_DGST_SHIFT)
-#define TLS1_PRF_SHA1 (SSL_HANDSHAKE_MAC_SHA << TLS1_PRF_DGST_SHIFT)
-#define TLS1_PRF_SHA256 (SSL_HANDSHAKE_MAC_SHA256 << TLS1_PRF_DGST_SHIFT)
-#define TLS1_PRF_SHA384 (SSL_HANDSHAKE_MAC_SHA384 << TLS1_PRF_DGST_SHIFT)
-#define TLS1_PRF (TLS1_PRF_MD5 | TLS1_PRF_SHA1)
 
 /*
  * Cipher strength information.
@@ -280,10 +266,6 @@ __BEGIN_HIDDEN_DECLS
 /* See if we use signature algorithms extension. */
 #define SSL_USE_SIGALGS(s) \
 	(s->method->enc_flags & SSL_ENC_FLAG_SIGALGS)
-
-/* See if we use SHA256 default PRF. */
-#define SSL_USE_SHA256_PRF(s) \
-	(s->method->enc_flags & SSL_ENC_FLAG_SHA256_PRF)
 
 /* Allow TLS 1.2 ciphersuites: applies to DTLS 1.2 as well as TLS 1.2. */
 #define SSL_USE_TLS1_2_CIPHERS(s) \
@@ -307,12 +289,8 @@ __BEGIN_HIDDEN_DECLS
  * SSL_aDSS <- DSA_SIGN
  */
 
-/* From ECC-TLS draft, used in encoding the curve type in
- * ECParameters
- */
-#define EXPLICIT_PRIME_CURVE_TYPE  1
-#define EXPLICIT_CHAR2_CURVE_TYPE  2
-#define NAMED_CURVE_TYPE           3
+/* From RFC 4492, section 5.4. Only named curves are supported. */
+#define NAMED_CURVE_TYPE	3
 
 typedef struct ssl_cert_pkey_st {
 	X509 *x509;
@@ -353,9 +331,9 @@ struct ssl_comp_st {
 };
 
 struct ssl_cipher_st {
-	int valid;
+	uint16_t value;			/* Cipher suite value. */
+
 	const char *name;		/* text name */
-	unsigned long id;		/* id, 4 bytes, first is version */
 
 	unsigned long algorithm_mkey;	/* key exchange algorithm */
 	unsigned long algorithm_auth;	/* server authentication */
@@ -393,8 +371,6 @@ struct ssl_method_st {
 	    int peek);
 	int (*ssl_write_bytes)(SSL *s, int type, const void *buf_, int len);
 
-	const SSL_CIPHER *(*get_cipher)(unsigned int ncipher);
-
 	unsigned int enc_flags;		/* SSL_ENC_FLAG_* */
 };
 
@@ -416,7 +392,7 @@ struct ssl_method_st {
  *	PSK_identity_hint [ 7 ] EXPLICIT OCTET STRING, -- optional PSK identity hint
  *	PSK_identity [ 8 ] EXPLICIT OCTET STRING,  -- optional PSK identity
  *	Ticket_lifetime_hint [9] EXPLICIT INTEGER, -- server's lifetime hint for session ticket
- *	Ticket [10]             EXPLICIT OCTET STRING, -- session ticket (clients only)
+ *	Ticket [10]		EXPLICIT OCTET STRING, -- session ticket (clients only)
  *	Compression_meth [11]   EXPLICIT OCTET STRING, -- optional compression method
  *	SRP_username [ 12 ] EXPLICIT OCTET STRING -- optional SRP username
  * }
@@ -452,12 +428,7 @@ struct ssl_session_st {
 	time_t time;
 	int references;
 
-	const SSL_CIPHER *cipher;
-	unsigned long cipher_id;	/* when ASN.1 loaded, this
-					 * needs to be used to load
-					 * the 'cipher' structure */
-
-	STACK_OF(SSL_CIPHER) *ciphers; /* shared ciphers? */
+	uint16_t cipher_value;
 
 	char *tlsext_hostname;
 
@@ -581,6 +552,9 @@ typedef struct ssl_handshake_st {
 
 	/* Cipher being negotiated in this handshake. */
 	const SSL_CIPHER *cipher;
+
+	/* Ciphers sent by the client. */
+	STACK_OF(SSL_CIPHER) *client_ciphers;
 
 	/* Extensions seen in this handshake. */
 	uint32_t extensions_seen;
@@ -1076,7 +1050,7 @@ struct ssl_st {
 
 	int renegotiate;/* 1 if we are renegotiating.
 			 * 2 if we are a server and are inside a handshake
-	                 * (i.e. not just sending a HelloRequest) */
+			 * (i.e. not just sending a HelloRequest) */
 
 	int rstate;	/* where we are when reading */
 
@@ -1100,7 +1074,7 @@ typedef struct ssl3_record_internal_st {
 
 typedef struct ssl3_buffer_internal_st {
 	unsigned char *buf;	/* at least SSL3_RT_MAX_PACKET_SIZE bytes,
-	                         * see ssl3_setup_buffers() */
+				 * see ssl3_setup_buffers() */
 	size_t len;		/* buffer size */
 	int offset;		/* where to 'copy from' */
 	int left;		/* how many bytes left */
@@ -1195,9 +1169,6 @@ typedef struct ssl3_state_st {
 /* Uses signature algorithms extension. */
 #define SSL_ENC_FLAG_SIGALGS            (1 << 1)
 
-/* Uses SHA256 default PRF. */
-#define SSL_ENC_FLAG_SHA256_PRF         (1 << 2)
-
 /* Allow TLS 1.2 ciphersuites: applies to DTLS 1.2 as well as TLS 1.2. */
 #define SSL_ENC_FLAG_TLS1_2_CIPHERS     (1 << 4)
 
@@ -1207,7 +1178,6 @@ typedef struct ssl3_state_st {
 #define TLSV1_ENC_FLAGS		0
 #define TLSV1_1_ENC_FLAGS	0
 #define TLSV1_2_ENC_FLAGS	(SSL_ENC_FLAG_SIGALGS		| \
-				 SSL_ENC_FLAG_SHA256_PRF	| \
 				 SSL_ENC_FLAG_TLS1_2_CIPHERS)
 #define TLSV1_3_ENC_FLAGS	(SSL_ENC_FLAG_SIGALGS		| \
 				 SSL_ENC_FLAG_TLS1_3_CIPHERS)
@@ -1284,9 +1254,9 @@ int ssl_merge_cipherlists(STACK_OF(SSL_CIPHER) *cipherlist,
     STACK_OF(SSL_CIPHER) *cipherlist_tls13,
     STACK_OF(SSL_CIPHER) **out_cipherlist);
 void ssl_update_cache(SSL *s, int mode);
-int ssl_cipher_get_evp(const SSL_SESSION *s, const EVP_CIPHER **enc,
+int ssl_cipher_get_evp(SSL *s, const EVP_CIPHER **enc,
     const EVP_MD **md, int *mac_pkey_type, int *mac_secret_size);
-int ssl_cipher_get_evp_aead(const SSL_SESSION *s, const EVP_AEAD **aead);
+int ssl_cipher_get_evp_aead(SSL *s, const EVP_AEAD **aead);
 int ssl_get_handshake_evp_md(SSL *s, const EVP_MD **md);
 
 int ssl_verify_cert_chain(SSL *s, STACK_OF(X509) *sk);
@@ -1310,10 +1280,8 @@ int ssl3_send_alert(SSL *s, int level, int desc);
 int ssl3_get_req_cert_types(SSL *s, CBB *cbb);
 int ssl3_get_message(SSL *s, int st1, int stn, int mt, long max);
 int ssl3_num_ciphers(void);
-const SSL_CIPHER *ssl3_get_cipher(unsigned int u);
-const SSL_CIPHER *ssl3_get_cipher_by_id(unsigned long id);
+const SSL_CIPHER *ssl3_get_cipher_by_index(int idx);
 const SSL_CIPHER *ssl3_get_cipher_by_value(uint16_t value);
-uint16_t ssl3_cipher_get_value(const SSL_CIPHER *c);
 int ssl3_renegotiate(SSL *ssl);
 
 int ssl3_renegotiate_check(SSL *ssl);
@@ -1471,9 +1439,10 @@ int ssl3_cbc_digest_record(const EVP_MD_CTX *ctx, unsigned char *md_out,
     unsigned int mac_secret_length);
 int SSL_state_func_code(int _state);
 
-#define SSLerror(s, r) SSL_error_internal(s, r, __FILE__, __LINE__)
-#define SSLerrorx(r) ERR_PUT_error(ERR_LIB_SSL,(0xfff),(r),__FILE__,__LINE__)
-void SSL_error_internal(const SSL *s, int r, char *f, int l);
+void SSL_error_internal(const SSL *s, int r, const char *f, int l);
+#define SSLerror(s, r)	SSL_error_internal(s, r, OPENSSL_FILE, OPENSSL_LINE)
+#define SSLerrorx(r)	ERR_PUT_error(ERR_LIB_SSL,(0xfff),(r),OPENSSL_FILE,OPENSSL_LINE)
+#define SYSerror(r)	ERR_PUT_error(ERR_LIB_SYS,(0xfff),(r),OPENSSL_FILE,OPENSSL_LINE)
 
 #ifndef OPENSSL_NO_SRTP
 

@@ -1,4 +1,4 @@
-/* $OpenBSD: a_bitstr.c,v 1.42 2023/12/25 22:02:59 tb Exp $ */
+/* $OpenBSD: a_bitstr.c,v 1.44 2025/05/10 05:54:38 tb Exp $ */
 /* Copyright (C) 1995-1998 Eric Young (eay@cryptsoft.com)
  * All rights reserved.
  *
@@ -63,16 +63,17 @@
 #include <openssl/asn1.h>
 #include <openssl/asn1t.h>
 #include <openssl/conf.h>
-#include <openssl/err.h>
 #include <openssl/x509v3.h>
 
 #include "bytestring.h"
+#include "err_local.h"
 
 const ASN1_ITEM ASN1_BIT_STRING_it = {
 	.itype = ASN1_ITYPE_PRIMITIVE,
 	.utype = V_ASN1_BIT_STRING,
 	.sname = "ASN1_BIT_STRING",
 };
+LCRYPTO_ALIAS(ASN1_BIT_STRING_it);
 
 ASN1_BIT_STRING *
 ASN1_BIT_STRING_new(void)

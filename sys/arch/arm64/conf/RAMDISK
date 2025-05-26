@@ -1,4 +1,4 @@
-# $OpenBSD: RAMDISK,v 1.216 2024/03/25 17:24:03 patrick Exp $
+# $OpenBSD: RAMDISK,v 1.223 2025/04/21 21:11:04 mglocker Exp $
 
 machine		arm64
 maxusers	4
@@ -41,6 +41,7 @@ acpi0		at mainbus?
 acpiec*		at acpi?
 acpimcfg*	at acpi?
 acpiiort*	at acpi?
+acpisectwo*	at acpi?
 smmu*		at acpiiort?
 acpipci*	at acpi?
 pci*		at acpipci?
@@ -82,6 +83,7 @@ bwfm*		at sdmmc?	# Broadcom FullMAC
 smmu*		at fdt?
 xhci*		at fdt?
 ccp*		at fdt?		# AMD Cryptographic Co-processor
+ufshci*		at fdt?
 
 # NS16550 compatible serial ports
 com*		at fdt?
@@ -202,6 +204,12 @@ hiclock*	at fdt? early 1
 hidwusb*	at fdt?
 hireset*	at fdt? early 1
 
+# MediaTek SoCs
+mtintc*		at fdt?
+mtrng*		at fdt?
+mtxhci*		at fdt?
+usb*		at mtxhci?
+
 # Marvell SoCs
 mvclock*	at fdt? early 1
 mvgicp*		at fdt? early 1
@@ -260,6 +268,7 @@ qcipcc*		at fdt?
 qcmtx*		at fdt? early 1
 qcpas*		at fdt?
 qcpdc*		at fdt?
+qcscm*		at acpi?
 qcscm*		at fdt?
 qcsmem*		at fdt?
 qcsmptp*	at fdt?
@@ -317,6 +326,7 @@ athn*		at pci?			# Atheros AR9k (802.11a/g/n)
 bwfm*		at pci?			# Broadcom FullMAC
 iwx*		at pci?			# Intel WiFi Link 22xxx
 qwx*		at pci?			# Qualcomm 802.11ax
+#qwz*		at pci?			# Qualcomm 802.11be
 
 # PCI SCSI
 ahci*		at pci? flags 0x0000	# AHCI SATA controllers

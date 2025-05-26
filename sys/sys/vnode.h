@@ -1,4 +1,4 @@
-/*	$OpenBSD: vnode.h,v 1.170 2024/02/03 18:51:58 beck Exp $	*/
+/*	$OpenBSD: vnode.h,v 1.177 2025/04/15 05:51:51 jsg Exp $	*/
 /*	$NetBSD: vnode.h,v 1.38 1996/02/29 20:59:05 cgd Exp $	*/
 
 /*
@@ -233,7 +233,7 @@ extern int		vttoif_tab[];
  * Flags to various vnode functions.
  */
 #define	SKIPSYSTEM	0x0001		/* vflush: skip vnodes marked VSYSTEM */
-#define	FORCECLOSE	0x0002		/* vflush: force file closeure */
+#define	FORCECLOSE	0x0002		/* vflush: force file closure */
 #define	WRITECLOSE	0x0004		/* vflush: only close writeable files */
 #define	DOCLOSE		0x0008		/* vclean: close active files */
 #define	IGNORECLEAN	0x0010		/* vflush: ignore clean vnodes */
@@ -243,7 +243,6 @@ extern int		vttoif_tab[];
 #define REVOKEALL	0x0001		/* vop_revoke: revoke all aliases */
 
 
-#define	VATTR_NULL(vap)	vattr_null(vap)
 #define	NULLVP	((struct vnode *)NULL)
 #define	VN_KNOTE(vp, b)					\
 	knote_locked(&vp->v_klist, (b))
@@ -565,7 +564,6 @@ int VOP_BWRITE(struct buf *);
 
 /* Public vnode manipulation functions. */
 struct file;
-struct filedesc;
 struct mount;
 struct nameidata;
 struct proc;
@@ -619,7 +617,6 @@ int	vop_generic_badop(void *);
 int	vop_generic_bmap(void *);
 int	vop_generic_bwrite(void *);
 int	vop_generic_revoke(void *);
-int	vop_generic_kqfilter(void *);
 int	vop_generic_lookup(void *);
 
 /* vfs_vnops.c */
@@ -642,7 +639,6 @@ void	vn_initialize_syncerd(void);
 void	vn_syncer_add_to_worklist(struct vnode *, int);
 
 /* misc */
-int	vn_isdisk(struct vnode *, int *);
 int 	getvnode(struct proc *, int, struct file **);
 
 /* uvm */

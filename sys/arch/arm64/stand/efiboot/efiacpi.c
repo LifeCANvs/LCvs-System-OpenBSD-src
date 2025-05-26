@@ -1,4 +1,4 @@
-/*	$OpenBSD: efiacpi.c,v 1.16 2023/10/09 22:05:27 patrick Exp $	*/
+/*	$OpenBSD: efiacpi.c,v 1.19 2025/02/10 20:40:26 kettenis Exp $	*/
 
 /*
  * Copyright (c) 2018 Mark Kettenis <kettenis@openbsd.org>
@@ -341,6 +341,33 @@ struct acpi_spcr {
 	uint32_t	reserved3;
 } __packed;
 
+struct acpi_dbg2 {
+	struct acpi_table_header	hdr;
+#define DBG2_SIG	"DBG2"
+	uint32_t	info_offset;
+	uint32_t	info_count;
+} __packed;
+
+struct acpi_dbg2_info {
+	uint8_t		revision;
+	uint16_t	length;
+	uint8_t		num_address;
+	uint16_t	name_length;
+	uint16_t	name_offset;
+	uint16_t	oem_data_length;
+	uint16_t	oem_data_offset;
+	uint16_t	port_type;
+#define DBG2_SERIAL	0x8000
+	uint16_t	port_subtype;
+#define DBG2_16550	0x0000
+#define DBG2_16450	0x0001
+#define DBG2_ARM_PL011	0x0003
+#define DBG2_ARM_SBSA	0x000e
+	uint16_t	reserved;
+	uint16_t	base_address_offset;
+	uint16_t	address_size_offset;
+} __packed;
+
 /* We'll never see ACPI 1.0 tables on ARM. */
 static EFI_GUID acpi_guid = ACPI_20_TABLE_GUID;
 
@@ -390,7 +417,7 @@ efi_acpi_gtdt(struct acpi_table_header *hdr)
 	interrupts[8] = htobe32(map[gtdt->virt_flags & mask]);
 	interrupts[9] = htobe32(1);
 	interrupts[10] = htobe32(gtdt->nonsec_el2_interrupt - 16);
-	interrupts[11] = htobe32(map[gtdt->virt_flags & mask]);
+	interrupts[11] = htobe32(map[gtdt->nonsec_el2_flags & mask]);
 
 	node = fdt_find_node("/timer");
 	fdt_node_set_property(node, "interrupts",
@@ -402,7 +429,8 @@ static int gic_version;
 static uint64_t gicc_base;
 static uint64_t gicd_base;
 static uint64_t gicr_base;
-static uint32_t gicr_size;
+static uint64_t gicr_size;
+static uint64_t gicr_stride;
 
 void
 efi_acpi_madt_gicc(struct acpi_madt_gicc *gicc)
@@ -436,6 +464,30 @@ efi_acpi_madt_gicc(struct acpi_madt_gicc *gicc)
 
 	/* Stash GIC information. */
 	gicc_base = gicc->base_address;
+
+	/*
+	 * The redistributor base address may be specified per-CPU.
+	 * In that case we will need to reconstruct the base, size and
+	 * stride to use for the redistributor registers.
+	 */
+	if (gicc->gicr_base_address > 0) {
+		if (gicr_base > 0) {
+			uint32_t size;
+
+			if (gicc->gicr_base_address < gicr_base)
+				size = gicr_base - gicc->gicr_base_address;
+			else
+				size = gicc->gicr_base_address - gicr_base;
+			if (gicr_stride == 0 || size < gicr_stride)
+				gicr_stride = size;
+			if (gicr_size == 0 || size > gicr_size)
+				gicr_size = size;
+			gicr_base = MIN(gicr_base, gicc->gicr_base_address);
+		} else {
+			gicr_base = gicc->gicr_base_address;
+			gicr_size = 0x20000;
+		}
+	}
 }
 
 void
@@ -579,7 +631,7 @@ efi_acpi_madt(struct acpi_table_header *hdr)
 		reg[0] = htobe64(gicd_base);
 		reg[1] = htobe64(0x10000);
 		reg[2] = htobe64(gicr_base);
-		reg[3] = htobe64(gicr_size);
+		reg[3] = htobe64(gicr_size + gicr_stride);
 		break;
 	default:
 		return;
@@ -589,29 +641,28 @@ efi_acpi_madt(struct acpi_table_header *hdr)
 	node = fdt_find_node("/interrupt-controller");
 	fdt_node_set_string_property(node, "compatible", compat);
 	fdt_node_set_property(node, "reg", reg, sizeof(reg));
+	if (gicr_stride > 0) {
+		uint64_t stride = htobe64(gicr_stride);
+		fdt_node_add_property(node, "redistributor-stride",
+		    &stride, sizeof(stride));
+	}
 	fdt_node_set_string_property(node, "status", "okay");
 }
 
 static int serial = 0;
 
 void
-efi_acpi_spcr(struct acpi_table_header *hdr)
+efi_acpi_serial(char *compat, struct acpi_gas *base_address,
+    uint32_t address_size)
 {
-	struct acpi_spcr *spcr = (struct acpi_spcr *)hdr;
 	uint64_t reg[2], reg_shift, reg_io_width;
 	void *node;
 
-	/* Minimal revision required by Server Base Boot Requirements is 2. */
-	if (spcr->hdr_revision < 2)
-		return;
-
 	/* No idea how to support anything else on ARM. */
-	if (spcr->base_address.address_space_id != GAS_SYSTEM_MEMORY)
+	if (base_address->address_space_id != GAS_SYSTEM_MEMORY)
 		return;
 
-	reg[0] = htobe64(spcr->base_address.address);
-
-	switch (spcr->base_address.access_size) {
+	switch (base_address->access_size) {
 	case GAS_ACCESS_BYTE:
 		reg_io_width = 1;
 		break;
@@ -630,37 +681,83 @@ efi_acpi_spcr(struct acpi_table_header *hdr)
 	reg_io_width = htobe32(reg_io_width);
 
 	reg_shift = 0;
-	if (spcr->base_address.register_bit_width > 8)
+	if (base_address->register_bit_width > 8)
 		reg_shift = 1;
-	if (spcr->base_address.register_bit_width > 16)
+	if (base_address->register_bit_width > 16)
 		reg_shift = 2;
-	if (spcr->base_address.register_bit_width > 32)
+	if (base_address->register_bit_width > 32)
 		reg_shift = 3;
 	reg_shift = htobe32(reg_shift);
 
 	/* Update "serial" node. */
 	node = fdt_find_node("/serial");
-	switch (spcr->interface_type) {
-	case SPCR_16550:
-	case SPCR_16450:
-		fdt_node_set_string_property(node, "compatible",
-		    "snps,dw-apb-uart");
+	fdt_node_set_string_property(node, "compatible", compat);
+	if (strcmp(compat, "snps,dw-apb-uart") == 0) {
 		fdt_node_add_property(node, "reg-shift",
 		    &reg_shift, sizeof(reg_shift));
 		fdt_node_add_property(node, "reg-io-width",
 		    &reg_io_width, sizeof(reg_io_width));
-		reg[1] = htobe64(0x100);
+	}
+	reg[0] = htobe64(base_address->address);
+	reg[1] = htobe64(address_size);
+	fdt_node_set_property(node, "reg", reg, sizeof(reg));
+}
+
+void
+efi_acpi_spcr(struct acpi_table_header *hdr)
+{
+	struct acpi_spcr *spcr = (struct acpi_spcr *)hdr;
+
+	/* Minimal revision required by Server Base Boot Requirements is 2. */
+	if (spcr->hdr_revision < 2)
+		return;
+
+	switch (spcr->interface_type) {
+	case SPCR_16550:
+	case SPCR_16450:
+		efi_acpi_serial("snps,dw-apb-uart", &spcr->base_address, 0x100);
 		break;
 	case SPCR_ARM_PL011:
 	case SPCR_ARM_SBSA:
-		fdt_node_set_string_property(node, "compatible", "arm,pl011");
-		reg[1] = htobe64(0x1000);
+		efi_acpi_serial("arm,pl011", &spcr->base_address, 0x1000);
 		break;
 	default:
 		return;
 	}
-	fdt_node_set_property(node, "reg", reg, sizeof(reg));
 	serial = 1;
+}
+
+void
+efi_acpi_dbg2(struct acpi_table_header *hdr)
+{
+	struct acpi_dbg2 *dbg2 = (struct acpi_dbg2 *)hdr;
+	struct acpi_dbg2_info *info;
+	struct acpi_gas *base_address;
+	uint32_t address_size;
+
+	info = (struct acpi_dbg2_info *)((char *)hdr + dbg2->info_offset);
+
+	/* Only looking for serial ports. */
+	if (info->port_type != DBG2_SERIAL)
+		return;
+
+	base_address = (struct acpi_gas *)
+	    ((char *)info + info->base_address_offset);
+	address_size = *(uint32_t *)
+	    ((char *)info + info->address_size_offset);
+
+	switch (info->port_subtype) {
+	case DBG2_16550:
+	case DBG2_16450:
+		efi_acpi_serial("snps,dw-apb-uart", base_address, address_size);
+		break;
+	case DBG2_ARM_PL011:
+	case DBG2_ARM_SBSA:
+		efi_acpi_serial("arm,pl011", base_address, address_size);
+		break;
+	default:
+		return;
+	}
 }
 
 void *
@@ -714,6 +811,12 @@ efi_acpi(void)
 			efi_acpi_spcr(hdr);
 	}
 	printf("\n");
+
+	for (i = 0; i < ntables; i++) {
+		hdr = (struct acpi_table_header *)xsdt->table_offsets[i];
+		if (memcmp(hdr->signature, DBG2_SIG, 4) == 0 && !serial)
+			efi_acpi_dbg2(hdr);
+	}
 
 	reg[0] = htobe64((uint64_t)rsdp);
 	reg[1] = htobe64(rsdp->rsdp_length);

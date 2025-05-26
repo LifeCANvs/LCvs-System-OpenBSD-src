@@ -1,4 +1,4 @@
-/*	$OpenBSD: radiusd_module.c,v 1.16 2024/02/09 07:41:32 yasuoka Exp $	*/
+/*	$OpenBSD: radiusd_module.c,v 1.26 2024/11/21 13:43:10 claudio Exp $	*/
 
 /*
  * Copyright (c) 2015 YASUOKA Masahiko <yasuoka@yasuoka.net>
@@ -46,10 +46,15 @@ static void	(*module_userpass) (void *, u_int, const char *, const char *)
 		    = NULL;
 static void	(*module_access_request) (void *, u_int, const u_char *,
 		    size_t) = NULL;
+static void	(*module_next_response) (void *, u_int, const u_char *,
+		    size_t) = NULL;
 static void	(*module_request_decoration) (void *, u_int, const u_char *,
 		    size_t) = NULL;
 static void	(*module_response_decoration) (void *, u_int, const u_char *,
 		    size_t, const u_char *, size_t) = NULL;
+static void	(*module_accounting_request) (void *, u_int, const u_char *,
+		    size_t) = NULL;
+static void	(*module_dispatch_control) (void *, struct imsg *) = NULL;
 
 struct module_base {
 	void			*ctx;
@@ -90,16 +95,22 @@ module_create(int sock, void *ctx, struct module_handlers *handler)
 	if ((base = calloc(1, sizeof(struct module_base))) == NULL)
 		return (NULL);
 
-	imsg_init(&base->ibuf, sock);
+	if (imsgbuf_init(&base->ibuf, sock) == -1) {
+		free(base);
+		return (NULL);
+	}
 	base->ctx = ctx;
 
 	module_userpass = handler->userpass;
 	module_access_request = handler->access_request;
+	module_next_response = handler->next_response;
 	module_config_set = handler->config_set;
 	module_request_decoration = handler->request_decoration;
 	module_response_decoration = handler->response_decoration;
+	module_accounting_request = handler->accounting_request;
 	module_start_module = handler->start;
 	module_stop_module = handler->stop;
+	module_dispatch_control = handler->dispatch_control;
 
 	return (base);
 }
@@ -126,7 +137,7 @@ module_run(struct module_base *base)
 
 	ret = module_recv_imsg(base);
 	if (ret == 0)
-		imsg_flush(&base->ibuf);
+		imsgbuf_flush(&base->ibuf);
 
 	return (ret);
 }
@@ -137,7 +148,7 @@ module_destroy(struct module_base *base)
 	if (base != NULL) {
 		free(base->radpkt);
 		free(base->radpkt2);
-		imsg_clear(&base->ibuf);
+		imsgbuf_clear(&base->ibuf);
 	}
 	free(base);
 }
@@ -152,13 +163,19 @@ module_load(struct module_base *base)
 		load.cap |= RADIUSD_MODULE_CAP_USERPASS;
 	if (module_access_request != NULL)
 		load.cap |= RADIUSD_MODULE_CAP_ACCSREQ;
+	if (module_next_response != NULL)
+		load.cap |= RADIUSD_MODULE_CAP_NEXTRES;
 	if (module_request_decoration != NULL)
 		load.cap |= RADIUSD_MODULE_CAP_REQDECO;
 	if (module_response_decoration != NULL)
 		load.cap |= RADIUSD_MODULE_CAP_RESDECO;
+	if (module_accounting_request != NULL)
+		load.cap |= RADIUSD_MODULE_CAP_ACCTREQ;
+	if (module_dispatch_control != NULL)
+		load.cap |= RADIUSD_MODULE_CAP_CONTROL;
 	imsg_compose(&base->ibuf, IMSG_RADIUSD_MODULE_LOAD, 0, 0, -1, &load,
 	    sizeof(load));
-	imsg_flush(&base->ibuf);
+	imsgbuf_flush(&base->ibuf);
 }
 
 void
@@ -265,6 +282,14 @@ module_accsreq_answer(struct module_base *base, u_int q_id, const u_char *pkt,
 }
 
 int
+module_accsreq_next(struct module_base *base, u_int q_id, const u_char *pkt,
+    size_t pktlen)
+{
+	return (module_common_radpkt(base, IMSG_RADIUSD_MODULE_ACCSREQ_NEXT,
+	    q_id, pkt, pktlen));
+}
+
+int
 module_accsreq_aborted(struct module_base *base, u_int q_id)
 {
 	int	 ret;
@@ -334,9 +359,9 @@ module_recv_imsg(struct module_base *base)
 	ssize_t		 n;
 	struct imsg	 imsg;
 
-	if (((n = imsg_read(&base->ibuf)) == -1 && errno != EAGAIN) || n == 0) {
-		if (n != 0)
-			syslog(LOG_ERR, "%s: imsg_read(): %m", __func__);
+	if ((n = imsgbuf_read(&base->ibuf)) != 1) {
+		if (n == -1)
+			syslog(LOG_ERR, "%s: imsgbuf_read(): %m", __func__);
 		module_stop(base);
 		return (-1);
 	}
@@ -444,9 +469,11 @@ module_imsg_handler(struct module_base *base, struct imsg *imsg)
 		break;
 	    }
 	case IMSG_RADIUSD_MODULE_ACCSREQ:
+	case IMSG_RADIUSD_MODULE_NEXTRES:
 	case IMSG_RADIUSD_MODULE_REQDECO:
 	case IMSG_RADIUSD_MODULE_RESDECO0_REQ:
 	case IMSG_RADIUSD_MODULE_RESDECO:
+	case IMSG_RADIUSD_MODULE_ACCTREQ:
 	    {
 		struct radiusd_module_radpkt_arg	*accessreq;
 		int					 chunklen;
@@ -459,6 +486,20 @@ module_imsg_handler(struct module_base *base, struct imsg *imsg)
 				break;
 			}
 			typestr = "ACCSREQ";
+		} else if (imsg->hdr.type == IMSG_RADIUSD_MODULE_NEXTRES) {
+			if (module_next_response == NULL) {
+				syslog(LOG_ERR, "Received NEXTRES message, but "
+				    "module doesn't support");
+				break;
+			}
+			typestr = "NEXTRES";
+		} else if (imsg->hdr.type == IMSG_RADIUSD_MODULE_ACCTREQ) {
+			if (module_accounting_request == NULL) {
+				syslog(LOG_ERR, "Received ACCTREQ message, but "
+				    "module doesn't support");
+				break;
+			}
+			typestr = "ACCTREQ";
 		} else if (imsg->hdr.type == IMSG_RADIUSD_MODULE_REQDECO) {
 			if (module_request_decoration == NULL) {
 				syslog(LOG_ERR, "Received REQDECO message, but "
@@ -520,6 +561,9 @@ module_imsg_handler(struct module_base *base, struct imsg *imsg)
 		if (imsg->hdr.type == IMSG_RADIUSD_MODULE_ACCSREQ)
 			module_access_request(base->ctx, accessreq->q_id,
 			    base->radpkt, base->radpktoff);
+		else if (imsg->hdr.type == IMSG_RADIUSD_MODULE_NEXTRES)
+			module_next_response(base->ctx, accessreq->q_id,
+			    base->radpkt, base->radpktoff);
 		else if (imsg->hdr.type == IMSG_RADIUSD_MODULE_REQDECO)
 			module_request_decoration(base->ctx, accessreq->q_id,
 			    base->radpkt, base->radpktoff);
@@ -539,16 +583,32 @@ module_imsg_handler(struct module_base *base, struct imsg *imsg)
 			}
 			memcpy(base->radpkt2, base->radpkt, base->radpktoff);
 			base->radpkt2len = base->radpktoff;
-		} else {
+		} else if (imsg->hdr.type == IMSG_RADIUSD_MODULE_RESDECO) {
 			module_response_decoration(base->ctx, accessreq->q_id,
 			    base->radpkt2, base->radpkt2len, base->radpkt,
 			    base->radpktoff);
 			base->radpkt2len = 0;
-		}
+		} else
+			module_accounting_request(base->ctx, accessreq->q_id,
+			    base->radpkt, base->radpktoff);
 		base->radpktoff = 0;
-accsreq_out:
+ accsreq_out:
 		break;
 	    }
+	case IMSG_RADIUSD_MODULE_CTRL_UNBIND:
+		goto forward_msg;
+		break;
+	default:
+		if (imsg->hdr.type >= IMSG_RADIUSD_MODULE_MIN) {
+ forward_msg:
+			if (module_dispatch_control == NULL) {
+				const char msg[] =
+				    "the module doesn't handle any controls";
+				imsg_compose(&base->ibuf, IMSG_NG,
+				    imsg->hdr.peerid, 0, -1, msg, sizeof(msg));
+			} else
+				module_dispatch_control(base->ctx, imsg);
+		}
 	}
 
 	return (0);
@@ -574,23 +634,19 @@ module_on_event(int fd, short evmask, void *ctx)
 	int			 ret;
 
 	base->ev_onhandler = true;
-	if (evmask & EV_WRITE)
+	if (evmask & EV_WRITE) {
 		base->writeready = true;
+		if (imsgbuf_write(&base->ibuf) == -1) {
+			syslog(LOG_ERR, "%s: imsgbuf_write: %m", __func__);
+			module_stop(base);
+			return;
+		}
+		base->writeready = false;
+	}
 	if (evmask & EV_READ) {
 		ret = module_recv_imsg(base);
 		if (ret < 0)
 			return;
-	}
-	while (base->writeready && base->ibuf.w.queued) {
-		ret = msgbuf_write(&base->ibuf.w);
-		if (ret > 0)
-			continue;
-		base->writeready = false;
-		if (ret == 0 && errno == EAGAIN)
-			break;
-		syslog(LOG_ERR, "%s: msgbuf_write: %m", __func__);
-		module_stop(base);
-		return;
 	}
 	base->ev_onhandler = false;
 	module_reset_event(base);
@@ -612,7 +668,7 @@ module_reset_event(struct module_base *base)
 	event_del(&base->ev);
 
 	evmask |= EV_READ;
-	if (base->ibuf.w.queued) {
+	if (imsgbuf_queuelen(&base->ibuf) > 0) {
 		if (!base->writeready)
 			evmask |= EV_WRITE;
 		else
@@ -622,4 +678,30 @@ module_reset_event(struct module_base *base)
 	if (event_add(&base->ev, tvp) == -1)
 		syslog(LOG_ERR, "event_add() failed in %s()", __func__);
 #endif
+}
+
+int
+module_imsg_compose(struct module_base *base, uint32_t type, uint32_t id,
+    pid_t pid, int fd, const void *data, size_t datalen)
+{
+	int	 ret;
+
+	if ((ret = imsg_compose(&base->ibuf, type, id, pid, fd, data, datalen))
+	    != -1)
+		module_reset_event(base);
+
+	return (ret);
+}
+
+int
+module_imsg_composev(struct module_base *base, uint32_t type, uint32_t id,
+    pid_t pid, int fd, const struct iovec *iov, int iovcnt)
+{
+	int	 ret;
+
+	if ((ret = imsg_composev(&base->ibuf, type, id, pid, fd, iov, iovcnt))
+	    != -1)
+		module_reset_event(base);
+
+	return (ret);
 }

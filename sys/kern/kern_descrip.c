@@ -1,4 +1,4 @@
-/*	$OpenBSD: kern_descrip.c,v 1.207 2022/12/05 23:18:37 deraadt Exp $	*/
+/*	$OpenBSD: kern_descrip.c,v 1.211 2025/05/10 09:44:39 visa Exp $	*/
 /*	$NetBSD: kern_descrip.c,v 1.42 1996/03/30 22:24:38 christos Exp $	*/
 
 /*
@@ -39,6 +39,7 @@
 
 #include <sys/param.h>
 #include <sys/systm.h>
+#include <sys/atomic.h>
 #include <sys/filedesc.h>
 #include <sys/vnode.h>
 #include <sys/proc.h>
@@ -94,7 +95,7 @@ filedesc_init(void)
 }
 
 static __inline int
-find_next_zero (u_int *bitmap, int want, u_int bits)
+find_next_zero(u_int *bitmap, int want, u_int bits)
 {
 	int i, off, maxoff;
 	u_int sub;
@@ -362,7 +363,7 @@ restart:
 		return (0);
 	}
 	if ((u_int)new >= lim_cur(RLIMIT_NOFILE) ||
-	    (u_int)new >= maxfiles) {
+	    (u_int)new >= atomic_load_int(&maxfiles)) {
 		FRELE(fp, p);
 		return (EBADF);
 	}
@@ -424,7 +425,7 @@ restart:
 	case F_DUPFD_CLOEXEC:
 		newmin = (long)SCARG(uap, arg);
 		if ((u_int)newmin >= lim_cur(RLIMIT_NOFILE) ||
-		    (u_int)newmin >= maxfiles) {
+		    (u_int)newmin >= atomic_load_int(&maxfiles)) {
 			error = EINVAL;
 			break;
 		}
@@ -484,17 +485,8 @@ restart:
 			tmp &= ~FCNTLFLAGS;
 			tmp |= FFLAGS((long)SCARG(uap, arg)) & FCNTLFLAGS;
 		} while (atomic_cas_uint(&fp->f_flag, prev, tmp) != prev);
-		tmp = fp->f_flag & FNONBLOCK;
-		error = (*fp->f_ops->fo_ioctl)(fp, FIONBIO, (caddr_t)&tmp, p);
-		if (error)
-			break;
 		tmp = fp->f_flag & FASYNC;
 		error = (*fp->f_ops->fo_ioctl)(fp, FIOASYNC, (caddr_t)&tmp, p);
-		if (!error)
-			break;
-		atomic_clearbits_int(&fp->f_flag, FNONBLOCK);
-		tmp = 0;
-		(void) (*fp->f_ops->fo_ioctl)(fp, FIONBIO, (caddr_t)&tmp, p);
 		break;
 
 	case F_GETOWN:
@@ -877,7 +869,7 @@ fdalloc(struct proc *p, int want, int *result)
 	 * expanding the ofile array.
 	 */
 restart:
-	lim = min((int)lim_cur(RLIMIT_NOFILE), maxfiles);
+	lim = min((int)lim_cur(RLIMIT_NOFILE), atomic_load_int(&maxfiles));
 	last = min(fdp->fd_nfiles, lim);
 	if ((i = want) < fdp->fd_freefile)
 		i = fdp->fd_freefile;
@@ -1037,7 +1029,7 @@ fnew(struct proc *p)
 	int nfiles;
 
 	nfiles = atomic_inc_int_nv(&numfiles);
-	if (nfiles > maxfiles) {
+	if (nfiles > atomic_load_int(&maxfiles)) {
 		atomic_dec_int(&numfiles);
 		tablefull("file");
 		return (NULL);
@@ -1210,6 +1202,7 @@ fdfree(struct proc *p)
 		vrele(fdp->fd_cdir);
 	if (fdp->fd_rdir)
 		vrele(fdp->fd_rdir);
+	KASSERT(atomic_load_int(&fdp->fd_nuserevents) == 0);
 	pool_put(&fdesc_pool, fdp);
 }
 

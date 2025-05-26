@@ -1,4 +1,4 @@
-/*	$OpenBSD: resolver.c,v 1.166 2024/05/21 05:00:48 jsg Exp $	*/
+/*	$OpenBSD: resolver.c,v 1.174 2025/04/27 16:21:26 florian Exp $	*/
 
 
 /*
@@ -158,8 +158,10 @@ void			 asr_resolve_done(struct asr_result *, void *);
 void			 new_resolver(enum uw_resolver_type,
 			     enum uw_resolver_state);
 struct uw_resolver	*create_resolver(enum uw_resolver_type);
+#ifdef UNIFIED_CACHE
 void			 setup_unified_caches(void);
 void			 set_unified_cache(struct uw_resolver *);
+#endif /* UNIFIED_CACHE */
 void			 free_resolver(struct uw_resolver *);
 void			 set_forwarders(struct uw_resolver *,
 			     struct uw_forwarder_head *, int);
@@ -222,10 +224,12 @@ struct event_base		*ev_base;
 RB_GENERATE(force_tree, force_tree_entry, entry, force_tree_cmp)
 
 int				 val_id = -1;
+#ifdef UNIFIED_CACHE
 struct slabhash			*unified_msg_cache;
 struct rrset_cache		*unified_rrset_cache;
 struct key_cache		*unified_key_cache;
 struct val_neg_cache		*unified_neg_cache;
+#endif /* UNIFIED_CACHE */
 
 int				 dns64_present;
 int				 available_afs = HAVE_IPV4 | HAVE_IPV6;
@@ -411,7 +415,9 @@ resolver(int debug, int verbose)
 	if ((iev_main = malloc(sizeof(struct imsgev))) == NULL)
 		fatal(NULL);
 
-	imsg_init(&iev_main->ibuf, 3);
+	if (imsgbuf_init(&iev_main->ibuf, 3) == -1)
+		fatal(NULL);
+	imsgbuf_allow_fdpass(&iev_main->ibuf);
 	iev_main->handler = resolver_dispatch_main;
 
 	/* Setup event handlers. */
@@ -431,7 +437,9 @@ resolver(int debug, int verbose)
 		fatalx("local libunbound/util/alloc.c diff lost");
 	alloc_clear(&cache_alloc_test);
 
+#ifdef UNIFIED_CACHE
 	setup_unified_caches();
+#endif /* UNIFIED_CACHE */
 
 	TAILQ_INIT(&autoconf_forwarder_list);
 	TAILQ_INIT(&trust_anchors);
@@ -447,9 +455,9 @@ __dead void
 resolver_shutdown(void)
 {
 	/* Close pipes. */
-	msgbuf_clear(&iev_frontend->ibuf.w);
+	imsgbuf_clear(&iev_frontend->ibuf);
 	close(iev_frontend->ibuf.fd);
-	msgbuf_clear(&iev_main->ibuf.w);
+	imsgbuf_clear(&iev_main->ibuf);
 	close(iev_main->ibuf.fd);
 
 	config_clear(resolver_conf);
@@ -489,16 +497,18 @@ resolver_dispatch_frontend(int fd, short event, void *bula)
 	ibuf = &iev->ibuf;
 
 	if (event & EV_READ) {
-		if ((n = imsg_read(ibuf)) == -1 && errno != EAGAIN)
-			fatal("imsg_read error");
+		if ((n = imsgbuf_read(ibuf)) == -1)
+			fatal("imsgbuf_read error");
 		if (n == 0)	/* Connection closed. */
 			shut = 1;
 	}
 	if (event & EV_WRITE) {
-		if ((n = msgbuf_write(&ibuf->w)) == -1 && errno != EAGAIN)
-			fatal("msgbuf_write");
-		if (n == 0)	/* Connection closed. */
-			shut = 1;
+		if (imsgbuf_write(ibuf) == -1) {
+			if (errno == EPIPE)	/* Connection closed. */
+				shut = 1;
+			else
+				fatal("imsgbuf_write");
+		}
 	}
 
 	for (;;) {
@@ -529,6 +539,9 @@ resolver_dispatch_frontend(int fd, short event, void *bula)
 				break;
 			}
 			memcpy(query_imsg, imsg.data, sizeof(*query_imsg));
+			if (query_imsg->qname[NI_MAXHOST - 1] != '\0')
+				fatalx("%s: IMSG_QUERY invalid", __func__);
+
 			setup_query(query_imsg);
 			break;
 		case IMSG_CTL_STATUS:
@@ -625,16 +638,18 @@ resolver_dispatch_main(int fd, short event, void *bula)
 	ibuf = &iev->ibuf;
 
 	if (event & EV_READ) {
-		if ((n = imsg_read(ibuf)) == -1 && errno != EAGAIN)
-			fatal("imsg_read error");
+		if ((n = imsgbuf_read(ibuf)) == -1)
+			fatal("imsgbuf_read error");
 		if (n == 0)	/* Connection closed. */
 			shut = 1;
 	}
 	if (event & EV_WRITE) {
-		if ((n = msgbuf_write(&ibuf->w)) == -1 && errno != EAGAIN)
-			fatal("msgbuf_write");
-		if (n == 0)	/* Connection closed. */
-			shut = 1;
+		if (imsgbuf_write(ibuf) == -1) {
+			if (errno == EPIPE)	/* Connection closed. */
+				shut = 1;
+			else
+				fatal("imsgbuf_write");
+		}
 	}
 
 	for (;;) {
@@ -661,7 +676,8 @@ resolver_dispatch_main(int fd, short event, void *bula)
 			if (iev_frontend == NULL)
 				fatal(NULL);
 
-			imsg_init(&iev_frontend->ibuf, fd);
+			if (imsgbuf_init(&iev_frontend->ibuf, fd) == -1)
+				fatal(NULL);
 			iev_frontend->handler = resolver_dispatch_frontend;
 			iev_frontend->events = EV_READ;
 
@@ -1156,7 +1172,9 @@ new_resolver(enum uw_resolver_type type, enum uw_resolver_state state)
 		check_resolver(resolvers[type]);
 		break;
 	case VALIDATING:
+#ifdef UNIFIED_CACHE
 		set_unified_cache(resolvers[type]);
+#endif /* UNIFIED_CACHE */
 		/* FALLTHROUGH */
 	case RESOLVING:
 		resolvers[type]->state = state;
@@ -1166,6 +1184,7 @@ new_resolver(enum uw_resolver_type type, enum uw_resolver_state state)
 	}
 }
 
+#ifdef UNIFIED_CACHE
 void
 set_unified_cache(struct uw_resolver *res)
 {
@@ -1198,6 +1217,7 @@ set_unified_cache(struct uw_resolver *res)
 		fatalx("failed to set unified caches, libunbound/validator/"
 		    "validator.c diff lost");
 }
+#endif /* UNIFIED_CACHE */
 
 static const struct {
 	const char *name;
@@ -1393,8 +1413,6 @@ create_resolver(enum uw_resolver_type type)
 void
 free_resolver(struct uw_resolver *res)
 {
-	struct val_env	*val_env;
-
 	if (res == NULL)
 		return;
 
@@ -1402,8 +1420,11 @@ free_resolver(struct uw_resolver *res)
 		res->stop = 1;
 	else {
 		evtimer_del(&res->check_ev);
+#ifdef UNIFIED_CACHE
 		if (res->ctx != NULL) {
 			if (res->ctx->env->msg_cache == unified_msg_cache) {
+				struct val_env	*val_env;
+
 				val_env = (struct val_env*)
 				    res->ctx->env->modinfo[val_id];
 				res->ctx->env->msg_cache = NULL;
@@ -1414,12 +1435,14 @@ free_resolver(struct uw_resolver *res)
 				res->ctx->env->neg_cache = NULL;
 			}
 		}
+#endif /* UNIFIED_CACHE */
 		ub_ctx_delete(res->ctx);
 		asr_resolver_free(res->asr_ctx);
 		free(res);
 	}
 }
 
+#ifdef UNIFIED_CACHE
 void
 setup_unified_caches(void)
 {
@@ -1470,6 +1493,7 @@ setup_unified_caches(void)
 	val_env->neg_cache = NULL;
 	ub_ctx_delete(ctx);
 }
+#endif /* UNIFIED_CACHE */
 
 void
 set_forwarders(struct uw_resolver *res, struct uw_forwarder_head
@@ -1836,6 +1860,7 @@ show_mem(pid_t pid)
 	struct ctl_mem_info	 cmi;
 
 	memset(&cmi, 0, sizeof(cmi));
+#ifdef UNIFIED_CACHE
 	cmi.msg_cache_used = slabhash_get_mem(unified_msg_cache);
 	cmi.msg_cache_max = slabhash_get_size(unified_msg_cache);
 	cmi.rrset_cache_used = slabhash_get_mem(&unified_rrset_cache->table);
@@ -1844,6 +1869,7 @@ show_mem(pid_t pid)
 	cmi.key_cache_max = slabhash_get_size(unified_key_cache->slab);
 	cmi.neg_cache_used = unified_neg_cache->use;
 	cmi.neg_cache_max = unified_neg_cache->max;
+#endif /* UNIFIED_CACHE */
 	resolver_imsg_compose_frontend(IMSG_CTL_MEM_INFO, pid, &cmi,
 	    sizeof(cmi));
 

@@ -1,4 +1,4 @@
-/* $OpenBSD: evp_pkey.c,v 1.28 2024/04/09 13:55:02 beck Exp $ */
+/* $OpenBSD: evp_pkey.c,v 1.34 2025/05/10 05:54:38 tb Exp $ */
 /* Written by Dr Stephen N Henson (steve@openssl.org) for the OpenSSL
  * project 1999.
  */
@@ -58,11 +58,12 @@
 
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 
-#include <openssl/err.h>
 #include <openssl/x509.h>
 
 #include "asn1_local.h"
+#include "err_local.h"
 #include "evp_local.h"
 
 /* Extract a private key from a PKCS8 structure */
@@ -84,7 +85,8 @@ EVP_PKCS82PKEY(const PKCS8_PRIV_KEY_INFO *p8)
 
 	if (!EVP_PKEY_set_type(pkey, OBJ_obj2nid(algoid))) {
 		EVPerror(EVP_R_UNSUPPORTED_PRIVATE_KEY_ALGORITHM);
-		i2t_ASN1_OBJECT(obj_tmp, 80, algoid);
+		if (i2t_ASN1_OBJECT(obj_tmp, sizeof(obj_tmp), algoid) == 0)
+			(void)strlcpy(obj_tmp, "unknown", sizeof(obj_tmp));
 		ERR_asprintf_error_data("TYPE=%s", obj_tmp);
 		goto error;
 	}
@@ -140,81 +142,3 @@ error:
 	return NULL;
 }
 LCRYPTO_ALIAS(EVP_PKEY2PKCS8);
-
-/* EVP_PKEY attribute functions */
-
-int
-EVP_PKEY_get_attr_count(const EVP_PKEY *key)
-{
-	return X509at_get_attr_count(key->attributes);
-}
-LCRYPTO_ALIAS(EVP_PKEY_get_attr_count);
-
-int
-EVP_PKEY_get_attr_by_NID(const EVP_PKEY *key, int nid, int lastpos)
-{
-	return X509at_get_attr_by_NID(key->attributes, nid, lastpos);
-}
-LCRYPTO_ALIAS(EVP_PKEY_get_attr_by_NID);
-
-int
-EVP_PKEY_get_attr_by_OBJ(const EVP_PKEY *key, const ASN1_OBJECT *obj,
-    int lastpos)
-{
-	return X509at_get_attr_by_OBJ(key->attributes, obj, lastpos);
-}
-LCRYPTO_ALIAS(EVP_PKEY_get_attr_by_OBJ);
-
-X509_ATTRIBUTE *
-EVP_PKEY_get_attr(const EVP_PKEY *key, int loc)
-{
-	return X509at_get_attr(key->attributes, loc);
-}
-LCRYPTO_ALIAS(EVP_PKEY_get_attr);
-
-X509_ATTRIBUTE *
-EVP_PKEY_delete_attr(EVP_PKEY *key, int loc)
-{
-	return X509at_delete_attr(key->attributes, loc);
-}
-LCRYPTO_ALIAS(EVP_PKEY_delete_attr);
-
-int
-EVP_PKEY_add1_attr(EVP_PKEY *key, X509_ATTRIBUTE *attr)
-{
-	if (X509at_add1_attr(&key->attributes, attr))
-		return 1;
-	return 0;
-}
-LCRYPTO_ALIAS(EVP_PKEY_add1_attr);
-
-int
-EVP_PKEY_add1_attr_by_OBJ(EVP_PKEY *key, const ASN1_OBJECT *obj, int type,
-    const unsigned char *bytes, int len)
-{
-	if (X509at_add1_attr_by_OBJ(&key->attributes, obj, type, bytes, len))
-		return 1;
-	return 0;
-}
-LCRYPTO_ALIAS(EVP_PKEY_add1_attr_by_OBJ);
-
-int
-EVP_PKEY_add1_attr_by_NID(EVP_PKEY *key, int nid, int type,
-    const unsigned char *bytes, int len)
-{
-	if (X509at_add1_attr_by_NID(&key->attributes, nid, type, bytes, len))
-		return 1;
-	return 0;
-}
-LCRYPTO_ALIAS(EVP_PKEY_add1_attr_by_NID);
-
-int
-EVP_PKEY_add1_attr_by_txt(EVP_PKEY *key, const char *attrname, int type,
-    const unsigned char *bytes, int len)
-{
-	if (X509at_add1_attr_by_txt(&key->attributes, attrname, type,
-	    bytes, len))
-		return 1;
-	return 0;
-}
-LCRYPTO_ALIAS(EVP_PKEY_add1_attr_by_txt);

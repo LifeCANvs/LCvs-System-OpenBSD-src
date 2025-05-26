@@ -1,5 +1,5 @@
 #!/bin/ksh
-#	$OpenBSD: attr.sh,v 1.1 2023/07/12 15:34:59 claudio Exp $
+#	$OpenBSD: attr.sh,v 1.4 2025/05/07 14:08:45 anton Exp $
 
 set -e
 
@@ -29,10 +29,7 @@ error_notify() {
 	ifconfig lo${RDOMAIN1} destroy || true
 	ifconfig lo${RDOMAIN2} destroy || true
 	if [ $1 -ne 0 ]; then
-		echo FAILED
 		exit 1
-	else
-		echo SUCCESS
 	fi
 }
 
@@ -93,12 +90,13 @@ route -T ${RDOMAIN1} exec ${BGPD} \
 
 sleep 1
 
-echo test2
+echo start exabgp
 run_exabgp attr exabgp.attr.conf > exabgp.attr.out 2>&1 &
 
-sleep 3
+sleep 10
+
+echo test RFC 7606 attribute handling
 route -T ${RDOMAIN1} exec bgpctl sh rib in | tee attr.out
-sleep .2
 diff -u ${BGPDCONFIGDIR}/exabgp.attr.ok attr.out
 echo OK
 

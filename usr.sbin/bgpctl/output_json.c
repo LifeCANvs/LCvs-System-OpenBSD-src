@@ -1,4 +1,4 @@
-/*	$OpenBSD: output_json.c,v 1.44 2024/05/22 08:42:34 claudio Exp $ */
+/*	$OpenBSD: output_json.c,v 1.52 2025/03/10 14:08:25 claudio Exp $ */
 
 /*
  * Copyright (c) 2020 Claudio Jeker <claudio@openbsd.org>
@@ -15,6 +15,9 @@
  * ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
  * OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
  */
+
+#include <sys/socket.h>
+#include <arpa/inet.h>
 
 #include <endian.h>
 #include <err.h>
@@ -57,6 +60,7 @@ json_neighbor_capabilities(struct capabilities *capa)
 	json_do_bool("as4byte", capa->as4byte);
 	json_do_bool("refresh", capa->refresh);
 	json_do_bool("enhanced_refresh", capa->enhanced_rr);
+	json_do_bool("extended_message", capa->ext_msg);
 
 	if (hascapamp) {
 		json_do_array("multiprotocol");
@@ -81,6 +85,8 @@ json_neighbor_capabilities(struct capabilities *capa)
 
 		if (capa->grestart.timeout)
 			json_do_uint("timeout", capa->grestart.timeout);
+		if (capa->grestart.grnotification)
+			json_do_bool("graceful_notification", 1);
 
 		if (present) {
 			json_do_array("protocols");
@@ -137,9 +143,9 @@ json_neighbor_stats(struct peer *p)
 {
 	json_do_object("stats", 0);
 	json_do_string("last_read", fmt_monotime(p->stats.last_read));
-	json_do_int("last_read_sec", get_monotime(p->stats.last_read));
+	json_do_int("last_read_sec", get_rel_monotime(p->stats.last_read));
 	json_do_string("last_write", fmt_monotime(p->stats.last_write));
-	json_do_int("last_write_sec", get_monotime(p->stats.last_write));
+	json_do_int("last_write_sec", get_rel_monotime(p->stats.last_write));
 
 	json_do_object("prefixes", 1);
 	json_do_uint("sent", p->stats.prefix_out_cnt);
@@ -240,9 +246,9 @@ json_neighbor_full(struct peer *p)
 			json_do_uint("max_out_prefix_restart",
 			    p->conf.max_out_prefix_restart);
 	}
-	if (p->auth.method != AUTH_NONE)
+	if (p->auth_conf.method != AUTH_NONE)
 		json_do_string("authentication",
-		    fmt_auth_method(p->auth.method));
+		    fmt_auth_method(p->auth_conf.method));
 	json_do_bool("ttl_security", p->conf.ttlsec);
 	json_do_uint("holdtime", p->conf.holdtime);
 	json_do_uint("min_holdtime", p->conf.min_holdtime);
@@ -329,7 +335,7 @@ json_neighbor(struct peer *p, struct parse_result *res)
 	}
 	json_do_string("state", statenames[p->state]);
 	json_do_string("last_updown", fmt_monotime(p->stats.last_updown));
-	json_do_int("last_updown_sec", get_monotime(p->stats.last_updown));
+	json_do_int("last_updown_sec", get_rel_monotime(p->stats.last_updown));
 
 	switch (res->action) {
 	case SHOW:
@@ -356,7 +362,7 @@ json_timer(struct ctl_timer *t)
 
 	json_do_object("timer", 1);
 	json_do_string("name", timernames[t->type]);
-	json_do_int("due", t->val);
+	json_do_int("due", -get_rel_monotime(t->val));
 	json_do_end();
 }
 
@@ -834,6 +840,8 @@ json_rib(struct ctl_show_rib *r, struct ibuf *asbuf, struct parse_result *res)
 
 	/* flags */
 	json_do_bool("valid", r->flags & F_PREF_ELIGIBLE);
+	if (r->flags & F_PREF_FILTERED)
+		json_do_bool("filtered", 1);
 	if (r->flags & F_PREF_BEST)
 		json_do_bool("best", 1);
 	if (r->flags & F_PREF_ECMP)
@@ -857,8 +865,8 @@ json_rib(struct ctl_show_rib *r, struct ibuf *asbuf, struct parse_result *res)
 	json_do_uint("localpref", r->local_pref);
 	json_do_uint("weight", r->weight);
 	json_do_int("dmetric", r->dmetric);
-	json_do_string("last_update", fmt_timeframe(r->age));
-	json_do_int("last_update_sec", r->age);
+	json_do_string("last_update", fmt_monotime(r->lastchange));
+	json_do_int("last_update_sec", get_rel_monotime(r->lastchange));
 
 	/* keep the object open for communities and attributes */
 }
@@ -937,7 +945,7 @@ json_rib_set(struct ctl_show_set *set)
 	json_do_string("name", set->name);
 	json_do_string("type", fmt_set_type(set));
 	json_do_string("last_change", fmt_monotime(set->lastchange));
-	json_do_int("last_change_sec", get_monotime(set->lastchange));
+	json_do_int("last_change_sec", get_rel_monotime(set->lastchange));
 	if (set->type == ASNUM_SET || set->type == ASPA_SET) {
 		json_do_uint("num_ASnum", set->as_cnt);
 	} else {
@@ -963,6 +971,7 @@ json_rtr(struct ctl_show_rtr *rtr)
 
 	if (rtr->session_id != -1) {
 		json_do_uint("version", rtr->version);
+		json_do_uint("minimal_version", rtr->min_version);
 		json_do_uint("session_id", rtr->session_id);
 		json_do_uint("serial", rtr->serial);
 	}

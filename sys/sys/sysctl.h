@@ -1,4 +1,4 @@
-/*	$OpenBSD: sysctl.h,v 1.235 2023/10/01 15:58:12 krw Exp $	*/
+/*	$OpenBSD: sysctl.h,v 1.242 2025/04/29 02:24:32 tedu Exp $	*/
 /*	$NetBSD: sysctl.h,v 1.16 1996/04/09 20:55:36 cgd Exp $	*/
 
 /*
@@ -75,7 +75,7 @@ struct ctlname {
 #define	CTL_UNSPEC	0		/* unused */
 #define	CTL_KERN	1		/* "high kernel": proc, limits */
 #define	CTL_VM		2		/* virtual memory */
-#define	CTL_FS		3		/* file system, mount type is next */
+/* gap for CTL_FS	3		*/
 #define	CTL_NET		4		/* network, see socket.h */
 #define	CTL_DEBUG	5		/* debugging parameters */
 #define	CTL_HW		6		/* generic cpu/io */
@@ -89,7 +89,7 @@ struct ctlname {
 	{ 0, 0 }, \
 	{ "kern", CTLTYPE_NODE }, \
 	{ "vm", CTLTYPE_NODE }, \
-	{ "fs", CTLTYPE_NODE }, \
+	{ "gap", 0 }, \
 	{ "net", CTLTYPE_NODE }, \
 	{ "debug", CTLTYPE_NODE }, \
 	{ "hw", CTLTYPE_NODE }, \
@@ -322,11 +322,13 @@ struct ctlname {
  * KERN_AUDIO
  */
 #define KERN_AUDIO_RECORD	1
-#define KERN_AUDIO_MAXID	2
+#define KERN_AUDIO_KBDCONTROL	2
+#define KERN_AUDIO_MAXID	3
 
 #define CTL_KERN_AUDIO_NAMES { \
 	{ 0, 0 }, \
 	{ "record", CTLTYPE_INT }, \
+	{ "kbdcontrol", CTLTYPE_INT }, \
 }
 
 /*
@@ -568,7 +570,7 @@ struct kinfo_vmentry {
  *	lim - source struct plimits
  *	sa - source struct sigacts
  * There are some members that are not handled by these macros
- * because they're too painful to generalize: p_ppid, p_sid, p_tdev,
+ * because they're too painful to generalize: p_sid, p_tdev,
  * p_tpgid, p_tsess, p_vm_rssize, p_u[us]time_{sec,usec}, p_cpuid
  */
 
@@ -589,7 +591,7 @@ struct kinfo_vmentry {
 #define	_FILL_KPROC_MIN(a,b) (((a)<(b))?(a):(b))
 
 #define FILL_KPROC(kp, copy_str, p, pr, uc, pg, paddr, \
-    praddr, sess, vm, lim, sa, isthread, show_addresses) \
+    praddr, sess, vm, lim, sa, tu, isthread, show_addresses) \
 do {									\
 	memset((kp), 0, sizeof(*(kp)));					\
 									\
@@ -625,21 +627,16 @@ do {									\
 									\
 	(kp)->p_estcpu = (p)->p_estcpu;					\
 	if (isthread) {							\
-		(kp)->p_rtime_sec = (p)->p_tu.tu_runtime.tv_sec;	\
-		(kp)->p_rtime_usec = (p)->p_tu.tu_runtime.tv_nsec/1000;	\
 		(kp)->p_tid = (p)->p_tid + THREAD_PID_OFFSET;		\
-		(kp)->p_uticks = (p)->p_tu.tu_uticks;			\
-		(kp)->p_sticks = (p)->p_tu.tu_sticks;			\
-		(kp)->p_iticks = (p)->p_tu.tu_iticks;			\
 		strlcpy((kp)->p_name, (p)->p_name, sizeof((kp)->p_name)); \
 	} else {							\
-		(kp)->p_rtime_sec = (pr)->ps_tu.tu_runtime.tv_sec;	\
-		(kp)->p_rtime_usec = (pr)->ps_tu.tu_runtime.tv_nsec/1000; \
 		(kp)->p_tid = -1;					\
-		(kp)->p_uticks = (pr)->ps_tu.tu_uticks;			\
-		(kp)->p_sticks = (pr)->ps_tu.tu_sticks;			\
-		(kp)->p_iticks = (pr)->ps_tu.tu_iticks;			\
 	}								\
+	(kp)->p_rtime_sec = (tu)->tu_runtime.tv_sec;			\
+	(kp)->p_rtime_usec = (tu)->tu_runtime.tv_nsec/1000;		\
+	(kp)->p_uticks = (tu)->tu_uticks;				\
+	(kp)->p_sticks = (tu)->tu_sticks;				\
+	(kp)->p_iticks = (tu)->tu_iticks;				\
 	(kp)->p_cpticks = (p)->p_cpticks;				\
 									\
 	if (show_addresses)						\
@@ -650,6 +647,7 @@ do {									\
 	(kp)->p_sigmask = (p)->p_sigmask;				\
 									\
 	PR_LOCK(pr);							\
+	(kp)->p_ppid = (pr)->ps_ppid;					\
 	(kp)->p_sigignore = (sa) ? (sa)->ps_sigignore : 0;		\
 	(kp)->p_sigcatch = (sa) ? (sa)->ps_sigcatch : 0;		\
 									\
@@ -898,28 +896,6 @@ struct kinfo_file {
 }
 
 /*
- * CTL_FS identifiers
- */
-#define	FS_POSIX	1		/* POSIX flags */
-#define	FS_MAXID	2
-
-#define	CTL_FS_NAMES { \
-	{ 0, 0 }, \
-	{ "posix", CTLTYPE_NODE }, \
-}
-
-/*
- * CTL_FS identifiers
- */
-#define	FS_POSIX_SETUID	1		/* int: always clear SGID/SUID bit when owner change */
-#define	FS_POSIX_MAXID	2
-
-#define	CTL_FS_POSIX_NAMES { \
-	{ 0, 0 }, \
-	{ "setuid", CTLTYPE_INT }, \
-}
-
-/*
  * CTL_HW identifiers
  */
 #define	HW_MACHINE		 1	/* string: machine class */
@@ -950,7 +926,7 @@ struct kinfo_file {
 #define	HW_POWER		26	/* int: machine has wall-power */
 #define	HW_BATTERY		27	/* node: battery */
 #define	HW_UCOMNAMES		28	/* strings: ucom names */
-#define	HW_MAXID		30	/* number of valid hw ids */
+#define	HW_MAXID		29	/* number of valid hw ids */
 
 #define	CTL_HW_NAMES { \
 	{ 0, 0 }, \
@@ -1054,6 +1030,9 @@ struct sysctl_bounded_args {
  */
 typedef int (sysctlfn)(int *, u_int, void *, size_t *, void *, size_t, struct proc *);
 
+int sysctl_vslock(void *, size_t);
+void sysctl_vsunlock(void *, size_t);
+
 int sysctl_int_lower(void *, size_t *, void *, size_t, int *);
 int sysctl_int(void *, size_t *, void *, size_t, int *);
 int sysctl_rdint(void *, size_t *, void *, int);
@@ -1075,7 +1054,6 @@ struct mbuf_queue;
 int sysctl_mq(int *, u_int, void *, size_t *, void *, size_t,
     struct mbuf_queue *);
 struct rtentry;
-struct walkarg;
 int sysctl_dumpentry(struct rtentry *, void *, unsigned int);
 int sysctl_rtable(int *, u_int, void *, size_t *, void *, size_t);
 int sysctl_clockrate(char *, size_t *, void *);

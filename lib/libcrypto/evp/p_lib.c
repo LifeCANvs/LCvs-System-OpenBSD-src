@@ -1,4 +1,4 @@
-/* $OpenBSD: p_lib.c,v 1.60 2024/04/09 13:52:41 beck Exp $ */
+/* $OpenBSD: p_lib.c,v 1.62 2025/05/10 05:54:38 tb Exp $ */
 /* Copyright (C) 1995-1998 Eric Young (eay@cryptsoft.com)
  * All rights reserved.
  *
@@ -111,7 +111,6 @@
 #include <openssl/bio.h>
 #include <openssl/cmac.h>
 #include <openssl/crypto.h>
-#include <openssl/err.h>
 #include <openssl/evp.h>
 #include <openssl/objects.h>
 #include <openssl/x509.h>
@@ -129,6 +128,7 @@
 #include <openssl/rsa.h>
 #endif
 
+#include "err_local.h"
 #include "evp_local.h"
 
 extern const EVP_PKEY_ASN1_METHOD cmac_asn1_meth;
@@ -422,7 +422,6 @@ EVP_PKEY_free(EVP_PKEY *pkey)
 		return;
 
 	evp_pkey_free_pkey_ptr(pkey);
-	sk_X509_ATTRIBUTE_pop_free(pkey->attributes, X509_ATTRIBUTE_free);
 	freezero(pkey, sizeof(*pkey));
 }
 LCRYPTO_ALIAS(EVP_PKEY_free);

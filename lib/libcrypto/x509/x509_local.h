@@ -1,4 +1,4 @@
-/*	$OpenBSD: x509_local.h,v 1.24 2024/04/08 23:46:21 beck Exp $ */
+/*	$OpenBSD: x509_local.h,v 1.38 2025/03/06 07:20:01 tb Exp $ */
 /* Written by Dr Stephen N Henson (steve@openssl.org) for the OpenSSL
  * project 2013.
  */
@@ -61,6 +61,8 @@
 
 #include <openssl/x509v3.h>
 
+#include "bytestring.h"
+
 __BEGIN_HIDDEN_DECLS
 
 #define TS_HASH_EVP		EVP_sha1()
@@ -70,6 +72,20 @@ __BEGIN_HIDDEN_DECLS
 #define X509_CERT_HASH_LEN	SHA512_DIGEST_LENGTH
 #define X509_CRL_HASH_EVP	EVP_sha512()
 #define X509_CRL_HASH_LEN	SHA512_DIGEST_LENGTH
+
+#define X509_TRUST_ACCEPT_ALL	-1
+
+/* check_trust return codes */
+#define X509_TRUST_TRUSTED	1
+#define X509_TRUST_REJECTED	2
+#define X509_TRUST_UNTRUSTED	3
+
+int X509_check_trust(X509 *x, int id, int flags);
+
+struct X509_val_st {
+	ASN1_TIME *notBefore;
+	ASN1_TIME *notAfter;
+} /* X509_VAL */;
 
 struct X509_pubkey_st {
 	X509_ALGOR *algor;
@@ -168,9 +184,7 @@ struct x509_st {
 	X509_CINF *cert_info;
 	X509_ALGOR *sig_alg;
 	ASN1_BIT_STRING *signature;
-	int valid;
 	int references;
-	char *name;
 	CRYPTO_EX_DATA ex_data;
 	/* These contain copies of various extension values */
 	long ex_pathlen;
@@ -185,7 +199,7 @@ struct x509_st {
 	NAME_CONSTRAINTS *nc;
 #ifndef OPENSSL_NO_RFC3779
 	STACK_OF(IPAddressFamily) *rfc3779_addr;
-	struct ASIdentifiers_st *rfc3779_asid;
+	ASIdentifiers *rfc3779_asid;
 #endif
 	unsigned char hash[X509_CERT_HASH_LEN];
 	X509_CERT_AUX *aux;
@@ -304,7 +318,7 @@ struct x509_store_st {
 
 /* This is the functions plus an instance of the local variables. */
 struct x509_lookup_st {
-	X509_LOOKUP_METHOD *method;	/* the functions */
+	const X509_LOOKUP_METHOD *method;	/* the functions */
 	void *method_data;		/* method data */
 
 	X509_STORE *store_ctx;	/* who owns us */
@@ -409,6 +423,80 @@ X509_ALGOR *PKCS5_pbkdf2_set(int iter, unsigned char *salt, int saltlen,
 
 int X509_PURPOSE_get_by_id(int id);
 int X509_PURPOSE_get_trust(const X509_PURPOSE *xp);
+
+int X509at_get_attr_by_NID(const STACK_OF(X509_ATTRIBUTE) *x, int nid,
+    int lastpos);
+int X509at_get_attr_by_OBJ(const STACK_OF(X509_ATTRIBUTE) *sk,
+    const ASN1_OBJECT *obj, int lastpos);
+STACK_OF(X509_ATTRIBUTE) *X509at_add1_attr(STACK_OF(X509_ATTRIBUTE) **x,
+    X509_ATTRIBUTE *attr);
+STACK_OF(X509_ATTRIBUTE) *X509at_add1_attr_by_OBJ(STACK_OF(X509_ATTRIBUTE) **x,
+    const ASN1_OBJECT *obj, int type, const unsigned char *bytes, int len);
+STACK_OF(X509_ATTRIBUTE) *X509at_add1_attr_by_NID(STACK_OF(X509_ATTRIBUTE) **x,
+    int nid, int type, const unsigned char *bytes, int len);
+STACK_OF(X509_ATTRIBUTE) *X509at_add1_attr_by_txt(STACK_OF(X509_ATTRIBUTE) **x,
+    const char *attrname, int type, const unsigned char *bytes, int len);
+void *X509at_get0_data_by_OBJ(STACK_OF(X509_ATTRIBUTE) *x,
+    const ASN1_OBJECT *obj, int lastpos, int type);
+
+int X509_NAME_ENTRY_add_cbb(CBB *cbb, const X509_NAME_ENTRY *ne);
+
+int X509V3_add_value(const char *name, const char *value,
+    STACK_OF(CONF_VALUE) **extlist);
+int X509V3_add_value_uchar(const char *name, const unsigned char *value,
+    STACK_OF(CONF_VALUE) **extlist);
+int X509V3_add_value_bool(const char *name, int asn1_bool,
+    STACK_OF(CONF_VALUE) **extlist);
+int X509V3_add_value_int(const char *name, const ASN1_INTEGER *aint,
+    STACK_OF(CONF_VALUE) **extlist);
+
+int X509V3_get_value_bool(const CONF_VALUE *value, int *asn1_bool);
+int X509V3_get_value_int(const CONF_VALUE *value, ASN1_INTEGER **aint);
+
+STACK_OF(CONF_VALUE) *X509V3_get0_section(X509V3_CTX *ctx, const char *section);
+
+const X509V3_EXT_METHOD *x509v3_ext_method_authority_key_identifier(void);
+const X509V3_EXT_METHOD *x509v3_ext_method_basic_constraints(void);
+const X509V3_EXT_METHOD *x509v3_ext_method_certificate_issuer(void);
+const X509V3_EXT_METHOD *x509v3_ext_method_certificate_policies(void);
+const X509V3_EXT_METHOD *x509v3_ext_method_crl_distribution_points(void);
+const X509V3_EXT_METHOD *x509v3_ext_method_crl_number(void);
+const X509V3_EXT_METHOD *x509v3_ext_method_crl_reason(void);
+const X509V3_EXT_METHOD *x509v3_ext_method_ct_cert_scts(void);
+const X509V3_EXT_METHOD *x509v3_ext_method_ct_precert_poison(void);
+const X509V3_EXT_METHOD *x509v3_ext_method_ct_precert_scts(void);
+const X509V3_EXT_METHOD *x509v3_ext_method_delta_crl(void);
+const X509V3_EXT_METHOD *x509v3_ext_method_ext_key_usage(void);
+const X509V3_EXT_METHOD *x509v3_ext_method_freshest_crl(void);
+const X509V3_EXT_METHOD *x509v3_ext_method_hold_instruction_code(void);
+const X509V3_EXT_METHOD *x509v3_ext_method_id_pkix_OCSP_CrlID(void);
+const X509V3_EXT_METHOD *x509v3_ext_method_id_pkix_OCSP_Nonce(void);
+const X509V3_EXT_METHOD *x509v3_ext_method_id_pkix_OCSP_acceptableResponses(void);
+const X509V3_EXT_METHOD *x509v3_ext_method_id_pkix_OCSP_archiveCutoff(void);
+const X509V3_EXT_METHOD *x509v3_ext_method_id_pkix_OCSP_serviceLocator(void);
+const X509V3_EXT_METHOD *x509v3_ext_method_info_access(void);
+const X509V3_EXT_METHOD *x509v3_ext_method_inhibit_any_policy(void);
+const X509V3_EXT_METHOD *x509v3_ext_method_invalidity_date(void);
+const X509V3_EXT_METHOD *x509v3_ext_method_issuer_alt_name(void);
+const X509V3_EXT_METHOD *x509v3_ext_method_issuing_distribution_point(void);
+const X509V3_EXT_METHOD *x509v3_ext_method_key_usage(void);
+const X509V3_EXT_METHOD *x509v3_ext_method_name_constraints(void);
+const X509V3_EXT_METHOD *x509v3_ext_method_netscape_base_url(void);
+const X509V3_EXT_METHOD *x509v3_ext_method_netscape_ca_policy_url(void);
+const X509V3_EXT_METHOD *x509v3_ext_method_netscape_ca_revocation_url(void);
+const X509V3_EXT_METHOD *x509v3_ext_method_netscape_cert_type(void);
+const X509V3_EXT_METHOD *x509v3_ext_method_netscape_comment(void);
+const X509V3_EXT_METHOD *x509v3_ext_method_netscape_renewal_url(void);
+const X509V3_EXT_METHOD *x509v3_ext_method_netscape_revocation_url(void);
+const X509V3_EXT_METHOD *x509v3_ext_method_netscape_ssl_server_name(void);
+const X509V3_EXT_METHOD *x509v3_ext_method_policy_constraints(void);
+const X509V3_EXT_METHOD *x509v3_ext_method_policy_mappings(void);
+const X509V3_EXT_METHOD *x509v3_ext_method_private_key_usage_period(void);
+const X509V3_EXT_METHOD *x509v3_ext_method_sbgp_ipAddrBlock(void);
+const X509V3_EXT_METHOD *x509v3_ext_method_sbgp_autonomousSysNum(void);
+const X509V3_EXT_METHOD *x509v3_ext_method_sinfo_access(void);
+const X509V3_EXT_METHOD *x509v3_ext_method_subject_alt_name(void);
+const X509V3_EXT_METHOD *x509v3_ext_method_subject_key_identifier(void);
 
 __END_HIDDEN_DECLS
 

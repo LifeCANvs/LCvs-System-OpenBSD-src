@@ -1,4 +1,4 @@
-/*	$OpenBSD: output.c,v 1.51 2024/05/22 08:42:34 claudio Exp $ */
+/*	$OpenBSD: output.c,v 1.61 2025/03/10 14:08:25 claudio Exp $ */
 
 /*
  * Copyright (c) 2003 Henning Brauer <henning@openbsd.org>
@@ -18,6 +18,9 @@
  * ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
  * OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
  */
+
+#include <sys/socket.h>
+#include <arpa/inet.h>
 
 #include <endian.h>
 #include <err.h>
@@ -66,7 +69,7 @@ show_head(struct parse_result *res)
 			break;
 		printf("flags: "
 		    "* = Valid, > = Selected, I = via IBGP, A = Announced,\n"
-		    "       S = Stale, E = Error\n");
+		    "       S = Stale, E = Error, F = Filtered, L = Leaked\n");
 		printf("origin validation state: "
 		    "N = not-found, V = valid, ! = invalid\n");
 		printf("aspa validation state: "
@@ -119,7 +122,7 @@ show_summary(struct peer *p)
 	    p->stats.msg_sent_open + p->stats.msg_sent_notification +
 	    p->stats.msg_sent_update + p->stats.msg_sent_keepalive +
 	    p->stats.msg_sent_rrefresh,
-	    p->wbuf.queued,
+	    p->stats.msg_queue_len,
 	    fmt_monotime(p->stats.last_updown));
 	if (p->state == STATE_ESTABLISHED) {
 		printf("%6u", p->stats.prefix_cnt);
@@ -182,9 +185,11 @@ show_neighbor_capa_restart(struct capabilities *capa)
 	int	comma;
 	uint8_t	i;
 
-	printf("    Graceful Restart");
+	printf("    Graceful Restart: ");
 	if (capa->grestart.timeout)
-		printf(": Timeout: %d, ", capa->grestart.timeout);
+		printf("timeout: %d, ", capa->grestart.timeout);
+	if (capa->grestart.grnotification)
+		printf("graceful notification, ");
 	for (i = AID_MIN, comma = 0; i < AID_MAX; i++)
 		if (capa->grestart.flags[i] & CAPA_GR_PRESENT) {
 			if (!comma &&
@@ -302,7 +307,7 @@ show_neighbor_full(struct peer *p, struct parse_result *res)
 		ina.s_addr = htonl(p->remote_bgpid);
 		printf("  BGP version 4, remote router-id %s",
 		    inet_ntoa(ina));
-		printf("%s\n", fmt_auth_method(p->auth.method));
+		printf("%s\n", fmt_auth_method(p->auth_conf.method));
 	}
 	printf("  BGP state = %s", statenames[p->state]);
 	if (p->conf.down) {
@@ -312,7 +317,7 @@ show_neighbor_full(struct peer *p, struct parse_result *res)
 		printf(" with shutdown reason \"%s\"",
 		    log_reason(p->conf.reason));
 	}
-	if (p->stats.last_updown != 0)
+	if (monotime_valid(p->stats.last_updown))
 		printf(", %s for %s",
 		    p->state == STATE_ESTABLISHED ? "up" : "down",
 		    fmt_monotime(p->stats.last_updown));
@@ -342,6 +347,8 @@ show_neighbor_full(struct peer *p, struct parse_result *res)
 			printf("    Route Refresh\n");
 		if (p->capa.peer.enhanced_rr)
 			printf("    Enhanced Route Refresh\n");
+		if (p->capa.peer.ext_msg)
+			printf("    Extended message\n");
 		if (p->capa.peer.grestart.restart)
 			show_neighbor_capa_restart(&p->capa.peer);
 		if (hascapaap)
@@ -372,6 +379,8 @@ show_neighbor_full(struct peer *p, struct parse_result *res)
 			printf("    Route Refresh\n");
 		if (p->capa.neg.enhanced_rr)
 			printf("    Enhanced Route Refresh\n");
+		if (p->capa.neg.ext_msg)
+			printf("    Extended message\n");
 		if (p->capa.neg.grestart.restart)
 			show_neighbor_capa_restart(&p->capa.neg);
 		if (hascapaap)
@@ -461,10 +470,10 @@ show_timer(struct ctl_timer *t)
 {
 	printf("  %-20s ", timernames[t->type]);
 
-	if (t->val <= 0)
-		printf("%-20s\n", "due");
+	if (get_rel_monotime(t->val) >= 0)
+		printf("%s\n", "due");
 	else
-		printf("due in %-13s\n", fmt_timeframe(t->val));
+		printf("%s\n", fmt_monotime(t->val));
 }
 
 static void
@@ -1027,7 +1036,7 @@ show_rib_detail(struct ctl_show_rib *r, struct ibuf *asbuf, int flag0)
 	    fmt_flags(r->flags, 0));
 
 	printf("%c    Last update: %s ago%c", EOL0(flag0),
-	    fmt_timeframe(r->age), EOL0(flag0));
+	    fmt_monotime(r->lastchange), EOL0(flag0));
 }
 
 static void
@@ -1107,7 +1116,7 @@ show_rib_set(struct ctl_show_set *set)
 		snprintf(buf, sizeof(buf), "%7zu %7zu %6s",
 		    set->v4_cnt, set->v6_cnt, "-");
 
-	printf("%-6s %-34s %s %11s\n", fmt_set_type(set), set->name,
+	printf("%-6s %-34s %s %12s\n", fmt_set_type(set), set->name,
 	    buf, fmt_monotime(set->lastchange));
 }
 
@@ -1128,8 +1137,9 @@ show_rtr(struct ctl_show_rtr *rtr)
 	if (rtr->local_addr.aid != AID_UNSPEC)
 		printf(" Local Address: %s\n", log_addr(&rtr->local_addr));
 	if (rtr->session_id != -1)
-		printf(" Version: %u Session ID: %d Serial #: %u\n",
-		    rtr->version, rtr->session_id, rtr->serial);
+		printf(" Version: %u min %u Session ID: %d Serial #: %u\n",
+		    rtr->version, rtr->min_version, rtr->session_id,
+		    rtr->serial);
 	printf(" Refresh: %u, Retry: %u, Expire: %u\n",
 	    rtr->refresh, rtr->retry, rtr->expire);
 

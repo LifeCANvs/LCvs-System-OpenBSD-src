@@ -1,7 +1,11 @@
-#	$OpenBSD: Makefile,v 1.11 2023/09/24 07:01:40 tb Exp $
+#	$OpenBSD: Makefile,v 1.15 2025/05/23 03:46:08 beck Exp $
 
 OPENSSL_RUBY_TESTS =	/usr/local/share/openssl-ruby-tests
+.if exists(/usr/local/bin/ruby32)
 RUBY_BINREV =		32
+.else
+RUBY_BINREV =		33
+.endif
 RUBY =			ruby${RUBY_BINREV}
 
 # We work in a subdirectory of obj/ since extconf.rb generates a Makefile whose
@@ -57,6 +61,21 @@ retest:
 	${_MAKE} test
 
 .for _t in test_client_ca
+REGRESS_TARGETS += ${_t}
+REGRESS_EXPECTED_FAILURES += ${_t}
+${_t}: ${_BUILD_COOKIE}
+	cd ${BUILDDIR} && \
+	    ${RUBY} -I. -I${OPENSSL_RUBY_TESTS}/test/openssl \
+		-I${OPENSSL_RUBY_TESTS}/lib \
+		${OPENSSL_RUBY_TESTS}/test/openssl/test_ssl.rb \
+		-n ${_t}
+.endfor
+
+# These tests can be a pain to run. To run a small set of individual
+# ssl tests, set the test names separated by spaces in the environment
+# variable RUBY_SSL_TEST_TARGETS - then you can type "make <test_name>"
+# to run a single ruby ssl test. 
+.for _t in ${RUBY_SSL_TEST_TARGETS}
 REGRESS_TARGETS += ${_t}
 REGRESS_EXPECTED_FAILURES += ${_t}
 ${_t}: ${_BUILD_COOKIE}

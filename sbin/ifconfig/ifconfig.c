@@ -1,4 +1,4 @@
-/*	$OpenBSD: ifconfig.c,v 1.473 2024/06/09 16:25:27 jan Exp $	*/
+/*	$OpenBSD: ifconfig.c,v 1.476 2025/03/22 07:24:49 kevlo Exp $	*/
 /*	$NetBSD: ifconfig.c,v 1.40 1997/10/01 02:19:43 enami Exp $	*/
 
 /*
@@ -578,6 +578,7 @@ const struct	cmd {
 	{ "flushall",	0,		0,		bridge_flushall },
 	{ "static",	NEXTARG2,	0,		NULL, bridge_addaddr },
 	{ "endpoint",	NEXTARG2,	0,		NULL, bridge_addendpoint },
+	{ "-endpoint",	NEXTARG,	0,		bridge_delendpoint },
 	{ "deladdr",	NEXTARG,	0,		bridge_deladdr },
 	{ "maxaddr",	NEXTARG,	0,		bridge_maxaddr },
 	{ "addr",	0,		0,		bridge_addrs },
@@ -624,7 +625,7 @@ const struct	cmd {
 	{ "wgpeer",	NEXTARG,	A_WIREGUARD,	setwgpeer},
 	{ "wgdescription", NEXTARG,	A_WIREGUARD,	setwgpeerdesc},
 	{ "wgdescr",	NEXTARG,	A_WIREGUARD,	setwgpeerdesc},
-	{ "wgendpoint",	NEXTARG2,	A_WIREGUARD,	NULL,	setwgpeerep},
+	{ "wgendpoint",	NEXTARG2,	A_WIREGUARD,	NULL, setwgpeerep},
 	{ "wgaip",	NEXTARG,	A_WIREGUARD,	setwgpeeraip},
 	{ "wgpsk",	NEXTARG,	A_WIREGUARD,	setwgpeerpsk},
 	{ "wgpka",	NEXTARG,	A_WIREGUARD,	setwgpeerpka},
@@ -726,6 +727,7 @@ void	ieee80211_listnodes(void);
 void	ieee80211_printnode(struct ieee80211_nodereq *);
 u_int	getwpacipher(const char *);
 void	print_cipherset(u_int32_t);
+void	print_rsnprotocol(u_int, u_int);
 
 void	spppauthinfo(struct sauthreq *, int);
 void	spppdnsinfo(struct sdnsreq *);
@@ -2397,6 +2399,22 @@ print_cipherset(u_int32_t cipherset)
 	}
 }
 
+void
+print_rsnprotocol(u_int proto, u_int akm)
+{
+	if (proto & IEEE80211_WPA_PROTO_WPA2) {
+		if (akm & IEEE80211_WPA_AKM_SAE) {
+			if (akm == IEEE80211_WPA_AKM_SAE)
+				fputs(",wpa3", stdout);
+			else
+				fputs(",wpa3,wpa2", stdout);
+		} else
+			fputs(",wpa2", stdout);
+	}
+	if (proto & IEEE80211_WPA_PROTO_WPA1)
+		fputs(",wpa1", stdout);
+}
+
 static void
 print_assoc_failures(uint32_t assoc_fail)
 {
@@ -2802,12 +2820,10 @@ ieee80211_printnode(struct ieee80211_nodereq *nr)
 	if (nr->nr_capinfo) {
 		printb_status(nr->nr_capinfo, IEEE80211_CAPINFO_BITS);
 		if (nr->nr_capinfo & IEEE80211_CAPINFO_PRIVACY) {
-			if (nr->nr_rsnprotos) {
-				if (nr->nr_rsnprotos & IEEE80211_WPA_PROTO_WPA2)
-					fputs(",wpa2", stdout);
-				if (nr->nr_rsnprotos & IEEE80211_WPA_PROTO_WPA1)
-					fputs(",wpa1", stdout);
-			} else
+			if (nr->nr_rsnprotos)
+				print_rsnprotocol(nr->nr_rsnprotos,
+				    nr->nr_rsnakms);
+			else
 				fputs(",wep", stdout);
 
 			if (nr->nr_rsnakms & IEEE80211_WPA_AKM_8021X ||
@@ -3209,10 +3225,6 @@ print_tunnel(const struct if_laddrreq *req)
 		printf(":%s", psrcport);
 
 	if (req->dstaddr.ss_family != AF_UNSPEC) {
-		in_port_t dstport = 0;
-		const struct sockaddr_in *sin;
-		const struct sockaddr_in6 *sin6;
-
 		if (getnameinfo((struct sockaddr *)&req->dstaddr,
 		    req->dstaddr.ss_len, pdstaddr, sizeof(pdstaddr),
 		    pdstport, sizeof(pdstport), niflag) != 0)

@@ -1,4 +1,4 @@
-/* $OpenBSD: ssh-keysign.c,v 1.74 2024/04/30 05:53:03 djm Exp $ */
+/* $OpenBSD: ssh-keysign.c,v 1.76 2025/05/06 05:40:56 djm Exp $ */
 /*
  * Copyright (c) 2002 Markus Friedl.  All rights reserved.
  *
@@ -195,9 +195,6 @@ main(int argc, char **argv)
 
 	i = 0;
 	/* XXX This really needs to read sshd_config for the paths */
-#ifdef WITH_DSA
-	key_fd[i++] = open(_PATH_HOST_DSA_KEY_FILE, O_RDONLY);
-#endif
 	key_fd[i++] = open(_PATH_HOST_ECDSA_KEY_FILE, O_RDONLY);
 	key_fd[i++] = open(_PATH_HOST_ED25519_KEY_FILE, O_RDONLY);
 	key_fd[i++] = open(_PATH_HOST_XMSS_KEY_FILE, O_RDONLY);
@@ -215,7 +212,7 @@ main(int argc, char **argv)
 
 	/* verify that ssh-keysign is enabled by the admin */
 	initialize_options(&options);
-	(void)read_config_file(_PATH_HOST_CONFIG_FILE, pw, "", "",
+	(void)read_config_file(_PATH_HOST_CONFIG_FILE, pw, "", "", "",
 	    &options, 0, NULL);
 	(void)fill_default_options(&options);
 	if (options.enable_ssh_keysign != 1)

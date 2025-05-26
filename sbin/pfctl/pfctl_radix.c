@@ -1,4 +1,4 @@
-/*	$OpenBSD: pfctl_radix.c,v 1.38 2023/09/05 15:37:07 robert Exp $ */
+/*	$OpenBSD: pfctl_radix.c,v 1.40 2024/11/20 13:57:29 kirill Exp $ */
 
 /*
  * Copyright (c) 2002 Cedric Berger
@@ -55,6 +55,18 @@ extern int dev;
 
 static int	 pfr_next_token(char buf[BUF_SIZE], FILE *);
 
+struct pfr_ktablehead	 pfr_ktables = { 0 };
+RB_GENERATE(pfr_ktablehead, pfr_ktable, pfrkt_tree, pfr_ktable_compare);
+
+int
+pfr_ktable_compare(struct pfr_ktable *p, struct pfr_ktable *q)
+{
+	int d;
+
+	if ((d = strncmp(p->pfrkt_name, q->pfrkt_name, PF_TABLE_NAME_SIZE)))
+		return (d);
+	return (strcmp(p->pfrkt_anchor, q->pfrkt_anchor));
+}
 
 int
 pfr_clr_tables(struct pfr_table *filter, int *ndel, int flags)
@@ -302,6 +314,29 @@ pfr_get_astats(struct pfr_table *tbl, struct pfr_astats *addr, int *size,
 }
 
 int
+pfr_clr_astats(struct pfr_table *tbl, struct pfr_addr *addr, int size,
+    int *nzero, int flags)
+{
+	struct pfioc_table io;
+
+	if (size < 0 || (size && !tbl) || addr == NULL) {
+		errno = EINVAL;
+		return (-1);
+	}
+	bzero(&io, sizeof io);
+	io.pfrio_flags = flags;
+	io.pfrio_table = *tbl;
+	io.pfrio_buffer = addr;
+	io.pfrio_esize = sizeof(*addr);
+	io.pfrio_size = size;
+	if (ioctl(dev, DIOCRCLRASTATS, &io) == -1)
+		return (-1);
+	if (nzero)
+		*nzero = io.pfrio_nzero;
+	return (0);
+}
+
+int
 pfr_clr_tstats(struct pfr_table *tbl, int size, int *nzero, int flags)
 {
 	struct pfioc_table io;
@@ -352,6 +387,7 @@ pfr_ina_define(struct pfr_table *tbl, struct pfr_addr *addr, int size,
 	struct pfioc_table io;
 
 	if (tbl == NULL || size < 0 || (size && addr == NULL)) {
+		DBGPRINT("%s %p %d %p\n", __func__, tbl, size, addr);
 		errno = EINVAL;
 		return (-1);
 	}

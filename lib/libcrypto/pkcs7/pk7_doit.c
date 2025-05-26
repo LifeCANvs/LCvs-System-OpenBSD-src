@@ -1,4 +1,4 @@
-/* $OpenBSD: pk7_doit.c,v 1.56 2024/02/18 15:45:42 tb Exp $ */
+/* $OpenBSD: pk7_doit.c,v 1.60 2025/05/10 05:54:38 tb Exp $ */
 /* Copyright (C) 1995-1998 Eric Young (eay@cryptsoft.com)
  * All rights reserved.
  *
@@ -60,11 +60,11 @@
 #include <stdlib.h>
 #include <string.h>
 
-#include <openssl/err.h>
 #include <openssl/objects.h>
 #include <openssl/x509.h>
 #include <openssl/x509v3.h>
 
+#include "err_local.h"
 #include "evp_local.h"
 #include "x509_local.h"
 
@@ -813,6 +813,7 @@ PKCS7_dataFinal(PKCS7 *p7, BIO *bio)
 				if (!EVP_SignFinal(&ctx_tmp, abuf, &abuflen,
 				    si->pkey)) {
 					PKCS7error(ERR_R_EVP_LIB);
+					free(abuf);
 					goto err;
 				}
 				ASN1_STRING_set0(si->enc_digest, abuf, abuflen);
@@ -980,8 +981,8 @@ PKCS7_dataVerify(X509_STORE *cert_store, X509_STORE_CTX *ctx, BIO *bio,
 	X509_STORE_CTX_cleanup(ctx);
 
 	return PKCS7_signatureVerify(bio, p7, si, x509);
+
 err:
-	
 	return ret;
 }
 LCRYPTO_ALIAS(PKCS7_dataVerify);
@@ -1066,8 +1067,10 @@ PKCS7_signatureVerify(BIO *bio, PKCS7 *p7, PKCS7_SIGNER_INFO *si, X509 *x509)
 			ret = -1;
 			goto err;
 		}
-		if (!EVP_VerifyUpdate(&mdc_tmp, abuf, alen))
+		if (!EVP_VerifyUpdate(&mdc_tmp, abuf, alen)) {
+			free(abuf);
 			goto err;
+		}
 
 		free(abuf);
 	}

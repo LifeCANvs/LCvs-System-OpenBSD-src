@@ -18,6 +18,7 @@
 #define __init
 #define __exit
 #define __deprecated
+#define __nonstring
 #define __always_unused	__attribute__((__unused__))
 #define __maybe_unused	__attribute__((__unused__))
 #define __always_inline	inline __attribute__((__always_inline__))
@@ -25,6 +26,7 @@
 #define noinline_for_stack	 __attribute__((__noinline__))
 #define fallthrough	do {} while (0)
 #define __counted_by(x)
+#define __cleanup(fn)	__attribute__((__cleanup__(fn)))
 
 #define __PASTE(x,y) __CONCAT(x,y)
 
@@ -45,5 +47,9 @@
 #else
 #pragma GCC diagnostic ignored "-Wformat-zero-length"
 #endif
+
+#define __diag_push()
+#define __diag_ignore_all(x, y)
+#define __diag_pop()
 
 #endif

@@ -1,4 +1,4 @@
-/* $OpenBSD: machdep.c,v 1.89 2024/04/29 13:01:54 jsg Exp $ */
+/* $OpenBSD: machdep.c,v 1.96 2025/02/11 22:27:09 kettenis Exp $ */
 /*
  * Copyright (c) 2014 Patrick Wildt <patrick@blueri.se>
  * Copyright (c) 2021 Mark Kettenis <kettenis@openbsd.org>
@@ -35,7 +35,7 @@
 #include <sys/malloc.h>
 
 #include <net/if.h>
-#include <uvm/uvm.h>
+#include <uvm/uvm_extern.h>
 #include <dev/cons.h>
 #include <dev/ofw/fdt.h>
 #include <dev/ofw/openfirm.h>
@@ -44,7 +44,6 @@
 #include <machine/bootconfig.h>
 #include <machine/bus.h>
 #include <machine/fpu.h>
-#include <arm64/arm64/arm64var.h>
 
 #include <machine/db_machdep.h>
 #include <ddb/db_extern.h>
@@ -332,7 +331,6 @@ cpu_sysctl(int *name, u_int namelen, void *oldp, size_t *oldlenp, void *newp,
 {
 	char *compatible;
 	int node, len, error;
-	uint64_t value;
 
 	/* all sysctl names at this level are terminal */
 	if (namelen != 1)
@@ -351,31 +349,25 @@ cpu_sysctl(int *name, u_int namelen, void *oldp, size_t *oldlenp, void *newp,
 		free(compatible, M_TEMP, len);
 		return error;
 	case CPU_ID_AA64ISAR0:
-		value = cpu_id_aa64isar0 & ID_AA64ISAR0_MASK;
-		value &= ~ID_AA64ISAR0_TLB_MASK;
-		return sysctl_rdquad(oldp, oldlenp, newp, value);
+		return sysctl_rdquad(oldp, oldlenp, newp, cpu_id_aa64isar0);
 	case CPU_ID_AA64ISAR1:
-		value = cpu_id_aa64isar1 & ID_AA64ISAR1_MASK;
-		value &= ~ID_AA64ISAR1_SPECRES_MASK;
-		return sysctl_rdquad(oldp, oldlenp, newp, value);
-	case CPU_ID_AA64PFR0:
-		value = 0;
-		value |= cpu_id_aa64pfr0 & ID_AA64PFR0_FP_MASK;
-		value |= cpu_id_aa64pfr0 & ID_AA64PFR0_ADV_SIMD_MASK;
-		value |= cpu_id_aa64pfr0 & ID_AA64PFR0_DIT_MASK;
-		return sysctl_rdquad(oldp, oldlenp, newp, value);
-	case CPU_ID_AA64PFR1:
-		value = 0;
-		value |= cpu_id_aa64pfr1 & ID_AA64PFR1_BT_MASK;
-		value |= cpu_id_aa64pfr1 & ID_AA64PFR1_SSBS_MASK;
-		return sysctl_rdquad(oldp, oldlenp, newp, value);
+		return sysctl_rdquad(oldp, oldlenp, newp, cpu_id_aa64isar1);
 	case CPU_ID_AA64ISAR2:
+		return sysctl_rdquad(oldp, oldlenp, newp, cpu_id_aa64isar2);
+	case CPU_ID_AA64PFR0:
+		return sysctl_rdquad(oldp, oldlenp, newp, cpu_id_aa64pfr0);
+	case CPU_ID_AA64PFR1:
+		return sysctl_rdquad(oldp, oldlenp, newp, cpu_id_aa64pfr1);
 	case CPU_ID_AA64MMFR0:
+		return sysctl_rdquad(oldp, oldlenp, newp, cpu_id_aa64mmfr0);
 	case CPU_ID_AA64MMFR1:
+		return sysctl_rdquad(oldp, oldlenp, newp, cpu_id_aa64mmfr1);
 	case CPU_ID_AA64MMFR2:
+		return sysctl_rdquad(oldp, oldlenp, newp, cpu_id_aa64mmfr2);
 	case CPU_ID_AA64SMFR0:
-	case CPU_ID_AA64ZFR0:
 		return sysctl_rdquad(oldp, oldlenp, newp, 0);
+	case CPU_ID_AA64ZFR0:
+		return sysctl_rdquad(oldp, oldlenp, newp, cpu_id_aa64zfr0);
 	default:
 		return (sysctl_bounded_arr(cpuctl_vars, nitems(cpuctl_vars),
 		    name, namelen, oldp, oldlenp, newp, newlen));
@@ -469,7 +461,7 @@ setregs(struct proc *p, struct exec_package *pack, u_long stack,
 
 	/* If we were using the FPU, forget about it. */
 	memset(&pcb->pcb_fpstate, 0, sizeof(pcb->pcb_fpstate));
-	pcb->pcb_flags &= ~PCB_FPU;
+	pcb->pcb_flags &= ~(PCB_FPU | PCB_SVE);
 	fpu_drop();
 
 	memset(tf, 0, sizeof *tf);
@@ -636,10 +628,6 @@ dumpsys(void)
 	}
 	printf("\ndumping to dev %u,%u offset %ld\n", major(dumpdev),
 	    minor(dumpdev), dumplo);
-
-#ifdef UVM_SWAP_ENCRYPT
-	uvm_swap_finicrypt_all();
-#endif
 
 	error = (*bdevsw[major(dumpdev)].d_psize)(dumpdev);
 	printf("dump ");
@@ -1170,6 +1158,10 @@ pmap_bootstrap_bs_map(bus_space_tag_t t, bus_addr_t bpa, bus_size_t size,
 {
 	u_long startpa, pa, endpa;
 	vaddr_t va;
+	int cache = PMAP_CACHE_DEV_NGNRNE;
+
+	if (flags & BUS_SPACE_MAP_PREFETCHABLE)
+		cache = PMAP_CACHE_CI;
 
 	va = virtual_avail;	/* steal memory from virtual avail. */
 
@@ -1179,8 +1171,7 @@ pmap_bootstrap_bs_map(bus_space_tag_t t, bus_addr_t bpa, bus_size_t size,
 	*bshp = (bus_space_handle_t)(va + (bpa - startpa));
 
 	for (pa = startpa; pa < endpa; pa += PAGE_SIZE, va += PAGE_SIZE)
-		pmap_kenter_cache(va, pa, PROT_READ | PROT_WRITE,
-		    PMAP_CACHE_DEV_NGNRNE);
+		pmap_kenter_cache(va, pa, PROT_READ | PROT_WRITE, cache);
 
 	virtual_avail = va;
 

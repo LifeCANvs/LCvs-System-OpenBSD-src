@@ -1,4 +1,4 @@
-/*	$OpenBSD: igmp.c,v 1.83 2023/09/16 09:33:27 mpi Exp $	*/
+/*	$OpenBSD: igmp.c,v 1.86 2025/03/02 21:28:32 bluhm Exp $	*/
 /*	$NetBSD: igmp.c,v 1.15 1996/02/13 23:41:25 christos Exp $	*/
 
 /*
@@ -96,16 +96,17 @@
 
 #define IP_MULTICASTOPTS	0
 
-int	igmp_timers_are_running;	/* [N] shortcut for fast timer */
+int	igmp_timers_are_running;	/* [a] shortcut for fast timer */
 static LIST_HEAD(, router_info) rti_head;
 static struct mbuf *router_alert;
 struct cpumem *igmpcounters;
 
-void igmp_checktimer(struct ifnet *);
+int igmp_checktimer(struct ifnet *);
 void igmp_sendpkt(struct ifnet *, struct in_multi *, int, in_addr_t);
 int rti_fill(struct in_multi *);
 struct router_info * rti_find(struct ifnet *);
-int igmp_input_if(struct ifnet *, struct mbuf **, int *, int, int);
+int igmp_input_if(struct ifnet *, struct mbuf **, int *, int, int,
+    struct netstack *);
 int igmp_sysctl_igmpstat(void *, size_t *, void *);
 
 void
@@ -196,7 +197,7 @@ rti_delete(struct ifnet *ifp)
 }
 
 int
-igmp_input(struct mbuf **mp, int *offp, int proto, int af)
+igmp_input(struct mbuf **mp, int *offp, int proto, int af, struct netstack *ns)
 {
 	struct ifnet *ifp;
 
@@ -209,14 +210,15 @@ igmp_input(struct mbuf **mp, int *offp, int proto, int af)
 	}
 
 	KERNEL_LOCK();
-	proto = igmp_input_if(ifp, mp, offp, proto, af);
+	proto = igmp_input_if(ifp, mp, offp, proto, af, ns);
 	KERNEL_UNLOCK();
 	if_put(ifp);
 	return proto;
 }
 
 int
-igmp_input_if(struct ifnet *ifp, struct mbuf **mp, int *offp, int proto, int af)
+igmp_input_if(struct ifnet *ifp, struct mbuf **mp, int *offp, int proto,
+    int af, struct netstack *ns)
 {
 	struct mbuf *m = *mp;
 	int iphlen = *offp;
@@ -228,7 +230,7 @@ igmp_input_if(struct ifnet *ifp, struct mbuf **mp, int *offp, int proto, int af)
 	struct in_multi *inm;
 	struct router_info *rti;
 	struct in_ifaddr *ia;
-	int timer;
+	int timer, running = 0;
 
 	igmplen = ntohs(ip->ip_len) - iphlen;
 
@@ -300,7 +302,7 @@ igmp_input_if(struct ifnet *ifp, struct mbuf **mp, int *offp, int proto, int af)
 					inm->inm_state = IGMP_DELAYING_MEMBER;
 					inm->inm_timer = IGMP_RANDOM_DELAY(
 					    IGMP_MAX_HOST_REPORT_DELAY * PR_FASTHZ);
-					igmp_timers_are_running = 1;
+					running = 1;
 				}
 			}
 		} else {
@@ -341,7 +343,7 @@ igmp_input_if(struct ifnet *ifp, struct mbuf **mp, int *offp, int proto, int af)
 						    IGMP_DELAYING_MEMBER;
 						inm->inm_timer =
 						    IGMP_RANDOM_DELAY(timer);
-						igmp_timers_are_running = 1;
+						running = 1;
 						break;
 					case IGMP_SLEEPING_MEMBER:
 						inm->inm_state =
@@ -475,17 +477,22 @@ igmp_input_if(struct ifnet *ifp, struct mbuf **mp, int *offp, int proto, int af)
 
 	}
 
+	if (running) {
+		membar_producer();
+		atomic_store_int(&igmp_timers_are_running, running);
+	}
+
 	/*
 	 * Pass all valid IGMP packets up to any process(es) listening
 	 * on a raw IGMP socket.
 	 */
-	return rip_input(mp, offp, proto, af);
+	return rip_input(mp, offp, proto, af, ns);
 }
 
 void
 igmp_joingroup(struct in_multi *inm, struct ifnet *ifp)
 {
-	int i;
+	int i, running = 0;
 
 	inm->inm_state = IGMP_IDLE_MEMBER;
 
@@ -496,9 +503,14 @@ igmp_joingroup(struct in_multi *inm, struct ifnet *ifp)
 		inm->inm_state = IGMP_DELAYING_MEMBER;
 		inm->inm_timer = IGMP_RANDOM_DELAY(
 		    IGMP_MAX_HOST_REPORT_DELAY * PR_FASTHZ);
-		igmp_timers_are_running = 1;
+		running = 1;
 	} else
 		inm->inm_timer = 0;
+
+	if (running) {
+		membar_producer();
+		atomic_store_int(&igmp_timers_are_running, running);
+	}
 }
 
 void
@@ -525,6 +537,7 @@ void
 igmp_fasttimo(void)
 {
 	struct ifnet *ifp;
+	int running = 0;
 
 	/*
 	 * Quick check to see if any work needs to be done, in order
@@ -533,23 +546,29 @@ igmp_fasttimo(void)
 	 * lock intentionally.  In case it is not set due to MP races, we may
 	 * miss to check the timers.  Then run the loop at next fast timeout.
 	 */
-	if (!igmp_timers_are_running)
+	if (!atomic_load_int(&igmp_timers_are_running))
 		return;
+	membar_consumer();
 
 	NET_LOCK();
 
-	igmp_timers_are_running = 0;
-	TAILQ_FOREACH(ifp, &ifnetlist, if_list)
-		igmp_checktimer(ifp);
+	TAILQ_FOREACH(ifp, &ifnetlist, if_list) {
+		if (igmp_checktimer(ifp))
+			running = 1;
+	}
+
+	membar_producer();
+	atomic_store_int(&igmp_timers_are_running, running);
 
 	NET_UNLOCK();
 }
 
-void
+int
 igmp_checktimer(struct ifnet *ifp)
 {
 	struct in_multi *inm;
 	struct ifmaddr *ifma;
+	int running = 0;
 
 	NET_ASSERT_LOCKED();
 
@@ -570,9 +589,11 @@ igmp_checktimer(struct ifnet *ifp)
 				inm->inm_state = IGMP_IDLE_MEMBER;
 			}
 		} else {
-			igmp_timers_are_running = 1;
+			running = 1;
 		}
 	}
+
+	return (running);
 }
 
 void
@@ -668,8 +689,6 @@ igmp_sysctl(int *name, u_int namelen, void *oldp, size_t *oldlenp,
 
 	switch (name[0]) {
 	case IGMPCTL_STATS:
-		if (newp != NULL)
-			return (EPERM);
 		return (igmp_sysctl_igmpstat(oldp, oldlenp, newp));
 	default:
 		return (EOPNOTSUPP);

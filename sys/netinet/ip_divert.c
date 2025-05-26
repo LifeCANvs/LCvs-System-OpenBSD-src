@@ -1,4 +1,4 @@
-/*      $OpenBSD: ip_divert.c,v 1.95 2024/03/05 09:45:13 bluhm Exp $ */
+/*      $OpenBSD: ip_divert.c,v 1.103 2025/05/22 03:09:00 bluhm Exp $ */
 
 /*
  * Copyright (c) 2009 Michele Marchetto <michele@openbsd.org>
@@ -41,33 +41,35 @@
 
 #include <net/pfvar.h>
 
+/*
+ * Locks used to protect data:
+ *	a	atomic
+ */
+
 struct	inpcbtable	divbtable;
 struct	cpumem		*divcounters;
 
 #ifndef DIVERT_SENDSPACE
 #define DIVERT_SENDSPACE	(65536 + 100)
 #endif
-u_int   divert_sendspace = DIVERT_SENDSPACE;
+u_int   divert_sendspace = DIVERT_SENDSPACE;	/* [a] */
 #ifndef DIVERT_RECVSPACE
 #define DIVERT_RECVSPACE	(65536 + 100)
 #endif
-u_int   divert_recvspace = DIVERT_RECVSPACE;
+u_int   divert_recvspace = DIVERT_RECVSPACE;	/* [a] */
 
 #ifndef DIVERTHASHSIZE
 #define DIVERTHASHSIZE	128
 #endif
 
 const struct sysctl_bounded_args divertctl_vars[] = {
-	{ DIVERTCTL_RECVSPACE, &divert_recvspace, 0, INT_MAX },
-	{ DIVERTCTL_SENDSPACE, &divert_sendspace, 0, INT_MAX },
+	{ DIVERTCTL_RECVSPACE, &divert_recvspace, 0, SB_MAX },
+	{ DIVERTCTL_SENDSPACE, &divert_sendspace, 0, SB_MAX },
 };
 
 const struct pr_usrreqs divert_usrreqs = {
 	.pru_attach	= divert_attach,
 	.pru_detach	= divert_detach,
-	.pru_lock	= divert_lock,
-	.pru_unlock	= divert_unlock,
-	.pru_locked	= divert_locked,
 	.pru_bind	= divert_bind,
 	.pru_shutdown	= divert_shutdown,
 	.pru_send	= divert_send,
@@ -166,7 +168,7 @@ divert_output(struct inpcb *inp, struct mbuf *m, struct mbuf *nam,
 			error = ENETDOWN;
 			goto fail;
 		}
-		ipv4_input(ifp, m);
+		ipv4_input(ifp, m, NULL);
 		if_put(ifp);
 	} else {
 		m->m_pkthdr.ph_rtableid = inp->inp_rtableid;
@@ -234,7 +236,7 @@ divert_packet(struct mbuf *m, int dir, u_int16_t divert_port)
 		if_put(ifp);
 	} else {
 		/*
-		 * Calculate IP and protocol checksums for outbound packet 
+		 * Calculate IP and protocol checksums for outbound packet
 		 * diverted to userland.  pf rule diverts before cksum offload.
 		 */
 		in_hdr_cksum_out(m, NULL);
@@ -243,7 +245,7 @@ divert_packet(struct mbuf *m, int dir, u_int16_t divert_port)
 
 	so = inp->inp_socket;
 	mtx_enter(&so->so_rcv.sb_mtx);
-	if (sbappendaddr(so, &so->so_rcv, sintosa(&sin), m, NULL) == 0) {
+	if (sbappendaddr(&so->so_rcv, sintosa(&sin), m, NULL) == 0) {
 		mtx_leave(&so->so_rcv.sb_mtx);
 		divstat_inc(divs_fullsock);
 		goto bad;
@@ -255,8 +257,7 @@ divert_packet(struct mbuf *m, int dir, u_int16_t divert_port)
 	return;
 
  bad:
-	if (inp != NULL)
-		in_pcbunref(inp);
+	in_pcbunref(inp);
 	m_freem(m);
 }
 
@@ -270,11 +271,11 @@ divert_attach(struct socket *so, int proto, int wait)
 	if ((so->so_state & SS_PRIV) == 0)
 		return EACCES;
 
-	error = in_pcballoc(so, &divbtable, wait);
+	error = soreserve(so, atomic_load_int(&divert_sendspace),
+	    atomic_load_int(&divert_recvspace));
 	if (error)
 		return error;
-
-	error = soreserve(so, divert_sendspace, divert_recvspace);
+	error = in_pcballoc(so, &divbtable, wait);
 	if (error)
 		return error;
 
@@ -294,32 +295,6 @@ divert_detach(struct socket *so)
 
 	in_pcbdetach(inp);
 	return (0);
-}
-
-void
-divert_lock(struct socket *so)
-{
-	struct inpcb *inp = sotoinpcb(so);
-
-	NET_ASSERT_LOCKED();
-	mtx_enter(&inp->inp_mtx);
-}
-
-void
-divert_unlock(struct socket *so)
-{
-	struct inpcb *inp = sotoinpcb(so);
-
-	NET_ASSERT_LOCKED();
-	mtx_leave(&inp->inp_mtx);
-}
-
-int
-divert_locked(struct socket *so)
-{
-	struct inpcb *inp = sotoinpcb(so);
-
-	return mtx_owned(&inp->inp_mtx);
 }
 
 int
@@ -375,8 +350,6 @@ int
 divert_sysctl(int *name, u_int namelen, void *oldp, size_t *oldlenp, void *newp,
     size_t newlen)
 {
-	int error;
-
 	/* All sysctl names at this level are terminal. */
 	if (namelen != 1)
 		return (ENOTDIR);
@@ -385,12 +358,9 @@ divert_sysctl(int *name, u_int namelen, void *oldp, size_t *oldlenp, void *newp,
 	case DIVERTCTL_STATS:
 		return (divert_sysctl_divstat(oldp, oldlenp, newp));
 	default:
-		NET_LOCK();
-		error = sysctl_bounded_arr(divertctl_vars,
-		    nitems(divertctl_vars), name, namelen, oldp, oldlenp, newp,
-		    newlen);
-		NET_UNLOCK();
-		return (error);
+		return (sysctl_bounded_arr(divertctl_vars,
+		    nitems(divertctl_vars), name, namelen, oldp, oldlenp,
+		    newp, newlen));
 	}
 	/* NOTREACHED */
 }

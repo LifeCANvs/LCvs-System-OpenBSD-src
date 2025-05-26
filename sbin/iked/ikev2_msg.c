@@ -1,4 +1,4 @@
-/*	$OpenBSD: ikev2_msg.c,v 1.101 2024/03/02 16:16:07 tobhe Exp $	*/
+/*	$OpenBSD: ikev2_msg.c,v 1.103 2024/11/21 13:26:49 claudio Exp $	*/
 
 /*
  * Copyright (c) 2019 Tobias Heider <tobias.heider@stusta.de>
@@ -203,6 +203,7 @@ ikev2_msg_cleanup(struct iked *env, struct iked_message *msg)
 		ibuf_free(msg->msg_cookie);
 		ibuf_free(msg->msg_cookie2);
 		ibuf_free(msg->msg_del_buf);
+		ibuf_free(msg->msg_eapmsg);
 		free(msg->msg_eap.eam_user);
 		free(msg->msg_cp_addr);
 		free(msg->msg_cp_addr6);
@@ -219,6 +220,7 @@ ikev2_msg_cleanup(struct iked *env, struct iked_message *msg)
 		msg->msg_cookie = NULL;
 		msg->msg_cookie2 = NULL;
 		msg->msg_del_buf = NULL;
+		msg->msg_eapmsg = NULL;
 		msg->msg_eap.eam_user = NULL;
 		msg->msg_cp_addr = NULL;
 		msg->msg_cp_addr6 = NULL;
@@ -300,7 +302,7 @@ ikev2_msg_send(struct iked *env, struct iked_message *msg)
 			log_debug("%s: failed to set NAT-T", __func__);
 			return (-1);
 		}
-		if (ibuf_add_buf(new, buf) == -1) {
+		if (ibuf_add_ibuf(new, buf) == -1) {
 			ibuf_free(new);
 			log_debug("%s: failed to set NAT-T", __func__);
 			return (-1);
@@ -781,7 +783,7 @@ ikev2_msg_send_encrypt(struct iked *env, struct iked_sa *sa, struct ibuf **ep,
 		log_debug("%s: encryption failed", __func__);
 		goto done;
 	}
-	if (ibuf_add_buf(buf, e) != 0)
+	if (ibuf_add_ibuf(buf, e) != 0)
 		goto done;
 
 	/* Add integrity checksum (HMAC) */
@@ -889,7 +891,7 @@ ikev2_send_encrypted_fragments(struct iked *env, struct iked_sa *sa,
 			log_debug("%s: encryption failed", __func__);
 			goto done;
 		}
-		if (ibuf_add_buf(buf, e) != 0)
+		if (ibuf_add_ibuf(buf, e) != 0)
 			goto done;
 
 		/* Add integrity checksum (HMAC) */
@@ -963,7 +965,7 @@ ikev2_msg_auth(struct iked *env, struct iked_sa *sa, int response)
 
 	if ((authmsg = ibuf_dup(buf)) == NULL)
 		return (NULL);
-	if (ibuf_add_buf(authmsg, nonce) != 0)
+	if (ibuf_add_ibuf(authmsg, nonce) != 0)
 		goto fail;
 
 	if ((hash_setkey(sa->sa_prf, ibuf_data(prfkey),
